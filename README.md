@@ -54,7 +54,7 @@ hsm/
 
 ## TypeScript / Node.js Integration
 
-A production-hardened TypeScript implementation is available for Node.js projects. See the `src/lib/crypto/pyhsm/` module in the companion project for:
+A production-hardened TypeScript implementation is available for Node.js projects and includes:
 
 - **AES-256-GCM-SIV** — nonce-misuse-resistant encryption
 - **Argon2id** — memory-hard key derivation (replaces PBKDF2)
