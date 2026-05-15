@@ -78,7 +78,7 @@ npm install
 ### Usage
 
 ```typescript
-import { PyHSM } from './src/lib/crypto/pyhsm';
+import { PyHSM } from './pyhsm-ts';
 
 // Initialize the HSM (starts a separate process via Unix socket)
 const hsm = new PyHSM();
