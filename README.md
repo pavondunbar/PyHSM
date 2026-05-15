@@ -54,7 +54,13 @@ hsm/
 
 ## TypeScript / Node.js Integration
 
+<<<<<<< HEAD
 A production-hardened TypeScript implementation is available for Node.js projects and includes:
+=======
+A production-hardened TypeScript implementation is available for Node.js projects in the companion project's `src/lib/crypto/pyhsm/` module.
+
+### Features
+>>>>>>> 707b296 (Modified the README to include instuctions on how to use the Typescript version of PyHSM.)
 
 - **AES-256-GCM-SIV** — nonce-misuse-resistant encryption
 - **Argon2id** — memory-hard key derivation (replaces PBKDF2)
@@ -68,6 +74,69 @@ A production-hardened TypeScript implementation is available for Node.js project
 - **FIPS mode** — enables OpenSSL FIPS provider when available
 - **Prometheus metrics** — health monitoring
 - **HMAC-chained audit log** — tamper-evident operation history
+
+### Install
+
+```bash
+npm install
+```
+
+### Usage
+
+```typescript
+import { PyHSM } from './src/lib/crypto/pyhsm';
+
+// Initialize the HSM (starts a separate process via Unix socket)
+const hsm = new PyHSM();
+
+// Unlock the keystore (Shamir M-of-N ceremony or single passphrase)
+await hsm.unlock('my-passphrase');
+
+// Generate keys
+const aesKey = await hsm.generateKey('my-aes-key', { type: 'aes-256-gcm-siv' });
+const ecKey = await hsm.generateKey('my-ec-key', { type: 'ec-p256' });
+
+// Encrypt / Decrypt (AES-256-GCM-SIV)
+const ciphertext = await hsm.encrypt('my-aes-key', Buffer.from('secret message'));
+const plaintext = await hsm.decrypt('my-aes-key', ciphertext);
+
+// Sign / Verify (ECDSA)
+const signature = await hsm.sign('my-ec-key', Buffer.from('message to sign'));
+const valid = await hsm.verify('my-ec-key', Buffer.from('message to sign'), signature);
+
+// Key rotation (versioned — old ciphertexts still decryptable)
+await hsm.rotateKey('my-aes-key');
+
+// Export public key
+const pubkey = await hsm.exportPublicKey('my-ec-key');
+
+// List keys
+const keys = await hsm.listKeys();
+
+// Delete a key
+await hsm.deleteKey('my-aes-key');
+
+// Lock the keystore when done
+await hsm.lock();
+```
+
+### Configuration
+
+The TypeScript implementation supports additional configuration:
+
+```typescript
+const hsm = new PyHSM({
+  socketPath: '/tmp/pyhsm.sock',   // Unix socket path for process isolation
+  fipsMode: true,                   // Enable OpenSSL FIPS provider
+  metricsPort: 9090,                // Prometheus metrics endpoint
+  rateLimits: {
+    decrypt: { maxPerMinute: 100 }, // Rate limiting per operation
+  },
+  acl: {
+    'my-aes-key': ['service-a', 'service-b'], // Per-key access control
+  },
+});
+```
 
 ## Security Notes
 
