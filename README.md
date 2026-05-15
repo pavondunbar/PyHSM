@@ -1,6 +1,6 @@
-# SoftHSM
+# PyHSM
 
-A software-based Hardware Security Module (SoftHSM) providing cryptographic key management, encryption, signing, and secure key storage.
+A software-based Hardware Security Module (PyHSM) providing cryptographic key management, encryption, signing, and secure key storage.
 
 ## Features
 
@@ -48,13 +48,13 @@ Stdin is also supported — omit `-d` and pipe data in.
 ```
 cli.py          — Command-line interface
 hsm/
-  core.py       — SoftHSM class (crypto operations)
+  core.py       — PyHSM class (crypto operations)
   storage.py    — KeyStore class (encrypted persistence)
 ```
 
 ## TypeScript / Node.js Integration
 
-A production-hardened TypeScript implementation is available for Node.js projects. See the `src/lib/crypto/softhsm/` module in the companion project for:
+A production-hardened TypeScript implementation is available for Node.js projects. See the `src/lib/crypto/pyhsm/` module in the companion project for:
 
 - **AES-256-GCM-SIV** — nonce-misuse-resistant encryption
 - **Argon2id** — memory-hard key derivation (replaces PBKDF2)

@@ -1,4 +1,4 @@
-"""SoftHSM - Software-based Hardware Security Module implementation."""
+"""PyHSM - Software-based Hardware Security Module implementation."""
 
 import os
 import json
@@ -12,7 +12,7 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from .storage import KeyStore
 
 
-class SoftHSM:
+class PyHSM:
     """Software-based Hardware Security Module providing key management and crypto operations."""
 
     def __init__(self, storage_path="keystore.enc", master_password=None):

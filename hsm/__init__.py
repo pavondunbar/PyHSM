@@ -1,3 +1,3 @@
-from .core import SoftHSM
+from .core import PyHSM
 
-__all__ = ["SoftHSM"]
+__all__ = ["PyHSM"]

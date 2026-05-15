@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""CLI interface for the SoftHSM."""
+"""CLI interface for the PyHSM."""
 
 import argparse
 import getpass
 import sys
-from hsm import SoftHSM
+from hsm import PyHSM
 
 
 def get_hsm(args):
     password = args.password or getpass.getpass("Master password: ")
-    return SoftHSM(storage_path=args.store, master_password=password)
+    return PyHSM(storage_path=args.store, master_password=password)
 
 
 def cmd_generate(args):
@@ -68,7 +68,7 @@ def cmd_pubkey(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(prog="softhsm", description="SoftHSM")
+    parser = argparse.ArgumentParser(prog="pyhsm", description="PyHSM")
     parser.add_argument("--store", default="keystore.enc", help="Key store file path")
     parser.add_argument("--password", "-p", help="Master password (or use prompt)")
     sub = parser.add_subparsers(dest="command", required=True)
