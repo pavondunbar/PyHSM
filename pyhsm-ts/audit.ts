@@ -22,11 +22,19 @@ export class AuditLog {
     this.logPath = logPath;
     this.webhookUrl = webhookUrl || process.env.PYHSM_AUDIT_WEBHOOK || null;
 
-    // Derive HMAC key from env or generate deterministically from log path
+    // HMAC key: from env, or generate a random key and persist it alongside the log
     const envKey = process.env[HMAC_KEY_ENV];
-    this.hmacKey = envKey
-      ? Buffer.from(envKey, "hex")
-      : crypto.createHash("sha256").update("pyhsm-audit-" + logPath).digest();
+    if (envKey) {
+      this.hmacKey = Buffer.from(envKey, "hex");
+    } else {
+      const keyFile = logPath + ".hmackey";
+      if (fs.existsSync(keyFile)) {
+        this.hmacKey = Buffer.from(fs.readFileSync(keyFile, "utf8").trim(), "hex");
+      } else {
+        this.hmacKey = crypto.randomBytes(32);
+        fs.writeFileSync(keyFile, this.hmacKey.toString("hex"), { mode: 0o600 });
+      }
+    }
 
     this.loadLastState();
   }

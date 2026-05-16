@@ -278,13 +278,16 @@ export class PyHSM {
 
   /** AES-KWP (RFC 5649) key wrapping — wraps key material for storage. */
   private wrapKey(kek: Buffer, keyData: Buffer): Buffer {
-    const cipher = crypto.createCipheriv("aes-256-wrap-pad" as any, kek, Buffer.alloc(4, 0xa6));
+    // Node.js supports aes-256-wrap-pad but @types/node doesn't include it in CipherCCMTypes
+    const algo: string = "aes-256-wrap-pad";
+    const cipher = crypto.createCipheriv(algo, kek, Buffer.alloc(4, 0xa6));
     return Buffer.concat([cipher.update(keyData), cipher.final()]);
   }
 
   /** AES-KWP unwrap. */
   private unwrapKey(kek: Buffer, wrapped: Buffer): Buffer {
-    const decipher = crypto.createDecipheriv("aes-256-wrap-pad" as any, kek, Buffer.alloc(4, 0xa6));
+    const algo: string = "aes-256-wrap-pad";
+    const decipher = crypto.createDecipheriv(algo, kek, Buffer.alloc(4, 0xa6));
     return Buffer.concat([decipher.update(wrapped), decipher.final()]);
   }
 
@@ -336,20 +339,20 @@ export class PyHSM {
       this.store = { version: 3, keys: {} };
       const oldKeys = parsed.keys || parsed;
       for (const [id, entry] of Object.entries(oldKeys)) {
-        const e = entry as any;
+        const e = entry as Record<string, unknown>;
         this.store.keys[id] = {
           keyId: id,
-          keyType: e.keyType || e.key_type || "aes-256",
+          keyType: (e.keyType || e.key_type || "aes-256") as string,
           currentVersion: 1,
           versions: [{
             version: 1,
-            keyData: e.keyData || e.key_data || "",
-            createdAt: e.createdAt || e.created_at || new Date().toISOString(),
+            keyData: (e.keyData || e.key_data || "") as string,
+            createdAt: (e.createdAt || e.created_at || new Date().toISOString()) as string,
             archived: false,
           }],
-          policy: e.policy || { allowEncrypt: true, allowDecrypt: true },
-          operationCount: e.operationCount || 0,
-          createdAt: e.createdAt || e.created_at || new Date().toISOString(),
+          policy: (e.policy || { allowEncrypt: true, allowDecrypt: true }) as KeyPolicy,
+          operationCount: (e.operationCount || 0) as number,
+          createdAt: (e.createdAt || e.created_at || new Date().toISOString()) as string,
         };
       }
     } else {
