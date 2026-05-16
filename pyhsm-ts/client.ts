@@ -6,7 +6,7 @@
  */
 import net from "node:net";
 import crypto from "node:crypto";
-import type { IPCRequest, IPCResponse } from "./types";
+import type { IPCRequest, IPCResponse } from "./types.js";
 
 export class PyHSMClient {
   private socketPath: string;
@@ -73,8 +73,8 @@ export class PyHSMClient {
     return res.data as string;
   }
 
-  async generateKey(keyId: string, policy?: Record<string, unknown>): Promise<void> {
-    const res = await this.send({ type: "generateKey", keyId, policy, callerId: this.callerId } as any);
+  async generateKey(keyId: string, policy?: Partial<import("./types.js").KeyPolicy>): Promise<void> {
+    const res = await this.send({ type: "generateKey", keyId, policy, callerId: this.callerId });
     if (!res.ok) throw new Error(res.error);
   }
 

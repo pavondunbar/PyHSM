@@ -1,0 +1,4 @@
+node_modules/
+dist/
+*.enc
+*.audit.jsonl
