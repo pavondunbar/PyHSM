@@ -3,7 +3,7 @@
  *
  * Tracks operations, errors, and exposes health status.
  */
-import type { HSMMetrics } from "./types";
+import type { HSMMetrics } from "./types.js";
 
 export class MetricsCollector {
   private startTime = Date.now();

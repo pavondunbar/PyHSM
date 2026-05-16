@@ -6,7 +6,7 @@
  */
 import net from "node:net";
 import crypto from "node:crypto";
-import type { IPCRequest, IPCResponse } from "./types";
+import type { IPCRequest, IPCResponse } from "./types.js";
 
 export class PyHSMClient {
   private socketPath: string;

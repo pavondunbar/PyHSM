@@ -1,0 +1,80 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.MetricsCollector = void 0;
+class MetricsCollector {
+    startTime = Date.now();
+    counters = {
+        totalOps: 0,
+        encryptOps: 0,
+        decryptOps: 0,
+        errors: 0,
+        rateLimitHits: 0,
+        accessDenials: 0,
+    };
+    lastOpAt = null;
+    activeKeys = 0;
+    archivedKeys = 0;
+    recordOp(type) {
+        this.counters.totalOps++;
+        if (type === "encrypt")
+            this.counters.encryptOps++;
+        else
+            this.counters.decryptOps++;
+        this.lastOpAt = new Date().toISOString();
+    }
+    recordError() {
+        this.counters.errors++;
+    }
+    recordRateLimit() {
+        this.counters.rateLimitHits++;
+    }
+    recordAccessDenial() {
+        this.counters.accessDenials++;
+    }
+    setKeyCount(active, archived) {
+        this.activeKeys = active;
+        this.archivedKeys = archived;
+    }
+    getMetrics() {
+        return {
+            totalOperations: this.counters.totalOps,
+            encryptOps: this.counters.encryptOps,
+            decryptOps: this.counters.decryptOps,
+            errors: this.counters.errors,
+            rateLimitHits: this.counters.rateLimitHits,
+            accessDenials: this.counters.accessDenials,
+            activeKeys: this.activeKeys,
+            archivedKeys: this.archivedKeys,
+            uptimeMs: Date.now() - this.startTime,
+            lastOperationAt: this.lastOpAt,
+        };
+    }
+    /** Prometheus-compatible text format. */
+    toPrometheus() {
+        const m = this.getMetrics();
+        return [
+            `# HELP pyhsm_operations_total Total HSM operations`,
+            `# TYPE pyhsm_operations_total counter`,
+            `pyhsm_operations_total{type="encrypt"} ${m.encryptOps}`,
+            `pyhsm_operations_total{type="decrypt"} ${m.decryptOps}`,
+            `# HELP pyhsm_errors_total Total HSM errors`,
+            `# TYPE pyhsm_errors_total counter`,
+            `pyhsm_errors_total ${m.errors}`,
+            `# HELP pyhsm_rate_limit_hits_total Rate limit rejections`,
+            `# TYPE pyhsm_rate_limit_hits_total counter`,
+            `pyhsm_rate_limit_hits_total ${m.rateLimitHits}`,
+            `# HELP pyhsm_access_denials_total Access control rejections`,
+            `# TYPE pyhsm_access_denials_total counter`,
+            `pyhsm_access_denials_total ${m.accessDenials}`,
+            `# HELP pyhsm_keys Active keys in the HSM`,
+            `# TYPE pyhsm_keys gauge`,
+            `pyhsm_keys{state="active"} ${m.activeKeys}`,
+            `pyhsm_keys{state="archived"} ${m.archivedKeys}`,
+            `# HELP pyhsm_uptime_seconds HSM uptime`,
+            `# TYPE pyhsm_uptime_seconds gauge`,
+            `pyhsm_uptime_seconds ${(m.uptimeMs / 1000).toFixed(1)}`,
+        ].join("\n");
+    }
+}
+exports.MetricsCollector = MetricsCollector;
+//# sourceMappingURL=metrics.js.map

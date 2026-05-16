@@ -2,6 +2,18 @@
  * PyHSM Type Definitions
  */
 
+// --- Key ID validation ---
+const KEY_ID_REGEX = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/;
+
+export function validateKeyId(keyId: string): void {
+  if (!KEY_ID_REGEX.test(keyId)) {
+    throw new Error(
+      `PyHSM: invalid key ID '${keyId}'. ` +
+      `Must be 1-128 chars, start with alphanumeric, contain only [a-zA-Z0-9._-]`
+    );
+  }
+}
+
 // --- Key Policies ---
 export interface KeyPolicy {
   allowEncrypt: boolean;
@@ -14,7 +26,7 @@ export interface KeyPolicy {
 // --- Key Versioning ---
 export interface KeyVersion {
   version: number;
-  keyData: string; // hex-encoded
+  keyData: string; // hex-encoded wrapped key (AES-KWP)
   createdAt: string;
   archived: boolean; // archived = can decrypt only, not encrypt
 }

@@ -56,11 +56,13 @@ hsm/
 
 ## TypeScript / Node.js
 
-A production-hardened TypeScript implementation lives in `./pyhsm-ts/` and features:
+A production-hardened TypeScript implementation lives in `./pyhsm-ts/`.
+
+### Features
 
 - **AES-256-GCM-SIV** — nonce-misuse-resistant encryption
 - **Argon2id** — memory-hard key derivation (replaces PBKDF2)
-- **AES-KWP** (RFC 5649) — key wrapping for stored key material
+- **AES-KWP** (RFC 5649) — per-key wrapping before storage (defense-in-depth beyond the outer envelope)
 - **Key versioning** — rotate keys without breaking old ciphertexts
 - **Per-key ACLs** — restrict which services can use which keys
 - **Rate limiting** — prevent bulk decryption attacks
@@ -70,11 +72,28 @@ A production-hardened TypeScript implementation lives in `./pyhsm-ts/` and featu
 - **Startup self-tests** — known-answer tests run before accepting operations
 - **HMAC-chained audit log** — tamper-evident operation history
 - **Prometheus metrics** — health monitoring
+- **Buffer-based secret storage** — master password and key material held in zeroizable Buffers, not strings
+- **Key ID validation** — rejects prototype pollution, path traversal, and invalid characters
 
 ### Install
 
 ```bash
+cd pyhsm-ts
 npm install
+```
+
+### Build
+
+```bash
+npm run build     # Compiles to dist/
+npm run lint      # Type-check without emitting
+```
+
+### Test
+
+```bash
+npm test          # Run full test suite (vitest)
+npm run test:watch  # Watch mode
 ```
 
 ### Usage
@@ -82,7 +101,7 @@ npm install
 ```typescript
 import { PyHSM } from './pyhsm-ts';
 
-// Initialize with a single passphrase
+// Initialize with a single passphrase (uses PBKDF2 sync fallback)
 const hsm = new PyHSM({
   storePath: './pyhsm-keystore.enc',
   masterPassword: 'my-passphrase',
@@ -119,6 +138,15 @@ hsm.destroyKey('my-aes-key');
 // Close session (zeroizes memory)
 hsm.closeSession();
 ```
+
+### Key ID Rules
+
+Key IDs must match `^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$`:
+
+- 1–128 characters
+- Must start with a letter or digit
+- May contain letters, digits, `.`, `_`, `-`
+- Rejects `__proto__`, path traversal (`../`), spaces, etc.
 
 ### Shamir M-of-N Unlock
 
@@ -179,14 +207,15 @@ const hsm = new PyHSM({
 | `PYHSM_RATE_LIMIT` | Max operations per window (default: 100) |
 | `PYHSM_RATE_WINDOW_MS` | Rate limit window in ms (default: 60000) |
 | `PYHSM_KEY_ID` | Default key ID for drop-in helpers |
+| `PYHSM_FIPS` | Set to `1` to enable FIPS mode (requires OpenSSL 3.x FIPS provider) |
 
 ### Architecture
 
 ```
 pyhsm-ts/
   index.ts        — Exports, singleton factory, drop-in helpers
-  core.ts         — PyHSM class (encrypt, decrypt, key lifecycle)
-  types.ts        — TypeScript interfaces
+  core.ts         — PyHSM class (encrypt, decrypt, key lifecycle, AES-KWP wrapping)
+  types.ts        — TypeScript interfaces, key ID validation
   shamir.ts       — Shamir's Secret Sharing (GF(256))
   rate-limiter.ts — Per-key rate limiting
   audit.ts        — HMAC-chained audit log
@@ -194,14 +223,20 @@ pyhsm-ts/
   self-test.ts    — Startup known-answer tests, FIPS mode
   process.ts      — Process isolation (Unix socket IPC)
   client.ts       — IPC client
+  pyhsm.test.ts   — Test suite (vitest)
+  package.json    — Dependencies (pinned versions)
+  tsconfig.json   — TypeScript configuration
 ```
 
 ## Security Notes
 
 - Keys never exist unencrypted on disk — the keystore is always AES-256-GCM encrypted
+- Individual keys are additionally wrapped with AES-KWP (RFC 5649) before being placed in the keystore
 - HMAC integrity check on every keystore load — tamper triggers immediate zeroization
-- Master key derived via Argon2id (64 MB memory, 3 iterations) or PBKDF2-SHA256 (480k iterations) as fallback
+- Master key derived via Argon2id (64 MB memory, 3 iterations) or PBKDF2-SHA256 (480k iterations) as sync fallback
+- Master password and caller secret held in `Buffer` objects that are zeroized on session close
 - Each encryption uses a fresh random nonce with AES-256-GCM-SIV (nonce-misuse resistant)
 - Key material is zeroized on session close or tamper detection
 - Atomic file writes prevent keystore corruption
+- Key IDs are validated to prevent prototype pollution and path traversal
 - This is a **development/educational tool** — not a replacement for a certified hardware HSM

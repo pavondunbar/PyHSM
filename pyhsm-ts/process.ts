@@ -11,8 +11,8 @@
 import net from "node:net";
 import fs from "node:fs";
 import crypto from "node:crypto";
-import { PyHSM } from "./core";
-import type { IPCRequest, IPCResponse, PyHSMConfig } from "./types";
+import { PyHSM } from "./core.js";
+import type { IPCRequest, IPCResponse, PyHSMConfig } from "./types.js";
 
 const SOCKET_PATH = process.env.PYHSM_SOCKET_PATH || "/tmp/pyhsm.sock";
 const CALLER_SECRET = process.env.PYHSM_CALLER_SECRET || null;

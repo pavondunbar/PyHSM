@@ -1,0 +1,26 @@
+{
+  "name": "pyhsm-ts",
+  "version": "1.0.0",
+  "description": "Production-hardened software HSM for Node.js",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@noble/ciphers": "1.2.1",
+    "argon2": "0.41.1"
+  },
+  "devDependencies": {
+    "@types/node": "22.15.17",
+    "typescript": "5.8.3",
+    "vitest": "3.1.3"
+  }
+}

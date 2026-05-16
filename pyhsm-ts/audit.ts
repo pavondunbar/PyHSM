@@ -7,7 +7,7 @@
  */
 import crypto from "node:crypto";
 import fs from "node:fs";
-import type { AuditEntry, AuditOperation } from "./types";
+import type { AuditEntry, AuditOperation } from "./types.js";
 
 const HMAC_KEY_ENV = "PYHSM_AUDIT_HMAC_KEY";
 
