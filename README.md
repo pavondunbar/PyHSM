@@ -10,6 +10,7 @@ A software-based Hardware Security Module (HSM) providing cryptographic key mana
 - **Encryption/Decryption**: AES-GCM authenticated encryption
 - **Signing/Verification**: RSA-PSS and ECDSA with SHA-256
 - **Secure Storage**: Keys encrypted at rest with AES-256-GCM, master key derived via PBKDF2 (480k iterations)
+- **Shamir's Secret Sharing**: Split any 256-bit secret into N shares with a K-of-N reconstruction threshold
 
 ### Install
 
@@ -45,6 +46,37 @@ python cli.py -p mypassword delete my-aes-key
 
 Stdin is also supported — omit `-d` and pipe data in.
 
+### Shamir's Secret Sharing (Split / Reconstruct)
+
+Split a 256-bit secret (e.g., a crypto wallet seed) into shares distributed to trusted parties. Any K shares can reconstruct the original; fewer reveal nothing.
+
+```bash
+# Split a hex-encoded secret into 5 shares, requiring 3 to reconstruct
+python cli.py split -k 3 -n 5 -s "deadbeefcafebabe1234567890abcdef1122334455667788aabbccddeeff0011"
+
+# Each share is printed as JSON:
+# {"index": 1, "data": "b0ec51f6..."}
+# {"index": 2, "data": "2a7e8ced..."}
+# ...
+
+# Reconstruct from any 3 shares (pass via --share flags)
+python cli.py reconstruct \
+  --share '{"index":1,"data":"b0ec51f6..."}' \
+  --share '{"index":3,"data":"443f63f4..."}' \
+  --share '{"index":5,"data":"e30ec432..."}'
+
+# Or pipe shares via stdin (one JSON object per line)
+python cli.py split -k 3 -n 5 -s "$SECRET" | head -3 | python cli.py reconstruct
+```
+
+**Security model:**
+- The secret and shares only exist in memory — nothing is written to disk
+- No password is required (these commands don't touch the keystore)
+- K-1 or fewer shares reveal zero information about the secret (information-theoretic security)
+- Uses GF(256) arithmetic with the AES irreducible polynomial, matching the TypeScript implementation
+
+**Use case:** Disaster recovery for a crypto wallet without trusting any single person or creating a single point of failure. Give 5 friends a share each; any 3 can recover your wallet if you lose access.
+
 ### Architecture
 
 ```
@@ -52,6 +84,7 @@ cli.py          — Command-line interface
 hsm/
   core.py       — PyHSM class (crypto operations)
   storage.py    — KeyStore class (encrypted persistence)
+  shamir.py     — Shamir's Secret Sharing (GF(256) split/reconstruct)
 ```
 
 ## TypeScript / Node.js
@@ -62,7 +95,10 @@ A production-hardened TypeScript implementation lives in `./pyhsm-ts/`.
 
 - **AES-256-GCM-SIV** — nonce-misuse-resistant encryption
 - **Argon2id** — memory-hard key derivation (replaces PBKDF2)
+<<<<<<< HEAD
 - **AES-KWP** (RFC 5649) — key wrapping for stored key material
+=======
+>>>>>>> d5383ba (changelog: implemented Shamir's Sharing Secret CLI in codebase and updated README.)
 - **AES-KWP** (RFC 5649) — per-key wrapping before storage (defense-in-depth beyond the outer envelope)
 - **Key versioning** — rotate keys without breaking old ciphertexts
 - **Per-key ACLs** — restrict which services can use which keys
@@ -75,7 +111,10 @@ A production-hardened TypeScript implementation lives in `./pyhsm-ts/`.
 - **Prometheus metrics** — health monitoring
 - **Buffer-based secret storage** — master password and key material held in zeroizable Buffers, not strings
 - **Key ID validation** — rejects prototype pollution, path traversal, and invalid characters
+<<<<<<< HEAD
 
+=======
+>>>>>>> d5383ba (changelog: implemented Shamir's Sharing Secret CLI in codebase and updated README.)
 
 ### Install
 
@@ -103,7 +142,10 @@ npm run test:watch  # Watch mode
 ```typescript
 import { PyHSM } from './pyhsm-ts';
 
+<<<<<<< HEAD
 // Initialize with a single passphrase
+=======
+>>>>>>> d5383ba (changelog: implemented Shamir's Sharing Secret CLI in codebase and updated README.)
 // Initialize with a single passphrase (uses PBKDF2 sync fallback)
 const hsm = new PyHSM({
   storePath: './pyhsm-keystore.enc',
@@ -142,10 +184,13 @@ hsm.destroyKey('my-aes-key');
 hsm.closeSession();
 ```
 
+<<<<<<< HEAD
 ### Shamir M-of-N Unlock
 
 Instead of a single passphrase, you can split the master password into N shares requiring K to reconstruct:
 
+=======
+>>>>>>> d5383ba (changelog: implemented Shamir's Sharing Secret CLI in codebase and updated README.)
 ### Key ID Rules
 
 Key IDs must match `^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$`:
@@ -221,8 +266,11 @@ const hsm = new PyHSM({
 ```
 pyhsm-ts/
   index.ts        — Exports, singleton factory, drop-in helpers
+<<<<<<< HEAD
   core.ts         — PyHSM class (encrypt, decrypt, key lifecycle)
   types.ts        — TypeScript interfaces
+=======
+>>>>>>> d5383ba (changelog: implemented Shamir's Sharing Secret CLI in codebase and updated README.)
   core.ts         — PyHSM class (encrypt, decrypt, key lifecycle, AES-KWP wrapping)
   types.ts        — TypeScript interfaces, key ID validation
   shamir.ts       — Shamir's Secret Sharing (GF(256))
@@ -240,11 +288,14 @@ pyhsm-ts/
 ## Security Notes
 
 - Keys never exist unencrypted on disk — the keystore is always AES-256-GCM encrypted
+<<<<<<< HEAD
 - HMAC integrity check on every keystore load — tamper triggers immediate zeroization
 - Master key derived via Argon2id (64 MB memory, 3 iterations) or PBKDF2-SHA256 (480k iterations) as fallback
 - Each encryption uses a fresh random nonce with AES-256-GCM-SIV (nonce-misuse resistant)
 - Key material is zeroized on session close or tamper detection
 - Atomic file writes prevent keystore corruption
+=======
+>>>>>>> d5383ba (changelog: implemented Shamir's Sharing Secret CLI in codebase and updated README.)
 - Individual keys are additionally wrapped with AES-KWP (RFC 5649) before being placed in the keystore
 - HMAC integrity check on every keystore load — tamper triggers immediate zeroization
 - Master key derived via Argon2id (64 MB memory, 3 iterations) or PBKDF2-SHA256 (480k iterations) as sync fallback
@@ -253,4 +304,8 @@ pyhsm-ts/
 - Key material is zeroized on session close or tamper detection
 - Atomic file writes prevent keystore corruption
 - Key IDs are validated to prevent prototype pollution and path traversal
+<<<<<<< HEAD
+=======
+- Shamir split/reconstruct operates entirely in memory — shares are never persisted
+>>>>>>> d5383ba (changelog: implemented Shamir's Sharing Secret CLI in codebase and updated README.)
 - This is a **development/educational tool** — not a replacement for a certified hardware HSM

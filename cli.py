@@ -3,8 +3,10 @@
 
 import argparse
 import getpass
+import json
 import sys
 from hsm import PyHSM
+from hsm.shamir import split_secret, reconstruct_secret
 
 
 def get_hsm(args):
@@ -67,6 +69,23 @@ def cmd_pubkey(args):
     print(hsm.get_public_key(args.key_id))
 
 
+def cmd_split(args):
+    secret_hex = args.secret or sys.stdin.read().strip()
+    secret = bytes.fromhex(secret_hex)
+    shares = split_secret(secret, args.threshold, args.shares)
+    for s in shares:
+        print(json.dumps(s))
+
+
+def cmd_reconstruct(args):
+    if args.share:
+        shares = [json.loads(s) for s in args.share]
+    else:
+        shares = [json.loads(line) for line in sys.stdin if line.strip()]
+    secret = reconstruct_secret(shares)
+    print(secret.hex())
+
+
 def main():
     parser = argparse.ArgumentParser(prog="pyhsm", description="PyHSM")
     parser.add_argument("--store", default="keystore.enc", help="Key store file path")
@@ -109,6 +128,16 @@ def main():
     pub = sub.add_parser("pubkey", help="Export public key (PEM)")
     pub.add_argument("key_id")
     pub.set_defaults(func=cmd_pubkey)
+
+    sp = sub.add_parser("split", help="Split a 256-bit secret into Shamir shares")
+    sp.add_argument("--threshold", "-k", type=int, required=True, help="Min shares to reconstruct")
+    sp.add_argument("--shares", "-n", type=int, required=True, help="Total shares to generate")
+    sp.add_argument("--secret", "-s", help="Hex-encoded secret (or pipe via stdin)")
+    sp.set_defaults(func=cmd_split)
+
+    rc = sub.add_parser("reconstruct", help="Reconstruct a secret from Shamir shares")
+    rc.add_argument("--share", action="append", help="JSON share (repeat for each share, or pipe via stdin)")
+    rc.set_defaults(func=cmd_reconstruct)
 
     args = parser.parse_args()
     try:
