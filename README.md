@@ -95,10 +95,7 @@ A production-hardened TypeScript implementation lives in `./pyhsm-ts/`.
 
 - **AES-256-GCM-SIV** — nonce-misuse-resistant encryption
 - **Argon2id** — memory-hard key derivation (replaces PBKDF2)
-<<<<<<< HEAD
 - **AES-KWP** (RFC 5649) — key wrapping for stored key material
-=======
->>>>>>> d5383ba (changelog: implemented Shamir's Sharing Secret CLI in codebase and updated README.)
 - **AES-KWP** (RFC 5649) — per-key wrapping before storage (defense-in-depth beyond the outer envelope)
 - **Key versioning** — rotate keys without breaking old ciphertexts
 - **Per-key ACLs** — restrict which services can use which keys
@@ -111,10 +108,6 @@ A production-hardened TypeScript implementation lives in `./pyhsm-ts/`.
 - **Prometheus metrics** — health monitoring
 - **Buffer-based secret storage** — master password and key material held in zeroizable Buffers, not strings
 - **Key ID validation** — rejects prototype pollution, path traversal, and invalid characters
-<<<<<<< HEAD
-
-=======
->>>>>>> d5383ba (changelog: implemented Shamir's Sharing Secret CLI in codebase and updated README.)
 
 ### Install
 
@@ -142,10 +135,6 @@ npm run test:watch  # Watch mode
 ```typescript
 import { PyHSM } from './pyhsm-ts';
 
-<<<<<<< HEAD
-// Initialize with a single passphrase
-=======
->>>>>>> d5383ba (changelog: implemented Shamir's Sharing Secret CLI in codebase and updated README.)
 // Initialize with a single passphrase (uses PBKDF2 sync fallback)
 const hsm = new PyHSM({
   storePath: './pyhsm-keystore.enc',
@@ -184,13 +173,10 @@ hsm.destroyKey('my-aes-key');
 hsm.closeSession();
 ```
 
-<<<<<<< HEAD
 ### Shamir M-of-N Unlock
 
 Instead of a single passphrase, you can split the master password into N shares requiring K to reconstruct:
 
-=======
->>>>>>> d5383ba (changelog: implemented Shamir's Sharing Secret CLI in codebase and updated README.)
 ### Key ID Rules
 
 Key IDs must match `^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$`:
@@ -266,11 +252,8 @@ const hsm = new PyHSM({
 ```
 pyhsm-ts/
   index.ts        — Exports, singleton factory, drop-in helpers
-<<<<<<< HEAD
   core.ts         — PyHSM class (encrypt, decrypt, key lifecycle)
   types.ts        — TypeScript interfaces
-=======
->>>>>>> d5383ba (changelog: implemented Shamir's Sharing Secret CLI in codebase and updated README.)
   core.ts         — PyHSM class (encrypt, decrypt, key lifecycle, AES-KWP wrapping)
   types.ts        — TypeScript interfaces, key ID validation
   shamir.ts       — Shamir's Secret Sharing (GF(256))
@@ -288,14 +271,11 @@ pyhsm-ts/
 ## Security Notes
 
 - Keys never exist unencrypted on disk — the keystore is always AES-256-GCM encrypted
-<<<<<<< HEAD
 - HMAC integrity check on every keystore load — tamper triggers immediate zeroization
 - Master key derived via Argon2id (64 MB memory, 3 iterations) or PBKDF2-SHA256 (480k iterations) as fallback
 - Each encryption uses a fresh random nonce with AES-256-GCM-SIV (nonce-misuse resistant)
 - Key material is zeroized on session close or tamper detection
 - Atomic file writes prevent keystore corruption
-=======
->>>>>>> d5383ba (changelog: implemented Shamir's Sharing Secret CLI in codebase and updated README.)
 - Individual keys are additionally wrapped with AES-KWP (RFC 5649) before being placed in the keystore
 - HMAC integrity check on every keystore load — tamper triggers immediate zeroization
 - Master key derived via Argon2id (64 MB memory, 3 iterations) or PBKDF2-SHA256 (480k iterations) as sync fallback
@@ -304,8 +284,5 @@ pyhsm-ts/
 - Key material is zeroized on session close or tamper detection
 - Atomic file writes prevent keystore corruption
 - Key IDs are validated to prevent prototype pollution and path traversal
-<<<<<<< HEAD
-=======
 - Shamir split/reconstruct operates entirely in memory — shares are never persisted
->>>>>>> d5383ba (changelog: implemented Shamir's Sharing Secret CLI in codebase and updated README.)
 - This is a **development/educational tool** — not a replacement for a certified hardware HSM
