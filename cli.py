@@ -6,7 +6,7 @@ import getpass
 import json
 import sys
 from hsm import PyHSM
-from hsm.shamir import split_secret, reconstruct_secret
+from hsm.shamir import split_secret, reconstruct_secret, zeroize
 
 
 def get_hsm(args):
@@ -83,7 +83,10 @@ def cmd_reconstruct(args):
     else:
         shares = [json.loads(line) for line in sys.stdin if line.strip()]
     secret = reconstruct_secret(shares)
-    print(secret.hex())
+    try:
+        print(secret.hex())
+    finally:
+        zeroize(secret)
 
 
 def main():

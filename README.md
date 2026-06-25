@@ -74,6 +74,24 @@ python cli.py split -k 3 -n 5 -s "$SECRET" | head -3 | python cli.py reconstruct
 - No password is required (these commands don't touch the keystore)
 - K-1 or fewer shares reveal zero information about the secret (information-theoretic security)
 - Uses GF(256) arithmetic with the AES irreducible polynomial, matching the TypeScript implementation
+- **Automatic zeroization:** `reconstruct_secret` returns a mutable `bytearray` that is wiped from memory after use. Intermediate share buffers are also zeroized before the function returns.
+
+### Zeroization
+
+After reconstruction, secret material is explicitly overwritten with zeros to minimize its lifetime in memory. The CLI handles this automatically. In your own code, use the `zeroize` helper:
+
+```python
+from hsm.shamir import reconstruct_secret, zeroize
+
+secret = reconstruct_secret(shares)
+try:
+    # Use the secret (e.g., sign a transaction)
+    signed_tx = sign(tx, private_key=bytes(secret))
+finally:
+    zeroize(secret)  # Overwrites the bytearray with zeros
+```
+
+**Note:** Python's garbage collector may retain copies of derived objects (e.g., the `bytes()` cast above). For maximum security, perform reconstruction and signing on an air-gapped machine and minimize conversions from the `bytearray`.
 
 **Use case:** Disaster recovery for a crypto wallet without trusting any single person or creating a single point of failure. Give 5 friends a share each; any 3 can recover your wallet if you lose access.
 

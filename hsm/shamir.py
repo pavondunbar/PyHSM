@@ -55,12 +55,21 @@ def split_secret(secret: bytes, k: int, n: int) -> list[dict]:
     return [{"index": i + 1, "data": bytes(shares[i]).hex()} for i in range(n)]
 
 
-def reconstruct_secret(shares: list[dict]) -> bytes:
-    """Reconstruct a secret from k or more shares via Lagrange interpolation."""
+def zeroize(buf: bytearray) -> None:
+    """Overwrite a bytearray with zeros to remove secret material from memory."""
+    for i in range(len(buf)):
+        buf[i] = 0
+
+
+def reconstruct_secret(shares: list[dict]) -> bytearray:
+    """Reconstruct a secret from k or more shares via Lagrange interpolation.
+
+    Returns a mutable bytearray so the caller can zeroize it after use.
+    """
     if len(shares) < 2:
         raise ValueError("Need at least 2 shares")
 
-    bufs = [bytes.fromhex(s["data"]) for s in shares]
+    bufs = [bytearray.fromhex(s["data"]) for s in shares]
     length = len(bufs[0])
     result = bytearray(length)
 
@@ -75,4 +84,8 @@ def reconstruct_secret(shares: list[dict]) -> bytes:
             secret ^= _gf_mul(bufs[i][b], lagrange)
         result[b] = secret
 
-    return bytes(result)
+    # Zeroize intermediate share buffers
+    for buf in bufs:
+        zeroize(buf)
+
+    return result
