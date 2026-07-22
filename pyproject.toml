@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyhsm"
+version = "1.0.0"
+description = "Production-grade software Key Management Service (KMS) — key lifecycle, authenticated encryption, digital signing, and tamper-evident audit logging."
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+authors = [
+    {name = "Pavon Dunbar"},
+]
+keywords = ["hsm", "kms", "cryptography", "key-management", "encryption", "signing", "audit"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security :: Cryptography",
+    "Topic :: Software Development :: Libraries",
+    "Typing :: Typed",
+]
+dependencies = [
+    "cryptography>=43.0.0,<48.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0,<9.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/pavondunbar/PyHSM"
+Repository = "https://github.com/pavondunbar/PyHSM"
+Issues = "https://github.com/pavondunbar/PyHSM/issues"
+
+[project.scripts]
+pyhsm = "cli:main"
+
+[tool.setuptools.packages.find]
+include = ["hsm*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools.package-data]
+hsm = ["py.typed"]

@@ -27,6 +27,9 @@ import { MetricsCollector } from "./metrics.js";
 import { runSelfTests } from "./self-test.js";
 import { reconstructMasterPassword, type ShamirShare } from "./shamir.js";
 import { SecureBuffer, zeroBuffer } from "./secure-buffer.js";
+import type { StorageBackend } from "./storage-backend.js";
+import { FileBackend } from "./storage-backend.js";
+import { exportSymmetricJwk, exportAsymmetricJwk, importJwk, type JWK } from "./jwk.js";
 
 const SALT_LEN = 16;
 const NONCE_LEN = 12;
@@ -38,17 +41,29 @@ const ARGON2_MEM_COST = 65536; // 64 MB
 const ARGON2_TIME_COST = 3;
 const ARGON2_PARALLELISM = 4;
 
+// Maximum plaintext size (64 MB) — prevents OOM denial-of-service
+const MAX_PLAINTEXT_SIZE = 64 * 1024 * 1024;
+
 // --- Constant-time utilities ---
 function constantTimeEqual(a: string, b: string): boolean {
   const bufA = Buffer.from(a);
   const bufB = Buffer.from(b);
-  if (bufA.length !== bufB.length) return false;
-  return crypto.timingSafeEqual(bufA, bufB);
+  // Pad the shorter buffer to prevent length-based timing leak
+  const maxLen = Math.max(bufA.length, bufB.length);
+  const paddedA = Buffer.alloc(maxLen);
+  const paddedB = Buffer.alloc(maxLen);
+  bufA.copy(paddedA);
+  bufB.copy(paddedB);
+  // timingSafeEqual requires same length — now guaranteed
+  const equal = crypto.timingSafeEqual(paddedA, paddedB);
+  // Also check original lengths match (after constant-time compare)
+  return equal && bufA.length === bufB.length;
 }
 
 export class PyHSM {
   private store: KeystoreData = { version: 3, keys: {} };
   private storePath!: string;
+  private backend!: StorageBackend;
   private masterPasswordBuf: Buffer = Buffer.alloc(0);
   private sessionActive = false;
   private lastActivity = 0;
@@ -67,7 +82,71 @@ export class PyHSM {
   private backupDir: string | null = null;
 
   constructor(config: PyHSMConfig) {
+    // When called from create(), config is the sentinel — skip all initialization
+    if ((config as unknown) === PyHSM._createSentinel) return;
+
+    this.initFields(config);
+
+    // Run self-tests before accepting any operations
+    try {
+      runSelfTests();
+      this.audit.record("selfTestPass", { success: true });
+    } catch (e: any) {
+      this.audit.record("selfTestFail", { success: false, reason: e.message });
+      throw e;
+    }
+
+    this.openSession();
+  }
+
+  /**
+   * Async factory — uses Argon2id for key derivation (preferred).
+   * The constructor uses PBKDF2 as sync fallback; this method upgrades to Argon2id
+   * and re-saves the keystore so subsequent loads use the Argon2id-derived key.
+   */
+  static async create(config: PyHSMConfig): Promise<PyHSM> {
+    // Construct instance without calling the normal constructor (skip sync open)
+    const instance = new PyHSM(PyHSM._createSentinel as unknown as PyHSMConfig);
+    instance.initFields(config);
+
+    // If keystore exists, pre-derive with Argon2id before loading
+    if (instance.backend.exists()) {
+      const raw = instance.backend.read();
+      instance._cachedSalt = Buffer.from(raw.subarray(0, SALT_LEN));
+      instance._cachedDerivedKey = await instance.deriveKeyAsync(instance._cachedSalt);
+    }
+
+    // Run self-tests
+    runSelfTests();
+    instance.audit.record("selfTestPass", { success: true });
+
+    // Open session (will use Argon2id-derived key for load)
+    instance.load();
+    instance.sessionActive = true;
+    instance.lastActivity = Date.now();
+    instance.scheduleTimeout();
+    instance.audit.record("sessionOpen", { success: true });
+    instance.updateKeyMetrics();
+
+    // Ensure Argon2id key is cached for saves on new keystores
+    if (!instance._cachedDerivedKey || !instance._cachedSalt) {
+      instance._cachedSalt = crypto.randomBytes(SALT_LEN);
+      instance._cachedDerivedKey = await instance.deriveKeyAsync(instance._cachedSalt);
+    }
+
+    return instance;
+  }
+
+  /** Sentinel value to distinguish internal create() calls from user constructor calls. */
+  private static readonly _createSentinel = Symbol("PyHSM.create");
+
+  /**
+   * Shared initialization logic used by both the constructor and create().
+   * Resolves the storage backend, master password, and sub-modules.
+   */
+  private initFields(config: PyHSMConfig): void {
     this.storePath = config.storePath;
+    this.backend = config.backend || new FileBackend(config.storePath);
     this.sessionTimeoutMs = config.sessionTimeoutMs || 5 * 60 * 1000;
     this.callerSecret = config.callerSecret
       ? Buffer.from(config.callerSecret, "utf8")
@@ -95,103 +174,6 @@ export class PyHSM {
       parseInt(process.env.PYHSM_RATE_WINDOW_MS || "60000", 10),
     );
     this.metrics = new MetricsCollector();
-
-    // Run self-tests before accepting any operations
-    try {
-      runSelfTests();
-      this.audit.record("selfTestPass", { success: true });
-    } catch (e: any) {
-      this.audit.record("selfTestFail", { success: false, reason: e.message });
-      throw e;
-    }
-
-    this.openSession();
-  }
-
-  /**
-   * Async factory — uses Argon2id for key derivation (preferred).
-   * The constructor uses PBKDF2 as sync fallback; this method upgrades to Argon2id
-   * and re-saves the keystore so subsequent loads use the Argon2id-derived key.
-   */
-  static async create(config: PyHSMConfig): Promise<PyHSM> {
-    // If keystore exists, read salt and pre-derive with Argon2id before constructing
-    let preDerivedKey: Buffer | null = null;
-    let preSalt: Buffer | null = null;
-    if (fs.existsSync(config.storePath)) {
-      const raw = fs.readFileSync(config.storePath);
-      preSalt = Buffer.from(raw.subarray(0, SALT_LEN));
-      const tempPasswordBuf = config.masterPassword
-        ? Buffer.from(config.masterPassword, "utf8")
-        : Buffer.from(reconstructMasterPassword(
-            (config.shares || []).map(s => JSON.parse(s))
-          ), "utf8");
-      preDerivedKey = await argon2.hash(tempPasswordBuf, {
-        type: argon2.argon2id,
-        salt: preSalt,
-        memoryCost: ARGON2_MEM_COST,
-        timeCost: ARGON2_TIME_COST,
-        parallelism: ARGON2_PARALLELISM,
-        hashLength: 32,
-        raw: true,
-      }).then(r => Buffer.from(r));
-    }
-
-    // Construct — if we have a pre-derived key, inject it before load() runs
-    const instance = Object.create(PyHSM.prototype) as PyHSM;
-    instance.store = { version: 3, keys: {} };
-    instance.storePath = config.storePath;
-    instance.sessionTimeoutMs = config.sessionTimeoutMs || 5 * 60 * 1000;
-    instance.callerSecret = config.callerSecret
-      ? Buffer.from(config.callerSecret, "utf8")
-      : process.env.PYHSM_CALLER_SECRET
-        ? Buffer.from(process.env.PYHSM_CALLER_SECRET, "utf8")
-        : null;
-    instance.backupDir = config.backupDir || process.env.PYHSM_BACKUP_DIR || null;
-    instance.sessionActive = false;
-    instance.lastActivity = 0;
-    instance.sessionTimer = null;
-
-    if (config.masterPassword) {
-      instance.masterPasswordBuf = Buffer.from(config.masterPassword, "utf8");
-    } else if (config.shares && config.shares.length > 0) {
-      const shares: ShamirShare[] = config.shares.map(s => JSON.parse(s));
-      instance.masterPasswordBuf = Buffer.from(reconstructMasterPassword(shares), "utf8");
-    } else {
-      throw new Error("PyHSM: masterPassword or shares required");
-    }
-
-    // Set cached Argon2id key before load
-    instance._cachedDerivedKey = preDerivedKey;
-    instance._cachedSalt = preSalt;
-
-    const auditPath = config.auditLogPath || config.storePath + ".audit.jsonl";
-    instance.audit = new AuditLog(auditPath);
-    instance.rateLimiter = new RateLimiter(
-      parseInt(process.env.PYHSM_RATE_LIMIT || "100", 10),
-      parseInt(process.env.PYHSM_RATE_WINDOW_MS || "60000", 10),
-    );
-    instance.metrics = new MetricsCollector();
-
-    runSelfTests();
-    instance.audit.record("selfTestPass", { success: true });
-
-    // Open session (will use Argon2id-derived key for load)
-    instance.load();
-    instance.sessionActive = true;
-    instance.lastActivity = Date.now();
-    instance.scheduleTimeout();
-    instance.audit.record("sessionOpen", { success: true });
-    instance.updateKeyMetrics();
-
-    // For both new and existing keystores, ensure we have an Argon2id-derived
-    // key cached so the very first save() always uses Argon2id — never the
-    // PBKDF2 sync fallback that fires when _cachedDerivedKey is null.
-    if (!instance._cachedDerivedKey || !instance._cachedSalt) {
-      instance._cachedSalt = crypto.randomBytes(SALT_LEN);
-      instance._cachedDerivedKey = await instance.deriveKeyAsync(instance._cachedSalt);
-    }
-
-    return instance;
   }
 
   // --- Session Management ---
@@ -265,6 +247,18 @@ export class PyHSM {
     return crypto.pbkdf2Sync(this.masterPasswordBuf, salt, 480_000, 32, "sha256");
   }
 
+  /**
+   * Derive separate encryption and MAC keys via HKDF-Expand.
+   * Returns { encKey, macKey } — each 32 bytes. Caller must zeroize both.
+   */
+  private deriveSubkeys(salt: Buffer): { encKey: Buffer; macKey: Buffer } {
+    const master = this.deriveKey(salt);
+    const encKey = Buffer.from(crypto.hkdfSync("sha256", master, Buffer.alloc(0), "pyhsm-enc-v1", 32));
+    const macKey = Buffer.from(crypto.hkdfSync("sha256", master, Buffer.alloc(0), "pyhsm-mac-v1", 32));
+    zeroBuffer(master);
+    return { encKey, macKey };
+  }
+
   private async deriveKeyAsync(salt: Buffer): Promise<Buffer> {
     const raw = await argon2.hash(this.masterPasswordBuf, {
       type: argon2.argon2id,
@@ -311,8 +305,8 @@ export class PyHSM {
   }
 
   private load(): void {
-    if (!fs.existsSync(this.storePath)) return;
-    const raw = fs.readFileSync(this.storePath);
+    if (!this.backend.exists()) return;
+    const raw = this.backend.read();
 
     if (raw.length < SALT_LEN + 32 + NONCE_LEN + TAG_LEN) {
       this.handleTamper("Keystore file too short");
@@ -322,11 +316,12 @@ export class PyHSM {
     const salt = raw.subarray(0, SALT_LEN);
     const storedHmac = raw.subarray(SALT_LEN, SALT_LEN + 32);
     const payload = raw.subarray(SALT_LEN + 32);
-    const key = this.deriveKey(Buffer.from(salt));
+    const { encKey, macKey } = this.deriveSubkeys(Buffer.from(salt));
 
-    const expectedHmac = this.computeHmac(payload, key);
+    const expectedHmac = this.computeHmac(payload, macKey);
     if (!crypto.timingSafeEqual(storedHmac, expectedHmac)) {
-      zeroBuffer(key);
+      zeroBuffer(encKey);
+      zeroBuffer(macKey);
       this.handleTamper("HMAC verification failed");
       return;
     }
@@ -336,10 +331,11 @@ export class PyHSM {
     const tag = ct.subarray(ct.length - TAG_LEN);
     const encrypted = ct.subarray(0, ct.length - TAG_LEN);
 
-    const decipher = crypto.createDecipheriv("aes-256-gcm", key, nonce);
+    const decipher = crypto.createDecipheriv("aes-256-gcm", encKey, nonce);
     decipher.setAuthTag(tag);
     const plain = Buffer.concat([decipher.update(encrypted), decipher.final()]);
-    zeroBuffer(key);
+    zeroBuffer(encKey);
+    zeroBuffer(macKey);
 
     const parsed = JSON.parse(plain.toString("utf8"));
     zeroBuffer(plain);
@@ -373,7 +369,7 @@ export class PyHSM {
   private save(): void {
     // Reuse cached salt so the Argon2id derived key remains valid
     const salt = this._cachedSalt ? Buffer.from(this._cachedSalt) : crypto.randomBytes(SALT_LEN);
-    const key = this.deriveKey(salt);
+    const { encKey, macKey } = this.deriveSubkeys(salt);
 
     // Update cache if we generated a new salt (PBKDF2 fallback path)
     if (!this._cachedSalt) {
@@ -381,21 +377,19 @@ export class PyHSM {
     }
 
     const nonce = crypto.randomBytes(NONCE_LEN);
-    const cipher = crypto.createCipheriv("aes-256-gcm", key, nonce);
+    const cipher = crypto.createCipheriv("aes-256-gcm", encKey, nonce);
     const ct = Buffer.concat([
       cipher.update(JSON.stringify(this.store), "utf8"),
       cipher.final(),
       cipher.getAuthTag(),
     ]);
     const payload = Buffer.concat([nonce, ct]);
-    const hmac = this.computeHmac(payload, key);
-    zeroBuffer(key);
+    const hmac = this.computeHmac(payload, macKey);
+    zeroBuffer(encKey);
+    zeroBuffer(macKey);
 
     const fileData = Buffer.concat([salt, hmac, payload]);
-    // Atomic write
-    const tmp = this.storePath + ".tmp." + crypto.randomBytes(4).toString("hex");
-    fs.writeFileSync(tmp, fileData, { mode: 0o600 });
-    fs.renameSync(tmp, this.storePath);
+    this.backend.write(fileData);
   }
 
   private handleTamper(reason: string): void {
@@ -573,6 +567,70 @@ export class PyHSM {
   }
 
   /**
+   * Export a key as a JWK (JSON Web Key, RFC 7517).
+   * WARNING: The returned object contains raw private key material.
+   */
+  exportJwk(keyId: string): JWK {
+    this.assertSession();
+    validateKeyId(keyId);
+    const entry = this.store.keys[keyId];
+    if (!entry) throw new Error(`PyHSM: key '${keyId}' not found`);
+
+    const current = entry.versions.find((v) => v.version === entry.currentVersion);
+    if (!current) throw new Error(`PyHSM: no current version for key '${keyId}'`);
+
+    const rawKey = this.unwrapFromStorage(current.keyData);
+    try {
+      if (entry.keyType.startsWith("aes")) {
+        return exportSymmetricJwk(rawKey, keyId);
+      } else {
+        return exportAsymmetricJwk(rawKey, keyId);
+      }
+    } finally {
+      zeroBuffer(rawKey);
+    }
+  }
+
+  /**
+   * Import a key from a JWK (JSON Web Key, RFC 7517).
+   * The key material is wrapped with AES-KWP before storage.
+   */
+  importKeyJwk(keyId: string, jwk: JWK, policy?: Partial<KeyPolicy>, callerId = "system"): void {
+    this.assertSession();
+    validateKeyId(keyId);
+    if (this.store.keys[keyId]) throw new Error(`PyHSM: key '${keyId}' already exists`);
+
+    const { keyType, rawKeyBytes, publicKeyPem } = importJwk(jwk);
+
+    const wrappedHex = this.wrapForStorage(rawKeyBytes);
+    zeroBuffer(rawKeyBytes);
+
+    this.store.keys[keyId] = {
+      keyId,
+      keyType,
+      currentVersion: 1,
+      versions: [{
+        version: 1,
+        keyData: wrappedHex,
+        createdAt: new Date().toISOString(),
+        archived: false,
+      }],
+      policy: { allowEncrypt: true, allowDecrypt: true, ...policy },
+      operationCount: 0,
+      createdAt: new Date().toISOString(),
+    };
+
+    // Store public key PEM if asymmetric (for future use)
+    if (publicKeyPem) {
+      (this.store.keys[keyId] as unknown as Record<string, unknown>).publicKeyPem = publicKeyPem;
+    }
+
+    this.audit.record("generateKey", { keyId, callerId, success: true });
+    this.save();
+    this.updateKeyMetrics();
+  }
+
+  /**
    * Encrypt with the current key version using AES-256-GCM-SIV (nonce misuse resistant).
    * Output format: base64(versionPrefix(4) || nonce(12) || ciphertext+tag)
    */
@@ -592,9 +650,16 @@ export class PyHSM {
     const aesKeyBuf = SecureBuffer.wrap(this.unwrapFromStorage(current.keyData));
     let result: string;
     try {
+      const plaintextBytes = new TextEncoder().encode(plaintext);
+      if (plaintextBytes.length > MAX_PLAINTEXT_SIZE) {
+        throw new Error(
+          `PyHSM: plaintext too large (${plaintextBytes.length} bytes). ` +
+          `Maximum is ${MAX_PLAINTEXT_SIZE} bytes (64 MB).`
+        );
+      }
       const nonce = crypto.randomBytes(NONCE_LEN);
       const sivCipher = siv(new Uint8Array(aesKeyBuf.buf), new Uint8Array(nonce));
-      const ct = sivCipher.encrypt(new TextEncoder().encode(plaintext));
+      const ct = sivCipher.encrypt(plaintextBytes);
 
       const versionBuf = Buffer.alloc(VERSION_PREFIX_LEN);
       versionBuf.writeUInt32BE(current.version);
@@ -606,7 +671,7 @@ export class PyHSM {
     entry.operationCount++;
     this.metrics.recordOp("encrypt");
     this.audit.record("encrypt", { keyId, callerId, success: true });
-    if (entry.operationCount % 10 === 0) this.save();
+    this.save();
 
     return result;
   }
@@ -649,7 +714,7 @@ export class PyHSM {
     entry.operationCount++;
     this.metrics.recordOp("decrypt");
     this.audit.record("decrypt", { keyId, callerId, success: true });
-    if (entry.operationCount % 10 === 0) this.save();
+    this.save();
 
     return plainText;
   }
@@ -665,8 +730,9 @@ export class PyHSM {
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
     const backupPath = `${dir}/pyhsm-backup-${timestamp}.enc`;
 
-    fs.copyFileSync(this.storePath, backupPath);
-    fs.chmodSync(backupPath, 0o600);
+    // Read current keystore data from backend and write to backup file
+    const data = this.backend.read();
+    fs.writeFileSync(backupPath, data, { mode: 0o600 });
 
     this.audit.record("backup", { callerId, success: true });
     return backupPath;
@@ -693,11 +759,12 @@ export class PyHSM {
     const salt = raw.subarray(0, SALT_LEN);
     const storedHmac = raw.subarray(SALT_LEN, SALT_LEN + 32);
     const payload = raw.subarray(SALT_LEN + 32);
-    const key = this.deriveKey(Buffer.from(salt));
+    const { encKey, macKey } = this.deriveSubkeys(Buffer.from(salt));
 
-    const expectedHmac = this.computeHmac(payload, key);
+    const expectedHmac = this.computeHmac(payload, macKey);
     if (!crypto.timingSafeEqual(storedHmac, expectedHmac)) {
-      zeroBuffer(key);
+      zeroBuffer(encKey);
+      zeroBuffer(macKey);
       this.audit.record("verifyBackup", { callerId, success: false });
       throw new Error(`PyHSM: backup HMAC verification FAILED — file may be corrupted or tampered: ${backupPath}`);
     }
@@ -708,17 +775,19 @@ export class PyHSM {
     const tag = ct.subarray(ct.length - TAG_LEN);
     const encrypted = ct.subarray(0, ct.length - TAG_LEN);
 
-    const decipher = crypto.createDecipheriv("aes-256-gcm", key, nonce);
+    const decipher = crypto.createDecipheriv("aes-256-gcm", encKey, nonce);
     decipher.setAuthTag(tag);
     try {
       Buffer.concat([decipher.update(encrypted), decipher.final()]);
     } catch {
-      zeroBuffer(key);
+      zeroBuffer(encKey);
+      zeroBuffer(macKey);
       this.audit.record("verifyBackup", { callerId, success: false });
       throw new Error(`PyHSM: backup decryption FAILED — file may be corrupted: ${backupPath}`);
     }
 
-    zeroBuffer(key);
+    zeroBuffer(encKey);
+    zeroBuffer(macKey);
     this.audit.record("verifyBackup", { callerId, success: true });
     return true;
   }

@@ -28,18 +28,33 @@ from typing import Optional
 from cryptography.hazmat.primitives.asymmetric import rsa, ec, padding
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.keywrap import aes_key_wrap_with_padding, aes_key_unwrap_with_padding
 
 from .storage import KeyStore, TamperError
 from .audit import AuditLog
 from .rate_limiter import RateLimiter
 from .metrics import MetricsCollector
 from .self_test import run_self_tests
+from .secure_memory import SecureBytes, zeroize_bytearray
+from .jwk import (
+    export_symmetric_jwk,
+    export_ec_jwk,
+    export_rsa_jwk,
+    import_jwk as _import_jwk,
+)
 
 # Key ID validation: 1-128 chars, start alphanumeric, body [a-zA-Z0-9._-]
 _KEY_ID_RE = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9._\-]{0,127}$')
 
 # Ciphertext version prefix length (4 bytes big-endian uint32)
 _VERSION_PREFIX_LEN = 4
+
+# Ciphertext format version: 0x02 = AAD-bound; 0x01 = legacy (no AAD)
+_CT_FORMAT_V2 = 2
+_CT_FORMAT_V1 = 1
+
+# Maximum plaintext size (64 MB) — prevents OOM denial-of-service
+_MAX_PLAINTEXT_SIZE = 64 * 1024 * 1024
 
 
 def _validate_key_id(key_id: str) -> None:
@@ -111,7 +126,11 @@ class PyHSM:
         self._store = KeyStore(storage_path, master_password)
         self._session_active = True
         self._last_activity = _now()
-        self._lock = threading.Lock()
+        # Sharded locks: per-key operations use striped locks for concurrency,
+        # global lock only for session/lifecycle operations
+        self._global_lock = threading.Lock()
+        self._key_locks: dict[str, threading.Lock] = {}
+        self._key_locks_lock = threading.Lock()  # protects _key_locks dict
 
         self._start_timeout_thread()
         self._audit.record("sessionOpen", success=True)
@@ -132,7 +151,7 @@ class PyHSM:
         import time
         while True:
             time.sleep(max(1.0, self._session_timeout_s / 10))
-            with self._lock:
+            with self._global_lock:
                 if not self._session_active:
                     return
                 if _now() - self._last_activity >= self._session_timeout_s:
@@ -147,9 +166,16 @@ class PyHSM:
             raise RuntimeError("PyHSM: session is closed. Create a new instance.")
         self._touch()
 
+    def _key_lock(self, key_id: str) -> threading.Lock:
+        """Get or create a per-key lock for concurrent operations."""
+        with self._key_locks_lock:
+            if key_id not in self._key_locks:
+                self._key_locks[key_id] = threading.Lock()
+            return self._key_locks[key_id]
+
     def close_session(self) -> None:
         """Explicitly close the session, flushing and zeroizing key material."""
-        with self._lock:
+        with self._global_lock:
             self._close_session_locked()
 
     def _close_session_locked(self) -> None:
@@ -172,6 +198,27 @@ class PyHSM:
                 active += 1
         self._metrics.set_key_count(active, archived)
 
+
+    # ------------------------------------------------------------------
+    # Per-key wrapping (AES-KWP RFC 5649)
+    # ------------------------------------------------------------------
+
+    def _wrap_key_data(self, raw_key: bytes) -> str:
+        """Wrap raw key material with AES-KWP, return hex string for storage."""
+        kek = self._store._derive_kek()
+        try:
+            wrapped = aes_key_wrap_with_padding(bytes(kek), raw_key)
+            return wrapped.hex()
+        finally:
+            zeroize_bytearray(kek)
+
+    def _unwrap_key_data(self, wrapped_hex: str) -> bytes:
+        """Unwrap stored key material from hex. Caller must manage the result."""
+        kek = self._store._derive_kek()
+        try:
+            return aes_key_unwrap_with_padding(bytes(kek), bytes.fromhex(wrapped_hex))
+        finally:
+            zeroize_bytearray(kek)
 
     # ------------------------------------------------------------------
     # Policy enforcement
@@ -222,22 +269,27 @@ class PyHSM:
         Supported types: aes-128, aes-256, rsa-2048, rsa-4096, ec-p256.
         Returns the key_id.
         """
-        with self._lock:
+        with self._global_lock:
             self._assert_session()
             _validate_key_id(key_id)
 
             if key_type == "aes-256":
-                key_data = os.urandom(32).hex()
+                raw = os.urandom(32)
+                key_data = self._wrap_key_data(raw)
                 public_key_pem = None
             elif key_type == "aes-128":
-                key_data = os.urandom(16).hex()
+                raw = os.urandom(16)
+                key_data = self._wrap_key_data(raw)
                 public_key_pem = None
             elif key_type == "rsa-2048":
-                key_data, public_key_pem = _gen_rsa(2048)
+                priv_pem, public_key_pem = _gen_rsa(2048)
+                key_data = self._wrap_key_data(priv_pem.encode())
             elif key_type == "rsa-4096":
-                key_data, public_key_pem = _gen_rsa(4096)
+                priv_pem, public_key_pem = _gen_rsa(4096)
+                key_data = self._wrap_key_data(priv_pem.encode())
             elif key_type == "ec-p256":
-                key_data, public_key_pem = _gen_ec(ec.SECP256R1())
+                priv_pem, public_key_pem = _gen_ec(ec.SECP256R1())
+                key_data = self._wrap_key_data(priv_pem.encode())
             else:
                 raise ValueError(f"Unsupported key type: {key_type}")
 
@@ -276,7 +328,7 @@ class PyHSM:
         Returns the new version number.
         Only works for AES keys.
         """
-        with self._lock:
+        with self._global_lock:
             self._assert_session()
             _validate_key_id(key_id)
             entry = self._store.load_key(key_id)
@@ -293,9 +345,10 @@ class PyHSM:
             # Generate new version
             key_len = 32 if entry["key_type"] == "aes-256" else 16
             new_version = entry["current_version"] + 1
+            raw = os.urandom(key_len)
             entry["versions"].append({
                 "version": new_version,
-                "key_data": os.urandom(key_len).hex(),
+                "key_data": self._wrap_key_data(raw),
                 "created_at": _utcnow(),
                 "archived": False,
             })
@@ -311,21 +364,30 @@ class PyHSM:
 
     def destroy_key(self, key_id: str) -> None:
         """Destroy a key — all versions are zeroized and removed."""
-        with self._lock:
+        with self._global_lock:
             self._assert_session()
             _validate_key_id(key_id)
             entry = self._store.load_key(key_id)
-            # Overwrite all key material in memory
+            # Overwrite all key material in memory byte-by-byte
             for v in entry["versions"]:
-                v["key_data"] = "0" * len(v["key_data"])
+                kd = v["key_data"]
+                if isinstance(kd, bytearray):
+                    for i in range(len(kd)):
+                        kd[i] = 0
+                else:
+                    # hex string — overwrite reference (strings are immutable)
+                    v["key_data"] = "0" * len(kd)
             self._store.delete_key(key_id)
             self._rate_limiter.reset(key_id)
+            # Clean up per-key lock to prevent unbounded growth
+            with self._key_locks_lock:
+                self._key_locks.pop(key_id, None)
             self._audit.record("destroyKey", key_id=key_id, success=True)
             self._update_key_metrics()
 
     def list_keys(self) -> list[dict]:
         """List all key IDs with their types, creation dates, and policies."""
-        with self._lock:
+        with self._global_lock:
             self._assert_session()
             keys = self._store.load_all()
             return [
@@ -341,7 +403,7 @@ class PyHSM:
 
     def has_key(self, key_id: str) -> bool:
         """Check whether a key_id exists in the store."""
-        with self._lock:
+        with self._global_lock:
             self._assert_session()
             try:
                 self._store.load_key(key_id)
@@ -357,10 +419,19 @@ class PyHSM:
     def encrypt(self, key_id: str, plaintext) -> str:
         """
         Encrypt data using a stored AES key.
-        Returns hex-encoded: version(4 bytes) + nonce(12) + ciphertext+tag.
+
+        Returns hex-encoded: format(1) + version(4 bytes) + nonce(12) + ciphertext+tag.
         Ciphertext is always encrypted with the current key version.
+
+        Security features:
+          - Per-key AES-KWP wrapping (keys double-encrypted at rest)
+          - AAD binds ciphertext to the key_id (prevents cross-key confusion)
+          - Hybrid nonce: 4-byte random prefix + 4-byte counter + 4-byte random
+            suffix. The counter prevents birthday-bound collisions even at
+            high encryption volumes (safe well beyond 2^32 operations per key).
+          - Input size validation (max 64 MB)
         """
-        with self._lock:
+        with self._key_lock(key_id):
             self._assert_session()
             _validate_key_id(key_id)
             entry = self._store.load_key(key_id)
@@ -378,16 +449,37 @@ class PyHSM:
             if not current or current.get("archived"):
                 raise ValueError(f"PyHSM: key '{key_id}' current version is archived")
 
-            key = bytes.fromhex(current["key_data"])
-            nonce = os.urandom(12)
             data = plaintext.encode("utf-8") if isinstance(plaintext, str) else plaintext
-            ct = AESGCM(key).encrypt(nonce, data, None)
 
-            # Version prefix: 4 bytes big-endian
+            # Input size guard
+            if len(data) > _MAX_PLAINTEXT_SIZE:
+                raise ValueError(
+                    f"PyHSM: plaintext too large ({len(data)} bytes). "
+                    f"Maximum is {_MAX_PLAINTEXT_SIZE} bytes (64 MB)."
+                )
+
+            # Hybrid nonce: random(4) + counter(4) + random(4) = 12 bytes
+            op_count = entry.get("operation_count", 0)
+            counter_bytes = (op_count & 0xFFFFFFFF).to_bytes(4, "big")
+            nonce = os.urandom(4) + counter_bytes + os.urandom(4)
+
+            # AAD: bind ciphertext to key_id + version
+            aad = f"pyhsm:v1:{key_id}:{current['version']}".encode("utf-8")
+
+            # Unwrap key material
+            raw_key = self._unwrap_key_data(current["key_data"])
+            key = SecureBytes(raw_key)
+            try:
+                ct = AESGCM(bytes(key.buf)).encrypt(nonce, data, aad)
+            finally:
+                key.zeroize()
+
+            # Format: format_byte(1) + version(4) + nonce(12) + ciphertext+tag
+            format_byte = _CT_FORMAT_V2.to_bytes(1, "big")
             version_bytes = current["version"].to_bytes(_VERSION_PREFIX_LEN, "big")
-            result = (version_bytes + nonce + ct).hex()
+            result = (format_byte + version_bytes + nonce + ct).hex()
 
-            entry["operation_count"] = entry.get("operation_count", 0) + 1
+            entry["operation_count"] = op_count + 1
             self._store.update_key(key_id, entry)
             self._metrics.record_op("encrypt")
             self._audit.record("encrypt", key_id=key_id, success=True)
@@ -395,10 +487,15 @@ class PyHSM:
 
     def decrypt(self, key_id: str, ciphertext_hex: str) -> bytes:
         """
-        Decrypt hex-encoded ciphertext with version prefix.
-        Selects the correct key version from the version prefix.
+        Decrypt hex-encoded ciphertext.
+
+        Supports two formats:
+          - v2 (current): format_byte(1) + version(4) + nonce(12) + ct+tag  [with AAD]
+          - v1 (legacy):  version(4) + nonce(12) + ct+tag                   [no AAD]
+
+        Automatically detects the format from the first byte.
         """
-        with self._lock:
+        with self._key_lock(key_id):
             self._assert_session()
             _validate_key_id(key_id)
             entry = self._store.load_key(key_id)
@@ -409,12 +506,28 @@ class PyHSM:
             self._enforce_policy(entry, "decrypt")
 
             raw = bytes.fromhex(ciphertext_hex)
-            if len(raw) < _VERSION_PREFIX_LEN + 12 + 16:
+
+            # Detect format: v2 starts with 0x02, v1 starts with 0x00 (version 1 high byte)
+            if len(raw) < 1:
                 raise ValueError("PyHSM: ciphertext too short")
 
-            version = int.from_bytes(raw[:_VERSION_PREFIX_LEN], "big")
-            nonce = raw[_VERSION_PREFIX_LEN : _VERSION_PREFIX_LEN + 12]
-            ct = raw[_VERSION_PREFIX_LEN + 12 :]
+            format_byte = raw[0]
+            if format_byte == _CT_FORMAT_V2:
+                # v2 format: format(1) + version(4) + nonce(12) + ct+tag
+                if len(raw) < 1 + _VERSION_PREFIX_LEN + 12 + 16:
+                    raise ValueError("PyHSM: ciphertext too short")
+                version = int.from_bytes(raw[1:1 + _VERSION_PREFIX_LEN], "big")
+                nonce = raw[1 + _VERSION_PREFIX_LEN : 1 + _VERSION_PREFIX_LEN + 12]
+                ct = raw[1 + _VERSION_PREFIX_LEN + 12:]
+                use_aad = True
+            else:
+                # v1 legacy format: version(4) + nonce(12) + ct+tag (no format byte)
+                if len(raw) < _VERSION_PREFIX_LEN + 12 + 16:
+                    raise ValueError("PyHSM: ciphertext too short")
+                version = int.from_bytes(raw[:_VERSION_PREFIX_LEN], "big")
+                nonce = raw[_VERSION_PREFIX_LEN : _VERSION_PREFIX_LEN + 12]
+                ct = raw[_VERSION_PREFIX_LEN + 12:]
+                use_aad = False
 
             # Find the matching version
             v_entry = next(
@@ -423,8 +536,16 @@ class PyHSM:
             if not v_entry:
                 raise ValueError(f"PyHSM: key version {version} not found for '{key_id}'")
 
-            key = bytes.fromhex(v_entry["key_data"])
-            plain = AESGCM(key).decrypt(nonce, ct, None)
+            # AAD only for v2 format
+            aad = f"pyhsm:v1:{key_id}:{version}".encode("utf-8") if use_aad else None
+
+            # Unwrap key material
+            raw_key = self._unwrap_key_data(v_entry["key_data"])
+            key = SecureBytes(raw_key)
+            try:
+                plain = AESGCM(bytes(key.buf)).decrypt(nonce, ct, aad)
+            finally:
+                key.zeroize()
 
             entry["operation_count"] = entry.get("operation_count", 0) + 1
             self._store.update_key(key_id, entry)
@@ -439,7 +560,7 @@ class PyHSM:
 
     def sign(self, key_id: str, message) -> str:
         """Sign a message using a stored RSA or EC key. Returns hex-encoded signature."""
-        with self._lock:
+        with self._key_lock(key_id):
             self._assert_session()
             _validate_key_id(key_id)
             entry = self._store.load_key(key_id)
@@ -460,7 +581,7 @@ class PyHSM:
                 raise ValueError(f"PyHSM: no current version for key '{key_id}'")
 
             private_key = serialization.load_pem_private_key(
-                current["key_data"].encode(), password=None
+                self._unwrap_key_data(current["key_data"]), password=None
             )
 
             if entry["key_type"].startswith("rsa"):
@@ -480,7 +601,7 @@ class PyHSM:
             entry["operation_count"] = entry.get("operation_count", 0) + 1
             self._store.update_key(key_id, entry)
             self._metrics.record_op("sign")
-            self._audit.record("encrypt", key_id=key_id, success=True)
+            self._audit.record("sign", key_id=key_id, success=True)
             return sig.hex()
 
     def verify(self, key_id: str, message, signature_hex: str) -> bool:
@@ -489,7 +610,7 @@ class PyHSM:
         Does NOT load the private key — only the public key PEM stored at generation time.
         Returns True if valid, False otherwise.
         """
-        with self._lock:
+        with self._key_lock(key_id):
             self._assert_session()
             _validate_key_id(key_id)
             entry = self._store.load_key(key_id)
@@ -518,6 +639,8 @@ class PyHSM:
                     public_key.verify(sig, data, ec.ECDSA(hashes.SHA256()))
                 else:
                     return False
+                entry["operation_count"] = entry.get("operation_count", 0) + 1
+                self._store.update_key(key_id, entry)
                 self._metrics.record_op("verify")
                 return True
             except Exception:
@@ -530,7 +653,7 @@ class PyHSM:
 
     def get_public_key(self, key_id: str) -> str:
         """Export the public key (PEM) for an asymmetric key. Never touches the private key."""
-        with self._lock:
+        with self._key_lock(key_id):
             self._assert_session()
             _validate_key_id(key_id)
             entry = self._store.load_key(key_id)
@@ -542,12 +665,105 @@ class PyHSM:
             return pub
 
     # ------------------------------------------------------------------
+    # JWK Import / Export (RFC 7517)
+    # ------------------------------------------------------------------
+
+    def export_jwk(self, key_id: str) -> dict:
+        """
+        Export a key as a JWK (JSON Web Key, RFC 7517).
+
+        Unwraps the stored key material and converts to standard JWK format.
+        Supports AES, EC, and RSA key types.
+
+        WARNING: The returned dict contains raw private key material.
+        Handle with care and zeroize after use.
+        """
+        with self._key_lock(key_id):
+            self._assert_session()
+            _validate_key_id(key_id)
+            entry = self._store.load_key(key_id)
+            key_type = entry["key_type"]
+
+            # Get current version's key material
+            current = next(
+                (v for v in entry["versions"] if v["version"] == entry["current_version"]),
+                None,
+            )
+            if not current:
+                raise ValueError(f"PyHSM: no current version for key '{key_id}'")
+
+            raw_key = self._unwrap_key_data(current["key_data"])
+
+            try:
+                if key_type.startswith("aes"):
+                    return export_symmetric_jwk(raw_key, key_id=key_id)
+                elif key_type.startswith("ec"):
+                    return export_ec_jwk(raw_key, key_id=key_id)
+                elif key_type.startswith("rsa"):
+                    return export_rsa_jwk(raw_key, key_id=key_id)
+                else:
+                    raise ValueError(f"Unsupported key type for JWK export: {key_type}")
+            finally:
+                # Best-effort zeroize raw key bytes
+                if isinstance(raw_key, bytearray):
+                    zeroize_bytearray(raw_key)
+
+    def import_key_jwk(
+        self,
+        key_id: str,
+        jwk: dict,
+        *,
+        metadata: Optional[dict] = None,
+        policy: Optional[dict] = None,
+    ) -> str:
+        """
+        Import a key from a JWK (JSON Web Key, RFC 7517).
+
+        Accepts standard JWK dicts with kty="oct", "EC", or "RSA".
+        The key material is wrapped with AES-KWP before storage.
+
+        Returns the key_id.
+        """
+        with self._global_lock:
+            self._assert_session()
+            _validate_key_id(key_id)
+
+            key_type, raw_key, public_key_pem = _import_jwk(jwk)
+
+            # Wrap the key material
+            key_data = self._wrap_key_data(raw_key)
+
+            now_iso = _utcnow()
+            entry = {
+                "key_id": key_id,
+                "key_type": key_type,
+                "current_version": 1,
+                "versions": [
+                    {
+                        "version": 1,
+                        "key_data": key_data,
+                        "created_at": now_iso,
+                        "archived": False,
+                    }
+                ],
+                "public_key_pem": public_key_pem,
+                "policy": policy or {"allow_encrypt": True, "allow_decrypt": True, "allow_sign": True},
+                "operation_count": 0,
+                "created_at": now_iso,
+                "metadata": metadata or {},
+            }
+            self._store.save_key(key_id, entry)
+            self._audit.record("generateKey", key_id=key_id, success=True)
+            self._update_key_metrics()
+            return key_id
+
+    # ------------------------------------------------------------------
     # Expiry enforcement
     # ------------------------------------------------------------------
 
     def enforce_expiry(self) -> None:
         """Archive all keys whose policy.expires_at is in the past."""
-        with self._lock:
+        with self._global_lock:
             self._assert_session()
             now = datetime.now(timezone.utc)
             for entry in self._store.load_all().values():

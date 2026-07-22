@@ -1,9 +1,29 @@
 {
   "name": "pyhsm-ts",
   "version": "1.0.0",
-  "description": "Production-hardened software HSM for Node.js",
+  "description": "Production-grade software HSM (Key Management Service) for Node.js — key lifecycle, authenticated encryption, digital signing, and tamper-evident audit logging.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.js"
+    },
+    "./storage-backend": {
+      "types": "./dist/storage-backend.d.ts",
+      "import": "./dist/storage-backend.js"
+    },
+    "./jwk": {
+      "types": "./dist/jwk.d.ts",
+      "import": "./dist/jwk.js"
+    }
+  },
+  "files": [
+    "dist/",
+    "OPERATIONS.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsc",
     "test": "vitest run",
@@ -12,12 +32,35 @@
     "eslint": "eslint .",
     "format": "prettier --write \"*.ts\"",
     "format:check": "prettier --check \"*.ts\"",
-    "ci": "npm run lint && npm run eslint && npm run format:check && npm test && npm run build"
+    "ci": "npm run lint && npm run eslint && npm run format:check && npm test && npm run build",
+    "prepublishOnly": "npm run ci"
   },
   "engines": {
     "node": ">=18.0.0"
   },
+  "keywords": [
+    "hsm",
+    "kms",
+    "key-management",
+    "encryption",
+    "cryptography",
+    "aes-gcm-siv",
+    "argon2",
+    "audit-log",
+    "shamir",
+    "signing"
+  ],
+  "author": "Pavon Dunbar",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pavondunbar/PyHSM.git",
+    "directory": "pyhsm-ts"
+  },
+  "homepage": "https://github.com/pavondunbar/PyHSM",
+  "bugs": {
+    "url": "https://github.com/pavondunbar/PyHSM/issues"
+  },
   "dependencies": {
     "@noble/ciphers": "1.2.1",
     "argon2": "0.41.1"

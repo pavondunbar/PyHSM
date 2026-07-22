@@ -1,18 +1,23 @@
 """
 PyHSM Encrypted Key Storage.
 
-File format (binary):
+Encrypted envelope format (binary):
   [0 :16]  salt         (random, 16 bytes)
   [16:48]  HMAC-SHA256  over the ciphertext payload (32 bytes)
   [48:60]  nonce        (GCM, 12 bytes)
   [60:  ]  AES-256-GCM ciphertext+tag  (plaintext is UTF-8 JSON)
 
-The HMAC is keyed with the *same* derived key as the encryption key,
-providing encrypt-then-MAC protection — tampering with the ciphertext
-or the nonce is detected before any decryption attempt.
+Key separation: the master password is derived via PBKDF2-SHA256 (480k
+iterations), then HKDF-Expand produces two independent 32-byte subkeys:
+  - Encryption key (info="pyhsm-enc-v1") — used for AES-256-GCM
+  - MAC key (info="pyhsm-mac-v1") — used for HMAC-SHA256
 
-Atomic writes: data is written to a temporary file then renamed,
-so a crash mid-write can never corrupt the live keystore.
+This encrypt-then-MAC construction with separated keys ensures that a
+weakness in one primitive cannot leak information about the other key.
+
+Persistence is delegated to a StorageBackend implementation. The default
+FileBackend uses atomic writes (temp file + rename), so a crash mid-write
+can never corrupt the live keystore.
 """
 
 from __future__ import annotations
@@ -21,11 +26,15 @@ import hashlib
 import hmac as _hmac
 import json
 import os
-import secrets
+from typing import Optional
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
 from cryptography.hazmat.primitives import hashes
+
+from .backends import StorageBackend, FileBackend
+from .secure_memory import zeroize_bytearray, zeroize_dict_keys
 
 
 _SALT_LEN = 16
@@ -39,36 +48,125 @@ class TamperError(Exception):
 
 
 class KeyStore:
-    """Manages encrypted, tamper-evident persistence of HSM keys."""
+    """
+    Manages encrypted, tamper-evident persistence of HSM keys.
 
-    def __init__(self, path: str, master_password: str) -> None:
-        self.path = path
-        self._master_password: bytes = master_password.encode("utf-8")
+    Parameters
+    ----------
+    path : str, optional
+        Path to the keystore file. Creates a FileBackend internally.
+        Ignored if ``backend`` is provided.
+    master_password : str
+        Master password for key derivation.
+    backend : StorageBackend, optional
+        A custom storage backend. If provided, ``path`` is ignored and
+        the backend is used directly for persistence.
+
+    Examples
+    --------
+    Using the default file backend (backward-compatible):
+
+        store = KeyStore("keystore.enc", "my-password")
+
+    Using a custom backend:
+
+        from hsm.backends import MemoryBackend
+        store = KeyStore(master_password="pw", backend=MemoryBackend())
+    """
+
+    def __init__(
+        self,
+        path: Optional[str] = None,
+        master_password: str = "",
+        *,
+        backend: Optional[StorageBackend] = None,
+    ) -> None:
+        if not master_password:
+            raise ValueError("KeyStore: master_password is required")
+
+        # Resolve the storage backend
+        if backend is not None:
+            self._backend = backend
+        elif path is not None:
+            self._backend = FileBackend(path)
+        else:
+            raise ValueError(
+                "KeyStore: either 'path' (for file storage) or 'backend' "
+                "(for custom storage) must be provided"
+            )
+
+        # Expose path for backward compatibility (used by tests/audit path derivation)
+        self.path = path or getattr(self._backend, "path", "<custom-backend>")
+
+        self._master_password: bytearray = bytearray(master_password.encode("utf-8"))
         self._keys: dict = self._load_store()
 
+    @property
+    def backend(self) -> StorageBackend:
+        """The underlying storage backend."""
+        return self._backend
+
     # ------------------------------------------------------------------
-    # KDF
+    # KDF — key separation via HKDF-Expand
     # ------------------------------------------------------------------
 
-    def _derive_key(self, salt: bytes) -> bytes:
+    def _derive_master(self, salt: bytes) -> bytearray:
+        """Derive the intermediate master key from password + salt."""
         kdf = PBKDF2HMAC(
             algorithm=hashes.SHA256(),
             length=32,
             salt=salt,
             iterations=_KDF_ITERATIONS,
         )
-        return kdf.derive(self._master_password)
+        derived = kdf.derive(bytes(self._master_password))
+        return bytearray(derived)
+
+    def _derive_subkeys(self, salt: bytes) -> tuple[bytearray, bytearray]:
+        """
+        Derive separate encryption and MAC keys via HKDF-Expand.
+
+        Returns (enc_key, mac_key) — each 32 bytes.
+        Caller is responsible for zeroizing both after use.
+        """
+        master = self._derive_master(salt)
+
+        enc_key = bytearray(HKDFExpand(
+            algorithm=hashes.SHA256(),
+            length=32,
+            info=b"pyhsm-enc-v1",
+        ).derive(bytes(master)))
+
+        mac_key = bytearray(HKDFExpand(
+            algorithm=hashes.SHA256(),
+            length=32,
+            info=b"pyhsm-mac-v1",
+        ).derive(bytes(master)))
+
+        zeroize_bytearray(master)
+        return enc_key, mac_key
+
+    def _derive_kek(self) -> bytearray:
+        """
+        Derive a Key Encryption Key (KEK) for per-key AES-KWP wrapping.
+
+        Uses HMAC-SHA256(master_password, "pyhsm-kek-v1") — independent
+        of the salt-based subkeys, so the KEK is stable across save/load
+        cycles without storing additional state.
+        """
+        kek = _hmac.new(
+            bytes(self._master_password), b"pyhsm-kek-v1", hashlib.sha256
+        ).digest()
+        return bytearray(kek)
 
     # ------------------------------------------------------------------
-    # Persistence
+    # Persistence (delegated to backend)
     # ------------------------------------------------------------------
 
     def _load_store(self) -> dict:
-        if not os.path.exists(self.path):
+        if not self._backend.exists():
             return {}
 
-        with open(self.path, "rb") as f:
-            data = f.read()
+        data = self._backend.read()
 
         min_len = _SALT_LEN + _HMAC_LEN + _NONCE_LEN + 16  # 16 = min GCM tag
         if len(data) < min_len:
@@ -78,13 +176,13 @@ class KeyStore:
         stored_hmac = data[_SALT_LEN : _SALT_LEN + _HMAC_LEN]
         payload = data[_SALT_LEN + _HMAC_LEN :]  # nonce + ciphertext+tag
 
-        key = self._derive_key(salt)
+        enc_key, mac_key = self._derive_subkeys(salt)
 
         # Verify MAC before decrypting (encrypt-then-MAC)
-        expected_hmac = _hmac.new(key, payload, hashlib.sha256).digest()
+        expected_hmac = _hmac.new(bytes(mac_key), payload, hashlib.sha256).digest()
         if not _hmac.compare_digest(stored_hmac, expected_hmac):
-            # Zeroize key before raising
-            key = bytes(len(key))
+            zeroize_bytearray(enc_key)
+            zeroize_bytearray(mac_key)
             raise TamperError(
                 "PyHSM TAMPER DETECTED: HMAC verification failed. "
                 "Keystore may have been modified outside of PyHSM."
@@ -92,36 +190,25 @@ class KeyStore:
 
         nonce = payload[:_NONCE_LEN]
         ct_plus_tag = payload[_NONCE_LEN:]
-        plain = AESGCM(key).decrypt(nonce, ct_plus_tag, None)
-        key = bytes(len(key))  # zeroize
+        plain = AESGCM(bytes(enc_key)).decrypt(nonce, ct_plus_tag, None)
+        zeroize_bytearray(enc_key)
+        zeroize_bytearray(mac_key)
 
         return json.loads(plain.decode("utf-8"))
 
     def _save_store(self) -> None:
         salt = os.urandom(_SALT_LEN)
-        key = self._derive_key(salt)
+        enc_key, mac_key = self._derive_subkeys(salt)
         nonce = os.urandom(_NONCE_LEN)
 
-        ct = AESGCM(key).encrypt(nonce, json.dumps(self._keys).encode("utf-8"), None)
+        ct = AESGCM(bytes(enc_key)).encrypt(nonce, json.dumps(self._keys).encode("utf-8"), None)
         payload = nonce + ct
-        mac = _hmac.new(key, payload, hashlib.sha256).digest()
-        key = bytes(len(key))  # zeroize
+        mac = _hmac.new(bytes(mac_key), payload, hashlib.sha256).digest()
+        zeroize_bytearray(enc_key)
+        zeroize_bytearray(mac_key)
 
         file_data = salt + mac + payload
-
-        # Atomic write: write to sibling temp file, then rename
-        tmp = self.path + ".tmp." + secrets.token_hex(4)
-        try:
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, "wb") as f:
-                f.write(file_data)
-            os.replace(tmp, self.path)
-        except Exception:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+        self._backend.write(file_data)
 
     # ------------------------------------------------------------------
     # Key CRUD
@@ -155,6 +242,9 @@ class KeyStore:
         self._save_store()
 
     def zeroize_memory(self) -> None:
-        """Overwrite the master password bytes held in memory."""
-        self._master_password = bytes(len(self._master_password))
+        """Overwrite all sensitive material held in memory byte-by-byte."""
+        # Zeroize all key material in the in-memory store
+        zeroize_dict_keys(self._keys)
+        # Zeroize the master password bytearray
+        zeroize_bytearray(self._master_password)
         self._keys = {}

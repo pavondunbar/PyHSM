@@ -118,4 +118,5 @@ export interface PyHSMConfig {
   sessionTimeoutMs?: number;
   socketPath?: string;
   callerSecret?: string; // shared secret for IPC auth
+  backend?: import("./storage-backend.js").StorageBackend; // custom storage backend
 }

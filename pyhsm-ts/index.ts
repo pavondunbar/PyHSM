@@ -9,6 +9,10 @@ export { runSelfTests, enableFipsIfRequested, isFipsEnabled } from "./self-test.
 export { splitMasterPassword, reconstructMasterPassword, splitSecret, reconstructSecret } from "./shamir.js";
 export { SecureBuffer, zeroBuffer } from "./secure-buffer.js";
 export { PyHSMClient } from "./client.js";
+export { exportSymmetricJwk, exportAsymmetricJwk, importJwk } from "./jwk.js";
+export type { JWK } from "./jwk.js";
+export type { StorageBackend } from "./storage-backend.js";
+export { FileBackend, MemoryBackend } from "./storage-backend.js";
 export type { ShamirShare } from "./shamir.js";
 export type * from "./types.js";
 

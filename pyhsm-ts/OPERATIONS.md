@@ -17,19 +17,24 @@ Production deployment, environment variables, and operational procedures.
 ┌────────────────────────────────────────────────┼─────┐
 │  PyHSM Process (process.ts)                    │     │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐     │     │
-│  │ AES keys │  │  Audit   │  │ Self-Test│     ▼     │
-│  │ (memory) │  │  Log     │  │  (KAT)   │  IPC     │
-│  └──────────┘  └──────────┘  └──────────┘  Server   │
+│  │ Wrapped  │  │  Audit   │  │ Self-Test│     ▼     │
+│  │ AES keys │  │  Log     │  │  (KAT)   │  IPC     │
+│  │ (AES-KWP)│  │          │  │          │  Server   │
+│  └──────────┘  └──────────┘  └──────────┘           │
 │  ┌──────────────────────────────────────────┐        │
-│  │ Encrypted Keystore (filesystem)          │        │
+│  │ Encrypted Keystore (StorageBackend)      │        │
+│  │  • FileBackend (default, atomic writes)  │        │
+│  │  • MemoryBackend (testing)               │        │
+│  │  • Custom (DB, S3, etc.)                 │        │
 │  └──────────────────────────────────────────┘        │
 └──────────────────────────────────────────────────────┘
 ```
 
-Key material lives exclusively in the PyHSM process.  The application
-process communicates over a Unix domain socket (NDJSON protocol) via the
-`PyHSMClient`.  A vulnerability in the application cannot directly read
-key material in the HSM process's address space.
+Key material lives exclusively in the PyHSM process, double-encrypted at rest:
+individual keys are wrapped with AES-KWP (RFC 5649) inside the outer AES-256-GCM
+encrypted keystore envelope. The application process communicates over a Unix domain
+socket (NDJSON protocol) via the `PyHSMClient`. A vulnerability in the application
+cannot directly read key material in the HSM process's address space.
 
 ---
 
@@ -56,7 +61,7 @@ key material in the HSM process's address space.
 | Variable                  | Default   | Description                                       |
 |---------------------------|-----------|---------------------------------------------------|
 | `PYHSM_CALLER_SECRET`    | *(none)*  | Shared secret for IPC caller HMAC authentication. |
-| `PYHSM_AUDIT_HMAC_KEY`   | *(auto)*  | Hex-encoded 32-byte key for audit HMAC chain.     |
+| `PYHSM_AUDIT_HMAC_KEY`   | *(auto)*  | Hex-encoded 32-byte key for audit HMAC chain. Auto-generated and stored at `<audit_log_path>.hmackey` if not set. Independent of master password — audit verification survives master password rotation. |
 | `PYHSM_FIPS`             | `0`       | Set to `1` to enable FIPS mode (requires OpenSSL 3.x FIPS provider). |
 
 ### Tuning
@@ -92,6 +97,27 @@ const ct = hsm.encrypt("app-key", plaintext);
 ```
 
 Key material resides in the same process as the application.
+
+### With custom storage backend
+
+```typescript
+import { PyHSM, MemoryBackend } from "pyhsm-ts";
+
+// Example: in-memory for testing
+const hsm = new PyHSM({
+  storePath: "test",
+  masterPassword: "test-pw",
+  backend: new MemoryBackend(),
+});
+
+// For production: implement StorageBackend interface for your database/cloud
+// interface StorageBackend {
+//   exists(): boolean;
+//   read(): Buffer;
+//   write(data: Buffer): void;
+//   delete(): void;
+// }
+```
 
 ### Process-Isolated (recommended for production)
 
@@ -144,6 +170,7 @@ npx tsx pyhsm-ts/process.ts
 
 Generates a new key version; old version is archived (can still decrypt
 ciphertexts encrypted with it, but new encryptions use the new version).
+New key material is wrapped with AES-KWP before storage.
 
 ```typescript
 hsm.rotateKey("my-key");
@@ -168,6 +195,9 @@ hsm.verifyBackup("/secure/backups/pyhsm-backup-2025-01-01.enc");
 
 ### Audit Log Verification
 
+The audit log uses an independently stored HMAC key (at `<log_path>.hmackey`),
+so verification works even if the master password changes or is unknown:
+
 ```typescript
 const corrupted = hsm.getAuditLog().verify();
 if (corrupted >= 0) {
@@ -184,6 +214,31 @@ const ndjson = hsm.getAuditLog().toNdjson({ since: "2025-01-01T00:00:00Z" });
 
 ---
 
+## Ciphertext Format
+
+### Python Layer
+
+The Python layer uses a versioned ciphertext format:
+
+**v2 (current):** `format_byte(1) + version(4) + nonce(12) + ciphertext+tag`
+
+- Format byte `0x02` identifies AAD-bound ciphertext
+- AAD = `pyhsm:v1:{key_id}:{version}` — binds ciphertext to the specific key
+- Nonce = `random(4) + counter(4) + random(4)` — hybrid strategy eliminates birthday collisions
+
+**v1 (legacy):** `version(4) + nonce(12) + ciphertext+tag`
+
+- No format byte prefix (first byte is `0x00` for version 1 keys)
+- No AAD binding
+- Decrypt auto-detects format and handles both transparently
+
+### TypeScript Layer
+
+- Base64-encoded: `version(4) + nonce(12) + ciphertext+tag`
+- Uses AES-256-GCM-SIV (nonce-misuse resistant from `@noble/ciphers`)
+
+---
+
 ## Metrics (Prometheus)
 
 Expose the `/metrics` endpoint:
@@ -195,7 +250,7 @@ const text = hsm.getPrometheusMetrics();
 
 Available metrics:
 
-- `pyhsm_operations_total{type="encrypt|decrypt"}`
+- `pyhsm_operations_total{type="encrypt|decrypt|sign|verify"}`
 - `pyhsm_errors_total`
 - `pyhsm_rate_limit_hits_total`
 - `pyhsm_access_denials_total`
@@ -206,14 +261,148 @@ Available metrics:
 
 ## Security Considerations
 
-1. **Memory zeroization**: Key material is zeroized via `Buffer.fill(0)` / `SecureBuffer.dispose()` when sessions close or keys are unwrapped. V8 strings (key IDs, metadata) are not deterministically clearable; only `Buffer`-backed data benefits.
+1. **Key separation**: The keystore uses HKDF-Expand to derive independent encryption and MAC keys from the master key (info strings: `pyhsm-enc-v1`, `pyhsm-mac-v1`). A weakness in one primitive cannot leak the other key.
 
-2. **File permissions**: The keystore is written mode `0o600`. The Unix socket is `chmod 0o600`. The audit HMAC key file is `0o600`.
+2. **Per-key wrapping**: Individual keys are wrapped with AES-KWP (RFC 5649) using a KEK derived via `HMAC(master_password, "pyhsm-kek-v1")`. Even if the decrypted keystore JSON is exposed (e.g., core dump), individual key material remains encrypted.
 
-3. **Tamper detection**: The keystore uses encrypt-then-MAC (AES-256-GCM + HMAC-SHA256). Any modification to the file triggers a tamper alert, zeroizes all memory, and throws.
+3. **Memory zeroization**: Key material is held in `SecureBytes` (Python `bytearray`) or `SecureBuffer` (Node.js `Buffer`) with deterministic byte-by-byte zeroization. The master password is stored as a mutable `bytearray` and overwritten on session close. V8/CPython string immutability means metadata (key IDs, timestamps) is not deterministically clearable.
 
-4. **KDF**: The async `PyHSM.create()` factory uses Argon2id (64 MB / 3 passes / 4 parallelism). The synchronous constructor falls back to PBKDF2-SHA256 at 480,000 iterations.
+4. **File permissions**: The keystore is written mode `0o600`. The Unix socket is `chmod 0o600`. The audit HMAC key file is `0o600`.
 
-5. **Nonce misuse resistance**: Encryption uses AES-256-GCM-SIV (from `@noble/ciphers`), which remains secure even if a nonce is accidentally reused.
+5. **Tamper detection**: The keystore uses encrypt-then-MAC with separated keys. Any modification to the file triggers a tamper alert, zeroizes all memory, and throws.
 
-6. **Key wrapping**: At-rest key material is double-encrypted: the keystore file is AES-256-GCM encrypted, and individual keys within it are additionally wrapped with AES-KWP (RFC 5649).
+6. **KDF**: The async `PyHSM.create()` factory uses Argon2id (64 MB / 3 passes / 4 parallelism). The synchronous constructor falls back to PBKDF2-SHA256 at 480,000 iterations. Both layers then apply HKDF-Expand to derive separate encryption and MAC subkeys.
+
+7. **Nonce safety**: Python uses a hybrid nonce (random + counter + random) that prevents birthday-bound collisions even at high operation volumes. TypeScript uses AES-256-GCM-SIV which is inherently nonce-misuse resistant.
+
+8. **AAD binding (Python)**: Ciphertext is bound to `pyhsm:v1:{key_id}:{version}` via GCM authenticated data. This prevents an attacker from moving ciphertext between keys or versions — decryption fails if the AAD doesn't match.
+
+9. **Input validation**: Both layers reject plaintext larger than 64 MB before encryption to prevent memory exhaustion attacks.
+
+10. **Constant-time comparisons**: HMAC verification uses `hmac.compare_digest` (Python) and length-padded `crypto.timingSafeEqual` (TypeScript). The TypeScript implementation pads both buffers to the same length before comparison to prevent length-based timing side channels.
+
+11. **Audit log independence**: The audit HMAC key is stored separately from the keystore (at `<log_path>.hmackey`) and auto-generated on first use. It is independent of the master password — you can verify audit integrity even if the master password is rotated, lost, or compromised. Override via `PYHSM_AUDIT_HMAC_KEY` env var.
+
+12. **Concurrency (Python)**: Per-key operations (encrypt, decrypt, sign, verify) use sharded locks — operations on different keys execute in parallel. Only lifecycle operations (generate, rotate, destroy) acquire the global lock.
+
+13. **Flush-on-every-operation (TypeScript)**: The keystore is persisted after every encrypt/decrypt operation, ensuring operation counts and rate limiting state survive crashes without data loss.
+
+14. **Operation counting consistency**: All cryptographic operations (encrypt, decrypt, sign, verify) increment the per-key `operation_count` and persist state. The `max_operations` policy applies uniformly across all operation types.
+
+---
+
+## JWK Key Import / Export (RFC 7517)
+
+PyHSM supports standard JSON Web Key format for key migration and interoperability.
+
+### Export
+
+Export a stored key to JWK for use in another system:
+
+**Python:**
+
+```python
+jwk = hsm.export_jwk("my-aes-key")
+# {"kty": "oct", "k": "...", "alg": "A256GCM", "kid": "my-aes-key"}
+
+ec_jwk = hsm.export_jwk("my-ec-key")
+# {"kty": "EC", "crv": "P-256", "x": "...", "y": "...", "d": "...", "kid": "my-ec-key"}
+
+rsa_jwk = hsm.export_jwk("my-rsa-key")
+# {"kty": "RSA", "n": "...", "e": "...", "d": "...", ...}
+```
+
+**TypeScript:**
+
+```typescript
+const jwk = hsm.exportJwk("my-key");
+```
+
+### Import
+
+Import a key from another KMS, identity provider, or standards-compliant system:
+
+**Python:**
+
+```python
+# Import an AES key
+hsm.import_key_jwk("imported-aes", {
+    "kty": "oct",
+    "k": "base64url-encoded-32-bytes",
+    "alg": "A256GCM",
+})
+
+# Import an EC signing key from an OAuth provider
+hsm.import_key_jwk("idp-key", jwk_from_provider, policy={
+    "allow_encrypt": False,
+    "allow_sign": True,
+})
+```
+
+**TypeScript:**
+
+```typescript
+hsm.importKeyJwk("external-key", jwkObject, { allowEncrypt: true, allowDecrypt: true });
+```
+
+### Supported Key Types
+
+| JWK `kty` | PyHSM key type | Notes |
+|---|---|---|
+| `oct` (16 bytes) | `aes-128` | Symmetric encryption |
+| `oct` (32 bytes) | `aes-256` | Symmetric encryption |
+| `EC` (P-256) | `ec-p256` | ECDSA signing |
+| `RSA` (2048-bit) | `rsa-2048` | RSA-PSS signing |
+| `RSA` (4096-bit) | `rsa-4096` | RSA-PSS signing |
+
+Imported keys are wrapped with AES-KWP before storage, matching the security properties of locally-generated keys.
+
+---
+
+## Implementing a Custom Storage Backend
+
+To store keystore data in a database, S3, or other system, implement the `StorageBackend` interface:
+
+### Python
+
+```python
+from hsm.backends import StorageBackend
+
+class PostgresBackend(StorageBackend):
+    def __init__(self, dsn: str, key_name: str = "default"):
+        self.dsn = dsn
+        self.key_name = key_name
+
+    def exists(self) -> bool:
+        # SELECT COUNT(*) FROM keystores WHERE name = self.key_name
+        ...
+
+    def read(self) -> bytes:
+        # SELECT data FROM keystores WHERE name = self.key_name
+        ...
+
+    def write(self, data: bytes) -> None:
+        # INSERT ... ON CONFLICT UPDATE (upsert)
+        ...
+
+    def delete(self) -> None:
+        # DELETE FROM keystores WHERE name = self.key_name
+        ...
+```
+
+### TypeScript
+
+```typescript
+import type { StorageBackend } from "pyhsm-ts";
+
+class S3Backend implements StorageBackend {
+  constructor(private bucket: string, private key: string) {}
+
+  exists(): boolean { /* HEAD object */ }
+  read(): Buffer { /* GET object */ }
+  write(data: Buffer): void { /* PUT object */ }
+  delete(): void { /* DELETE object */ }
+}
+```
+
+The backend never sees plaintext key material — it only stores and retrieves the fully-encrypted keystore blob.
