@@ -263,9 +263,9 @@ Available metrics:
 
 1. **Key separation**: The keystore uses HKDF-Expand to derive independent encryption and MAC keys from the master key (info strings: `pyhsm-enc-v1`, `pyhsm-mac-v1`). A weakness in one primitive cannot leak the other key.
 
-2. **Per-key wrapping**: Individual keys are wrapped with AES-KWP (RFC 5649) using a KEK derived via `HMAC(master_password, "pyhsm-kek-v1")`. Even if the decrypted keystore JSON is exposed (e.g., core dump), individual key material remains encrypted.
+2. **Per-key wrapping**: Individual keys are wrapped with AES-KWP (RFC 5649) using a KEK derived through the full PBKDF2 → HKDF-Expand path with a dedicated salt stored inside the encrypted keystore. The KEK is cached in memory for the session lifetime (avoiding repeated PBKDF2 on every operation) and zeroized on session close. Even if the decrypted keystore JSON is exposed (e.g., core dump), individual key material remains encrypted. Legacy keystores (pre-salt KEK) are automatically migrated on first open.
 
-3. **Memory zeroization**: Key material is held in `SecureBytes` (Python `bytearray`) or `SecureBuffer` (Node.js `Buffer`) with deterministic byte-by-byte zeroization. The master password is stored as a mutable `bytearray` and overwritten on session close. V8/CPython string immutability means metadata (key IDs, timestamps) is not deterministically clearable.
+3. **Memory zeroization**: Key material is stored as mutable `bytearray` (Python) or `Buffer` (TypeScript) with deterministic byte-by-byte zeroization. In the Python layer, key_data is held as `bytearray` in memory (not immutable hex strings), so it can be reliably zeroed on destroy or session close. The master password is stored as a mutable `bytearray` and overwritten on session close. The cached KEK is also zeroized. V8/CPython string immutability means metadata (key IDs, timestamps) is not deterministically clearable.
 
 4. **File permissions**: The keystore is written mode `0o600`. The Unix socket is `chmod 0o600`. The audit HMAC key file is `0o600`.
 
@@ -277,17 +277,21 @@ Available metrics:
 
 8. **AAD binding (Python)**: Ciphertext is bound to `pyhsm:v1:{key_id}:{version}` via GCM authenticated data. This prevents an attacker from moving ciphertext between keys or versions — decryption fails if the AAD doesn't match.
 
-9. **Input validation**: Both layers reject plaintext larger than 64 MB before encryption to prevent memory exhaustion attacks.
+9. **Input validation**: Both layers reject plaintext larger than 64 MB before encryption, and the Python layer also validates ciphertext input size before decryption, to prevent memory exhaustion attacks.
 
 10. **Constant-time comparisons**: HMAC verification uses `hmac.compare_digest` (Python) and length-padded `crypto.timingSafeEqual` (TypeScript). The TypeScript implementation pads both buffers to the same length before comparison to prevent length-based timing side channels.
 
-11. **Audit log independence**: The audit HMAC key is stored separately from the keystore (at `<log_path>.hmackey`) and auto-generated on first use. It is independent of the master password — you can verify audit integrity even if the master password is rotated, lost, or compromised. Override via `PYHSM_AUDIT_HMAC_KEY` env var.
+11. **Audit log independence**: The audit HMAC key is derived from the master password via HKDF-Expand (info: `pyhsm-audit-hmac-v1`) in the Python layer — no plaintext key file on disk. In the TypeScript layer, it is stored separately at `<log_path>.hmackey` (auto-generated on first use). Can be overridden via `PYHSM_AUDIT_HMAC_KEY` env var in both layers.
 
 12. **Concurrency (Python)**: Per-key operations (encrypt, decrypt, sign, verify) use sharded locks — operations on different keys execute in parallel. Only lifecycle operations (generate, rotate, destroy) acquire the global lock.
 
 13. **Flush-on-every-operation (TypeScript)**: The keystore is persisted after every encrypt/decrypt operation, ensuring operation counts and rate limiting state survive crashes without data loss.
 
 14. **Operation counting consistency**: All cryptographic operations (encrypt, decrypt, sign, verify) increment the per-key `operation_count` and persist state. The `max_operations` policy applies uniformly across all operation types.
+
+15. **Caller ACL enforcement (Python)**: Keys can define an `allowed_callers` list in their policy. When set, every operation must provide a `caller_id` that matches one of the allowed callers. Unauthorized access is denied, logged as an `accessDenied` audit entry with the caller identity, and raises an error. All operations record `caller_id` in the audit log when provided.
+
+16. **EC curve hash pairing (Python)**: ECDSA signing uses NIST-recommended hash algorithms per curve: P-256 → SHA-256, P-384 → SHA-384, P-521 → SHA-512. This ensures the hash security level matches the curve security level.
 
 ---
 
@@ -351,7 +355,9 @@ hsm.importKeyJwk("external-key", jwkObject, { allowEncrypt: true, allowDecrypt: 
 |---|---|---|
 | `oct` (16 bytes) | `aes-128` | Symmetric encryption |
 | `oct` (32 bytes) | `aes-256` | Symmetric encryption |
-| `EC` (P-256) | `ec-p256` | ECDSA signing |
+| `EC` (P-256) | `ec-p256` | ECDSA signing (SHA-256) |
+| `EC` (P-384) | `ec-p384` | ECDSA signing (SHA-384) |
+| `EC` (P-521) | `ec-p521` | ECDSA signing (SHA-512) |
 | `RSA` (2048-bit) | `rsa-2048` | RSA-PSS signing |
 | `RSA` (4096-bit) | `rsa-4096` | RSA-PSS signing |
 

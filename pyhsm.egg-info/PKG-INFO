@@ -1,3 +1,32 @@
+Metadata-Version: 2.4
+Name: pyhsm
+Version: 1.0.0
+Summary: Production-grade software Key Management Service (KMS) — key lifecycle, authenticated encryption, digital signing, and tamper-evident audit logging.
+Author: Pavon Dunbar
+License: MIT
+Project-URL: Homepage, https://github.com/pavondunbar/PyHSM
+Project-URL: Repository, https://github.com/pavondunbar/PyHSM
+Project-URL: Issues, https://github.com/pavondunbar/PyHSM/issues
+Keywords: hsm,kms,cryptography,key-management,encryption,signing,audit
+Classifier: Development Status :: 4 - Beta
+Classifier: Intended Audience :: Developers
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Programming Language :: Python :: 3.13
+Classifier: Topic :: Security :: Cryptography
+Classifier: Topic :: Software Development :: Libraries
+Classifier: Typing :: Typed
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: cryptography<48.0.0,>=43.0.0
+Provides-Extra: dev
+Requires-Dist: pytest<9.0.0,>=8.0.0; extra == "dev"
+Dynamic: license-file
+
 # PyHSM
 
 A production-grade software Key Management Service (KMS) providing cryptographic key lifecycle management, authenticated encryption, digital signing, and tamper-evident audit logging.
@@ -14,31 +43,26 @@ Most applications that need key management face a difficult choice: implement it
 
 - AES-256-GCM-SIV encryption (nonce-misuse resistant, TypeScript) / AES-256-GCM with hybrid nonce + AAD binding (Python)
 - Argon2id key derivation (OWASP recommended, 64 MB memory-hard)
-- HKDF key separation — independent encryption, MAC, and KEK subkeys derived from master
+- HKDF key separation — independent encryption and MAC subkeys derived from master
 - AES-KWP (RFC 5649) per-key wrapping — keys are double-encrypted at rest in both layers
-- Salt-bound KEK derivation — KEK uses a dedicated salt stored inside the encrypted envelope, derived through full PBKDF2 → HKDF path
 - Encrypt-then-MAC keystore with HMAC-SHA256 tamper detection
 - Pluggable storage backends — file, memory, or custom (database, cloud, etc.)
 - Atomic file writes — keystore never corrupts on crash
 - Key versioning — rotate without breaking old ciphertexts
 - Per-key policies: expiry, operation limits, caller ACLs, rate limiting
-- Per-caller ACL enforcement — `allowed_callers` policy with audit trail on denial
 - Per-key concurrency — sharded locks allow parallel operations on different keys
 - AAD-bound ciphertext — cryptographically binds ciphertext to key ID and version
 - Hybrid nonce strategy — random + counter eliminates birthday-bound collisions
-- Input size validation — rejects payloads over 64 MB on both encrypt and decrypt paths
-- HMAC-chained append-only audit log with HMAC key derived from master password
-- Caller ID tracking — every operation records the caller identity in the audit log
-- Deterministic memory zeroization via `SecureBytes` / `SecureBuffer` (key material stored as mutable `bytearray`, not immutable strings)
+- Input size validation — rejects payloads over 64 MB to prevent OOM
+- HMAC-chained append-only audit log with independent key file and SIEM export
+- Deterministic memory zeroization via `SecureBytes` / `SecureBuffer`
 - Process isolation via Unix domain socket IPC
 - Shamir M-of-N master password unlock ceremony
 - Startup Known-Answer Tests (KATs) before accepting any operations
 - Prometheus metrics
 - Backward-compatible ciphertext format versioning (v1 legacy, v2 AAD-bound)
-- JWK (RFC 7517) key import/export for interoperability (supports P-256, P-384, P-521, RSA, AES)
-- EC P-256, P-384, and P-521 signing with NIST-recommended hash algorithms (SHA-256, SHA-384, SHA-512)
-- Fully typed Python API (PEP 561 `py.typed` marker included)
-- 147 tests across both layers
+- JWK (RFC 7517) key import/export for interoperability with other KMS systems
+- 128 tests across both layers
 
 ---
 
@@ -67,11 +91,11 @@ Most applications that need key management face a difficult choice: implement it
 ### Python Installation
 
 ```bash
-# Install from PyPI
-pip install pyhsm
-
-# Or install from source (with pyproject.toml)
+# Install from source (with pyproject.toml)
 pip install .
+
+# Or install dependencies manually
+pip install cryptography
 
 # For development (includes pytest)
 pip install ".[dev]"
@@ -86,8 +110,6 @@ All commands require `--store` (keystore path) and a master password. The passwo
 python cli.py --store keystore.enc generate my-aes-key --type aes-256
 python cli.py --store keystore.enc generate my-rsa-key --type rsa-2048
 python cli.py --store keystore.enc generate my-ec-key  --type ec-p256
-python cli.py --store keystore.enc generate my-ec384   --type ec-p384
-python cli.py --store keystore.enc generate my-ec521   --type ec-p521
 
 # Generate a key with a policy
 python cli.py --store keystore.enc generate limited-key \
@@ -149,25 +171,18 @@ hsm = PyHSM(
 hsm.generate_key("aes-key")                          # AES-256 by default
 hsm.generate_key("rsa-key", "rsa-2048")
 hsm.generate_key("ec-key",  "ec-p256")
-hsm.generate_key("ec384",   "ec-p384")              # NIST P-384 (SHA-384)
-hsm.generate_key("ec521",   "ec-p521")              # NIST P-521 (SHA-512)
 
-# Generate a key with a policy (including caller ACL)
+# Generate a key with a policy
 hsm.generate_key("restricted", policy={
     "allow_encrypt": True,
     "allow_decrypt": False,     # encrypt-only
     "max_operations": 1000,
     "expires_at": "2027-01-01T00:00:00Z",
-    "allowed_callers": ["service-a", "service-b"],  # caller ACL
 })
 
 # Encrypt / Decrypt (AES-256-GCM with AAD binding and hybrid nonce)
 ciphertext = hsm.encrypt("aes-key", "secret message")  # returns hex string
 plaintext  = hsm.decrypt("aes-key", ciphertext)        # returns bytes
-
-# All operations support caller_id for audit tracking and ACL enforcement
-ciphertext = hsm.encrypt("aes-key", "data", caller_id="my-service")
-plaintext  = hsm.decrypt("aes-key", ciphertext, caller_id="my-service")
 
 # Rotate a key (old ciphertexts remain decryptable via version prefix)
 new_version = hsm.rotate_key("aes-key")
@@ -175,10 +190,6 @@ new_version = hsm.rotate_key("aes-key")
 # Sign / Verify
 signature = hsm.sign("ec-key", "message")
 is_valid   = hsm.verify("ec-key", "message", signature)  # uses stored public key only
-
-# Sign with P-384 (uses SHA-384 automatically) or P-521 (uses SHA-512)
-sig384 = hsm.sign("ec384", "message", caller_id="signer-service")
-is_valid = hsm.verify("ec384", "message", sig384, caller_id="verifier")
 
 # Export public key (PEM)
 pub_pem = hsm.get_public_key("rsa-key")
@@ -198,8 +209,6 @@ entries = audit.export_jsonl(operation="encrypt")       # SIEM-ready list of dic
 # JWK export (RFC 7517) — interoperate with other KMS systems
 jwk = hsm.export_jwk("aes-key")                        # {"kty": "oct", "k": "...", ...}
 ec_jwk = hsm.export_jwk("ec-key")                      # {"kty": "EC", "crv": "P-256", ...}
-ec384_jwk = hsm.export_jwk("ec384")                    # {"kty": "EC", "crv": "P-384", ...}
-ec521_jwk = hsm.export_jwk("ec521")                    # {"kty": "EC", "crv": "P-521", ...}
 
 # JWK import — bring keys from external systems
 hsm.import_key_jwk("imported-key", {
@@ -246,23 +255,21 @@ The `StorageBackend` interface deals only with raw encrypted bytes — all encry
 hsm/
   core.py           — PyHSM class: key lifecycle, encrypt/decrypt, sign/verify,
                       per-key AES-KWP wrapping, AAD binding, hybrid nonce,
-                      per-key sharded locks, caller_id ACL enforcement
-  storage.py        — KeyStore: HKDF key separation (enc/mac/kek subkeys),
-                      AES-256-GCM + HMAC-SHA256, cached KEK, pluggable StorageBackend,
-                      bytearray key_data for deterministic zeroization
+                      per-key sharded locks for concurrency
+  storage.py        — KeyStore: HKDF key separation, AES-256-GCM + HMAC-SHA256,
+                      pluggable StorageBackend
   backends.py       — StorageBackend ABC, FileBackend (atomic writes), MemoryBackend
   secure_memory.py  — SecureBytes: deterministic bytearray zeroization, context manager
-  jwk.py            — JWK (RFC 7517) import/export: oct, EC (P-256/P-384/P-521), RSA
+  jwk.py            — JWK (RFC 7517) import/export: oct, EC, RSA key types
   shamir.py         — Shamir secret sharing over GF(256)
-  audit.py          — HMAC-chained append-only audit log (HMAC key derived from master password)
+  audit.py          — HMAC-chained append-only audit log with independent key file
   rate_limiter.py   — Sliding-window per-key rate limiter
   metrics.py        — Prometheus-format metrics collector
   self_test.py      — Startup Known-Answer Tests (KATs)
   __init__.py       — Public API exports
-  py.typed          — PEP 561 marker for type checker support
 cli.py              — Full-featured command-line interface
 tests/
-  test_pyhsm.py     — 84 pytest tests
+  test_pyhsm.py     — 65 pytest tests
 ```
 
 ---
@@ -532,17 +539,14 @@ Intermediate share buffers are zeroized from memory after reconstruction in both
 | Per-key double encryption | AES-KWP RFC 5649 wrapping in both layers — keys encrypted inside the encrypted envelope |
 | Keystore tamper detection | Encrypt-then-MAC with separated keys (HKDF-derived enc + mac subkeys) |
 | Key derivation | PBKDF2-SHA256 480k iter → HKDF-Expand (Python) / Argon2id 64MB → HKDF-Expand (TypeScript async) |
-| Key separation | HKDF-Expand with distinct info strings (`pyhsm-enc-v1`, `pyhsm-mac-v1`, `pyhsm-kek-v1`) — encryption, MAC, and KEK keys are cryptographically independent |
-| KEK derivation | Dedicated salt stored inside encrypted keystore → PBKDF2 → HKDF-Expand. KEK is cached in memory for session lifetime and zeroized on close |
-| Memory zeroization | Key material stored as mutable `bytearray` (Python) / `Buffer` (TypeScript) with deterministic in-place zeroing. Immutable hex strings eliminated from memory path |
+| Key separation | HKDF-Expand with distinct info strings (`pyhsm-enc-v1`, `pyhsm-mac-v1`) in both layers — encryption and MAC keys are cryptographically independent |
+| Memory zeroization | `SecureBytes` with `bytearray` fill (Python) / `SecureBuffer` with `Buffer.fill(0)` (TypeScript) |
 | Nonce safety | Hybrid nonce: random(4) + counter(4) + random(4) eliminates birthday-bound (Python); AES-256-GCM-SIV nonce-misuse resistant (TypeScript) |
 | Ciphertext binding | AAD ties ciphertext to key_id + version — prevents cross-key confusion attacks |
 | Ciphertext versioning | Format byte distinguishes v2 (AAD-bound) from v1 (legacy) for backward compatibility |
-| Input validation | 64 MB maximum enforced on both encrypt (plaintext) and decrypt (ciphertext) paths |
+| Input validation | 64 MB maximum plaintext size enforced before encryption (both layers) |
 | Atomic writes | `os.replace()` (Python) / `fs.renameSync` on temp file (TypeScript) |
-| Audit integrity | Per-entry HMAC chain; audit HMAC key derived from master password via HKDF (Python) or stored independently (TypeScript) |
-| Caller ID tracking | All operations accept optional `caller_id`; recorded in every audit entry |
-| Caller ACL enforcement | Per-key `allowed_callers` policy; unauthorized callers denied with `accessDenied` audit entry |
+| Audit integrity | Per-entry HMAC chain with independently stored key file (survives master password loss) |
 | Constant-time comparisons | `hmac.compare_digest` (Python) / length-padded `timingSafeEqual` (TypeScript) |
 | Crypto primitive verification | Known-Answer Tests against RFC vectors at startup |
 | Session isolation | Auto-lock on inactivity; explicit `close_session()` / `closeSession()` |
@@ -550,9 +554,7 @@ Intermediate share buffers are zeroized from memory after reconstruction in both
 | Process memory isolation | Optional: IPC mode runs HSM in a separate process (TypeScript) |
 | M-of-N startup ceremony | Shamir split/reconstruct on master password |
 | Pluggable storage | `StorageBackend` interface — swap file I/O for database, S3, etc. |
-| Key interoperability | JWK (RFC 7517) import/export — supports P-256, P-384, P-521, RSA, AES |
-| EC curve support | P-256 (SHA-256), P-384 (SHA-384), P-521 (SHA-512) — NIST-recommended hash pairing |
-| Type safety | PEP 561 `py.typed` marker; `str | bytes` annotations on public API |
+| Key interoperability | JWK (RFC 7517) import/export — migrate keys to/from any standards-compliant KMS |
 
 **Honest scope statement:** PyHSM is a software KMS. It does not carry FIPS 140-2/3 validation (which requires NIST laboratory certification of the specific binary). It does not provide the physical tamper evidence of a hardware HSM. Key material is protected by OS-level process boundaries, not a secure enclave or physically separate processor. For regulated environments that mandate certified hardware, use a certified HSM; PyHSM is appropriate where software key management is acceptable.
 
@@ -564,7 +566,7 @@ Intermediate share buffers are zeroized from memory after reconstruction in both
 
 ```bash
 python -m pytest tests/ -v
-# 84 tests
+# 65 tests
 ```
 
 **TypeScript (vitest):**

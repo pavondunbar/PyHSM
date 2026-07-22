@@ -553,3 +553,212 @@ class TestMetrics:
         hsm.generate_key("k2")
         m = hsm.get_metrics()
         assert m["activeKeys"] >= 2
+
+
+
+# ---------------------------------------------------------------------------
+# EC P-384 and P-521 curves
+# ---------------------------------------------------------------------------
+
+class TestECCurves:
+    def test_generate_ec_p384(self, hsm):
+        hsm.generate_key("ec384", "ec-p384")
+        assert hsm.has_key("ec384")
+        pub = hsm.get_public_key("ec384")
+        assert "BEGIN PUBLIC KEY" in pub
+
+    def test_generate_ec_p521(self, hsm):
+        hsm.generate_key("ec521", "ec-p521")
+        assert hsm.has_key("ec521")
+        pub = hsm.get_public_key("ec521")
+        assert "BEGIN PUBLIC KEY" in pub
+
+    def test_sign_verify_ec_p384(self, hsm):
+        hsm.generate_key("ec384", "ec-p384")
+        sig = hsm.sign("ec384", "test message")
+        assert hsm.verify("ec384", "test message", sig) is True
+        assert hsm.verify("ec384", "wrong message", sig) is False
+
+    def test_sign_verify_ec_p521(self, hsm):
+        hsm.generate_key("ec521", "ec-p521")
+        sig = hsm.sign("ec521", "test message")
+        assert hsm.verify("ec521", "test message", sig) is True
+        assert hsm.verify("ec521", "wrong message", sig) is False
+
+    def test_ec_p384_persists(self, store_path):
+        h1 = PyHSM(store_path, master_password="pw", session_timeout_s=0)
+        h1.generate_key("ec384", "ec-p384")
+        sig = h1.sign("ec384", "persist test")
+        h1.close_session()
+
+        h2 = PyHSM(store_path, master_password="pw", session_timeout_s=0)
+        assert h2.verify("ec384", "persist test", sig) is True
+        h2.close_session()
+
+    def test_ec_p521_persists(self, store_path):
+        h1 = PyHSM(store_path, master_password="pw", session_timeout_s=0)
+        h1.generate_key("ec521", "ec-p521")
+        sig = h1.sign("ec521", "persist test")
+        h1.close_session()
+
+        h2 = PyHSM(store_path, master_password="pw", session_timeout_s=0)
+        assert h2.verify("ec521", "persist test", sig) is True
+        h2.close_session()
+
+
+# ---------------------------------------------------------------------------
+# KEK salt-based derivation
+# ---------------------------------------------------------------------------
+
+class TestKEKDerivation:
+    def test_new_keystore_has_kek_salt(self, store_path):
+        """New keystores should have a _kek_salt in their internal state."""
+        h = PyHSM(store_path, master_password="pw", session_timeout_s=0)
+        # The _kek_salt is internal to the store — verify by checking
+        # that keys can be generated and used (proves KEK derivation works)
+        h.generate_key("k1")
+        ct = h.encrypt("k1", "hello")
+        assert h.decrypt("k1", ct) == b"hello"
+        h.close_session()
+
+    def test_kek_survives_reload(self, store_path):
+        """KEK salt persists across sessions — keys remain accessible."""
+        h1 = PyHSM(store_path, master_password="pw", session_timeout_s=0)
+        h1.generate_key("k1")
+        ct = h1.encrypt("k1", "survives reload")
+        h1.close_session()
+
+        h2 = PyHSM(store_path, master_password="pw", session_timeout_s=0)
+        assert h2.decrypt("k1", ct) == b"survives reload"
+        h2.close_session()
+
+    def test_kek_rotation_after_key_rotate(self, store_path):
+        """Key rotation with new KEK derivation still allows decrypt of old versions."""
+        h = PyHSM(store_path, master_password="pw", session_timeout_s=0)
+        h.generate_key("rk")
+        ct1 = h.encrypt("rk", "version1")
+        h.rotate_key("rk")
+        ct2 = h.encrypt("rk", "version2")
+        h.close_session()
+
+        h2 = PyHSM(store_path, master_password="pw", session_timeout_s=0)
+        assert h2.decrypt("rk", ct1) == b"version1"
+        assert h2.decrypt("rk", ct2) == b"version2"
+        h2.close_session()
+
+
+# ---------------------------------------------------------------------------
+# Memory zeroization (bytearray key_data)
+# ---------------------------------------------------------------------------
+
+class TestMemoryZeroization:
+    def test_key_data_is_bytearray_in_memory(self, hsm):
+        """After generation, key_data should be stored as bytearray (not str)."""
+        hsm.generate_key("zk")
+        entry = hsm._store.load_key("zk")
+        for v in entry["versions"]:
+            assert isinstance(v["key_data"], bytearray), \
+                f"key_data should be bytearray, got {type(v['key_data'])}"
+
+    def test_destroy_zeroizes_key_data(self, hsm):
+        """After destroy, the bytearray should be zeroed out."""
+        hsm.generate_key("zk")
+        entry = hsm._store.load_key("zk")
+        key_data_ref = entry["versions"][0]["key_data"]
+        # Sanity: key_data is non-zero
+        assert any(b != 0 for b in key_data_ref)
+        hsm.destroy_key("zk")
+        # After destroy, the original bytearray should be zeroed
+        assert all(b == 0 for b in key_data_ref)
+
+    def test_close_session_zeroizes(self, store_path):
+        """close_session should zeroize all key material."""
+        h = PyHSM(store_path, master_password="pw", session_timeout_s=0)
+        h.generate_key("zk")
+        entry = h._store.load_key("zk")
+        key_data_ref = entry["versions"][0]["key_data"]
+        assert any(b != 0 for b in key_data_ref)
+        h.close_session()
+        assert all(b == 0 for b in key_data_ref)
+
+
+# ---------------------------------------------------------------------------
+# Caller ID audit logging and ACL enforcement
+# ---------------------------------------------------------------------------
+
+class TestCallerID:
+    def test_caller_id_recorded_in_audit(self, hsm):
+        hsm.generate_key("ck", caller_id="service-alpha")
+        hsm.encrypt("ck", "data", caller_id="service-alpha")
+        audit = hsm.get_audit_log()
+        entries = audit.export_jsonl(key_id="ck")
+        # At least one entry should have callerId
+        caller_entries = [e for e in entries if e.get("callerId") == "service-alpha"]
+        assert len(caller_entries) >= 2  # generate + encrypt
+
+    def test_caller_id_none_is_omitted(self, hsm):
+        hsm.generate_key("nk")
+        hsm.encrypt("nk", "data")
+        audit = hsm.get_audit_log()
+        entries = audit.export_jsonl(key_id="nk")
+        # When caller_id is None, callerId field should not appear
+        for e in entries:
+            if e.get("operation") == "encrypt":
+                assert "callerId" not in e or e["callerId"] is None
+
+    def test_allowed_callers_enforced(self, hsm):
+        """Keys with allowed_callers policy should deny unauthorized callers."""
+        hsm.generate_key("acl-key", policy={
+            "allow_encrypt": True,
+            "allow_decrypt": True,
+            "allowed_callers": ["service-a", "service-b"],
+        })
+        # Authorized caller succeeds
+        ct = hsm.encrypt("acl-key", "hello", caller_id="service-a")
+        assert hsm.decrypt("acl-key", ct, caller_id="service-b") == b"hello"
+
+        # Unauthorized caller is denied
+        with pytest.raises(ValueError, match="not authorized"):
+            hsm.encrypt("acl-key", "hello", caller_id="service-x")
+
+    def test_allowed_callers_none_caller_denied(self, hsm):
+        """If allowed_callers is set and caller_id is None, access is denied."""
+        hsm.generate_key("acl-key2", policy={
+            "allow_encrypt": True,
+            "allow_decrypt": True,
+            "allowed_callers": ["service-a"],
+        })
+        with pytest.raises(ValueError, match="not authorized"):
+            hsm.encrypt("acl-key2", "hello", caller_id=None)
+
+    def test_no_allowed_callers_any_caller_ok(self, hsm):
+        """Without allowed_callers policy, any caller_id is accepted."""
+        hsm.generate_key("open-key")
+        ct = hsm.encrypt("open-key", "hello", caller_id="anyone")
+        assert hsm.decrypt("open-key", ct, caller_id="someone-else") == b"hello"
+
+    def test_caller_id_in_sign_verify(self, hsm):
+        hsm.generate_key("ec-acl", "ec-p256", caller_id="admin")
+        sig = hsm.sign("ec-acl", "msg", caller_id="signer")
+        assert hsm.verify("ec-acl", "msg", sig, caller_id="verifier") is True
+        audit = hsm.get_audit_log()
+        entries = audit.export_jsonl(key_id="ec-acl")
+        callers = [e.get("callerId") for e in entries if e.get("callerId")]
+        assert "admin" in callers
+        assert "signer" in callers
+        assert "verifier" in callers
+
+    def test_access_denied_audit_entry(self, hsm):
+        """Denied access should be recorded in the audit log."""
+        hsm.generate_key("deny-key", policy={
+            "allow_encrypt": True,
+            "allowed_callers": ["trusted"],
+        })
+        with pytest.raises(ValueError, match="not authorized"):
+            hsm.encrypt("deny-key", "x", caller_id="untrusted")
+        audit = hsm.get_audit_log()
+        entries = audit.export_jsonl(key_id="deny-key")
+        denied = [e for e in entries if e.get("operation") == "accessDenied"]
+        assert len(denied) == 1
+        assert denied[0]["callerId"] == "untrusted"
+        assert denied[0]["success"] is False

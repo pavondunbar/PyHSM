@@ -83,15 +83,16 @@ def zeroize_dict_keys(keys_dict: dict) -> None:
     Overwrite all key_data fields in a keys dictionary with zeros.
 
     This handles the in-memory keystore structure where each key entry
-    has a 'versions' list, each containing a 'key_data' hex string.
-    Since strings are immutable, we replace them with a zeroed bytearray
-    of the same length, then clear the reference.
+    has a 'versions' list, each containing a 'key_data' bytearray.
+    The bytearray is overwritten in-place with zeros for deterministic
+    memory erasure. Any residual string references are also cleared.
     """
-    for entry in keys_dict.values():
+    for key_id, entry in keys_dict.items():
+        if isinstance(entry, str):
+            continue  # skip metadata fields like _kek_salt
         versions = entry.get("versions", [])
         for v in versions:
             key_data = v.get("key_data", "")
             if isinstance(key_data, bytearray):
                 zeroize_bytearray(key_data)
-            # Replace string references with empty (can't overwrite str in-place)
             v["key_data"] = ""

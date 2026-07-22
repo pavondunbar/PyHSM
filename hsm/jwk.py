@@ -6,12 +6,12 @@ other KMS systems, identity providers, and standards-based tooling.
 
 Supported key types for export:
   - AES-128, AES-256 → {"kty": "oct", "k": <base64url>, ...}
-  - EC P-256          → {"kty": "EC", "crv": "P-256", "x": ..., "y": ..., "d": ...}
+  - EC P-256/P-384/P-521 → {"kty": "EC", "crv": "P-256"|"P-384"|"P-521", ...}
   - RSA-2048/4096     → {"kty": "RSA", "n": ..., "e": ..., "d": ..., ...}
 
 Supported key types for import:
   - {"kty": "oct"}    → AES symmetric key
-  - {"kty": "EC"}     → ECDSA key (P-256)
+  - {"kty": "EC"}     → ECDSA key (P-256, P-384, P-521)
   - {"kty": "RSA"}    → RSA key
 """
 
@@ -86,6 +86,9 @@ def export_ec_jwk(private_key_pem: bytes, key_id: Optional[str] = None) -> dict:
     elif isinstance(curve, ec.SECP384R1):
         crv = "P-384"
         coord_size = 48
+    elif isinstance(curve, ec.SECP521R1):
+        crv = "P-521"
+        coord_size = 66
     else:
         raise ValueError(f"Unsupported curve: {curve.name}")
 
@@ -162,6 +165,9 @@ def import_jwk(jwk: dict) -> tuple[str, bytes, Optional[str]]:
         elif crv == "P-384":
             curve = ec.SECP384R1()
             coord_size = 48
+        elif crv == "P-521":
+            curve = ec.SECP521R1()
+            coord_size = 66
         else:
             raise ValueError(f"Unsupported curve: {crv}")
 
@@ -183,7 +189,7 @@ def import_jwk(jwk: dict) -> tuple[str, bytes, Optional[str]]:
             serialization.PublicFormat.SubjectPublicKeyInfo,
         ).decode()
 
-        key_type = "ec-p256" if crv == "P-256" else "ec-p384"
+        key_type = {"P-256": "ec-p256", "P-384": "ec-p384", "P-521": "ec-p521"}[crv]
         return key_type, priv_pem, pub_pem
 
     elif kty == "RSA":

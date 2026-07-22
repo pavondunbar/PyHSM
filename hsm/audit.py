@@ -21,6 +21,8 @@ _VALID_OPERATIONS = frozenset(
     [
         "encrypt",
         "decrypt",
+        "sign",
+        "verify",
         "generateKey",
         "destroyKey",
         "rotateKey",
@@ -45,31 +47,38 @@ class AuditLog:
     File format: one JSON object per line.
     Each entry carries an 'hmac' field computed as:
         HMAC-SHA256(key, json(entry_without_hmac) + prev_hmac_hex)
-    The key is loaded from PYHSM_AUDIT_HMAC_KEY (hex) or persisted
-    in <log_path>.hmackey (mode 0o600) if not set.
+
+    The HMAC key is resolved with the following priority:
+      1. Explicit ``hmac_key`` parameter (recommended: derived from master password)
+      2. PYHSM_AUDIT_HMAC_KEY environment variable (hex-encoded 32 bytes)
+      3. Persisted key file at <log_path>.hmackey (mode 0o600)
+      4. Auto-generated random key (written to key file)
     """
 
-    def __init__(self, log_path: str, webhook_url: Optional[str] = None) -> None:
+    def __init__(self, log_path: str, webhook_url: Optional[str] = None, *, hmac_key: Optional[bytes] = None) -> None:
         self.log_path = log_path
         self.webhook_url = webhook_url or os.environ.get("PYHSM_AUDIT_WEBHOOK")
         self._last_hmac = "0" * 64
         self._sequence = 0
 
-        # Resolve HMAC key
-        env_key = os.environ.get("PYHSM_AUDIT_HMAC_KEY")
-        if env_key:
-            self._hmac_key = bytes.fromhex(env_key)
+        # Resolve HMAC key (priority: explicit param > env var > key file > generate)
+        if hmac_key:
+            self._hmac_key = hmac_key
         else:
-            key_file = log_path + ".hmackey"
-            if os.path.exists(key_file):
-                with open(key_file, "r") as f:
-                    self._hmac_key = bytes.fromhex(f.read().strip())
+            env_key = os.environ.get("PYHSM_AUDIT_HMAC_KEY")
+            if env_key:
+                self._hmac_key = bytes.fromhex(env_key)
             else:
-                self._hmac_key = os.urandom(32)
-                # Write with restricted permissions
-                fd = os.open(key_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-                with os.fdopen(fd, "w") as f:
-                    f.write(self._hmac_key.hex())
+                key_file = log_path + ".hmackey"
+                if os.path.exists(key_file):
+                    with open(key_file, "r") as f:
+                        self._hmac_key = bytes.fromhex(f.read().strip())
+                else:
+                    self._hmac_key = os.urandom(32)
+                    # Write with restricted permissions
+                    fd = os.open(key_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                    with os.fdopen(fd, "w") as f:
+                        f.write(self._hmac_key.hex())
 
         self._load_last_state()
 

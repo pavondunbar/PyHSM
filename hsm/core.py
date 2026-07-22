@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import os
 import re
-import secrets
 import threading
 from datetime import datetime, timezone
 from typing import Optional
@@ -29,6 +28,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa, ec, padding
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.keywrap import aes_key_wrap_with_padding, aes_key_unwrap_with_padding
+from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
 
 from .storage import KeyStore, TamperError
 from .audit import AuditLog
@@ -89,6 +89,13 @@ class PyHSM:
         Maximum operations per key per rate window. Default 100.
     rate_limit_window_s : float, optional
         Rate-limit window in seconds. Default 60.
+
+    Notes
+    -----
+    All key operations (generate, encrypt, decrypt, sign, verify, rotate,
+    destroy, import/export) accept an optional ``caller_id`` keyword argument.
+    When provided, it is recorded in the audit log for every operation and
+    enforced against the key's ``allowed_callers`` policy if configured.
     """
 
     def __init__(
@@ -111,7 +118,17 @@ class PyHSM:
         self._session_timeout_s = session_timeout_s
 
         audit_path = audit_log_path or (storage_path + ".audit.jsonl")
-        self._audit = AuditLog(audit_path)
+
+        # Derive the audit HMAC key from the master password via HKDF.
+        # This eliminates the plaintext .hmackey file on disk — the audit
+        # chain integrity is now tied to the master password.
+        audit_hmac_key = HKDFExpand(
+            algorithm=hashes.SHA256(),
+            length=32,
+            info=b"pyhsm-audit-hmac-v1",
+        ).derive(master_password.encode("utf-8"))
+
+        self._audit = AuditLog(audit_path, hmac_key=audit_hmac_key)
         self._rate_limiter = RateLimiter(rate_limit_max_ops, rate_limit_window_s)
         self._metrics = MetricsCollector()
 
@@ -203,20 +220,27 @@ class PyHSM:
     # Per-key wrapping (AES-KWP RFC 5649)
     # ------------------------------------------------------------------
 
-    def _wrap_key_data(self, raw_key: bytes) -> str:
-        """Wrap raw key material with AES-KWP, return hex string for storage."""
+    def _wrap_key_data(self, raw_key: bytes) -> bytearray:
+        """Wrap raw key material with AES-KWP, return bytearray for in-memory storage."""
         kek = self._store._derive_kek()
         try:
             wrapped = aes_key_wrap_with_padding(bytes(kek), raw_key)
-            return wrapped.hex()
+            return bytearray(wrapped)
         finally:
             zeroize_bytearray(kek)
 
-    def _unwrap_key_data(self, wrapped_hex: str) -> bytes:
-        """Unwrap stored key material from hex. Caller must manage the result."""
+    def _unwrap_key_data(self, wrapped_data) -> bytes:
+        """Unwrap stored key material. Accepts bytearray or hex string. Caller must manage the result."""
         kek = self._store._derive_kek()
         try:
-            return aes_key_unwrap_with_padding(bytes(kek), bytes.fromhex(wrapped_hex))
+            if isinstance(wrapped_data, bytearray):
+                raw = bytes(wrapped_data)
+            elif isinstance(wrapped_data, bytes):
+                raw = wrapped_data
+            else:
+                # Legacy: hex string
+                raw = bytes.fromhex(wrapped_data)
+            return aes_key_unwrap_with_padding(bytes(kek), raw)
         finally:
             zeroize_bytearray(kek)
 
@@ -224,15 +248,24 @@ class PyHSM:
     # Policy enforcement
     # ------------------------------------------------------------------
 
-    def _enforce_policy(self, entry: dict, operation: str) -> None:
+    def _enforce_policy(self, entry: dict, operation: str, caller_id: Optional[str] = None) -> None:
         """Check per-key policy; raise ValueError if any constraint is violated."""
         policy = entry.get("policy", {})
         key_id = entry.get("key_id", "?")
 
         if not self._rate_limiter.allow(key_id):
             self._metrics.record_rate_limit()
-            self._audit.record("rateLimited", key_id=key_id, success=False)
+            self._audit.record("rateLimited", key_id=key_id, caller_id=caller_id, success=False)
             raise ValueError(f"PyHSM: key '{key_id}' is rate-limited")
+
+        # Check caller ACL if policy defines allowed_callers
+        allowed_callers = policy.get("allowed_callers")
+        if allowed_callers and caller_id not in allowed_callers:
+            self._audit.record("accessDenied", key_id=key_id, caller_id=caller_id, success=False,
+                               reason=f"caller '{caller_id}' not in allowed_callers")
+            raise ValueError(
+                f"PyHSM: caller '{caller_id}' is not authorized for key '{key_id}'"
+            )
 
         if operation == "encrypt" and not policy.get("allow_encrypt", True):
             raise ValueError(f"PyHSM: key '{key_id}' policy denies encrypt")
@@ -262,11 +295,12 @@ class PyHSM:
         *,
         metadata: Optional[dict] = None,
         policy: Optional[dict] = None,
+        caller_id: Optional[str] = None,
     ) -> str:
         """
         Generate a new cryptographic key.
 
-        Supported types: aes-128, aes-256, rsa-2048, rsa-4096, ec-p256.
+        Supported types: aes-128, aes-256, rsa-2048, rsa-4096, ec-p256, ec-p384, ec-p521.
         Returns the key_id.
         """
         with self._global_lock:
@@ -289,6 +323,12 @@ class PyHSM:
                 key_data = self._wrap_key_data(priv_pem.encode())
             elif key_type == "ec-p256":
                 priv_pem, public_key_pem = _gen_ec(ec.SECP256R1())
+                key_data = self._wrap_key_data(priv_pem.encode())
+            elif key_type == "ec-p384":
+                priv_pem, public_key_pem = _gen_ec(ec.SECP384R1())
+                key_data = self._wrap_key_data(priv_pem.encode())
+            elif key_type == "ec-p521":
+                priv_pem, public_key_pem = _gen_ec(ec.SECP521R1())
                 key_data = self._wrap_key_data(priv_pem.encode())
             else:
                 raise ValueError(f"Unsupported key type: {key_type}")
@@ -313,7 +353,7 @@ class PyHSM:
                 "metadata": metadata or {},
             }
             self._store.save_key(key_id, entry)
-            self._audit.record("generateKey", key_id=key_id, success=True)
+            self._audit.record("generateKey", key_id=key_id, caller_id=caller_id, success=True)
             self._update_key_metrics()
             return key_id
 
@@ -322,7 +362,7 @@ class PyHSM:
     # Key rotation
     # ------------------------------------------------------------------
 
-    def rotate_key(self, key_id: str) -> int:
+    def rotate_key(self, key_id: str, *, caller_id: Optional[str] = None) -> int:
         """
         Rotate a key: generates a new version, archives the old.
         Returns the new version number.
@@ -354,7 +394,7 @@ class PyHSM:
             })
             entry["current_version"] = new_version
             self._store.update_key(key_id, entry)
-            self._audit.record("rotateKey", key_id=key_id, success=True)
+            self._audit.record("rotateKey", key_id=key_id, caller_id=caller_id, success=True)
             self._update_key_metrics()
             return new_version
 
@@ -362,7 +402,7 @@ class PyHSM:
     # Key destruction / listing
     # ------------------------------------------------------------------
 
-    def destroy_key(self, key_id: str) -> None:
+    def destroy_key(self, key_id: str, *, caller_id: Optional[str] = None) -> None:
         """Destroy a key — all versions are zeroized and removed."""
         with self._global_lock:
             self._assert_session()
@@ -372,17 +412,14 @@ class PyHSM:
             for v in entry["versions"]:
                 kd = v["key_data"]
                 if isinstance(kd, bytearray):
-                    for i in range(len(kd)):
-                        kd[i] = 0
-                else:
-                    # hex string — overwrite reference (strings are immutable)
-                    v["key_data"] = "0" * len(kd)
+                    zeroize_bytearray(kd)
+                v["key_data"] = bytearray()
             self._store.delete_key(key_id)
             self._rate_limiter.reset(key_id)
             # Clean up per-key lock to prevent unbounded growth
             with self._key_locks_lock:
                 self._key_locks.pop(key_id, None)
-            self._audit.record("destroyKey", key_id=key_id, success=True)
+            self._audit.record("destroyKey", key_id=key_id, caller_id=caller_id, success=True)
             self._update_key_metrics()
 
     def list_keys(self) -> list[dict]:
@@ -416,7 +453,7 @@ class PyHSM:
     # Encrypt / Decrypt (AES-256-GCM with version prefix)
     # ------------------------------------------------------------------
 
-    def encrypt(self, key_id: str, plaintext) -> str:
+    def encrypt(self, key_id: str, plaintext: str | bytes, *, caller_id: Optional[str] = None) -> str:
         """
         Encrypt data using a stored AES key.
 
@@ -439,7 +476,7 @@ class PyHSM:
             if not entry["key_type"].startswith("aes"):
                 raise ValueError("Encryption requires an AES key")
 
-            self._enforce_policy(entry, "encrypt")
+            self._enforce_policy(entry, "encrypt", caller_id)
 
             # Get current version
             current = next(
@@ -482,10 +519,10 @@ class PyHSM:
             entry["operation_count"] = op_count + 1
             self._store.update_key(key_id, entry)
             self._metrics.record_op("encrypt")
-            self._audit.record("encrypt", key_id=key_id, success=True)
+            self._audit.record("encrypt", key_id=key_id, caller_id=caller_id, success=True)
             return result
 
-    def decrypt(self, key_id: str, ciphertext_hex: str) -> bytes:
+    def decrypt(self, key_id: str, ciphertext_hex: str, *, caller_id: Optional[str] = None) -> bytes:
         """
         Decrypt hex-encoded ciphertext.
 
@@ -503,7 +540,16 @@ class PyHSM:
             if not entry["key_type"].startswith("aes"):
                 raise ValueError("Decryption requires an AES key")
 
-            self._enforce_policy(entry, "decrypt")
+            self._enforce_policy(entry, "decrypt", caller_id)
+
+            # Input size guard: reject ciphertext that would decode to > 64 MB
+            # (hex string is 2x the binary size)
+            _MAX_CIPHERTEXT_HEX_LEN = _MAX_PLAINTEXT_SIZE * 2
+            if len(ciphertext_hex) > _MAX_CIPHERTEXT_HEX_LEN:
+                raise ValueError(
+                    f"PyHSM: ciphertext too large ({len(ciphertext_hex)} hex chars). "
+                    f"Maximum is {_MAX_CIPHERTEXT_HEX_LEN} hex chars (64 MB binary)."
+                )
 
             raw = bytes.fromhex(ciphertext_hex)
 
@@ -550,7 +596,7 @@ class PyHSM:
             entry["operation_count"] = entry.get("operation_count", 0) + 1
             self._store.update_key(key_id, entry)
             self._metrics.record_op("decrypt")
-            self._audit.record("decrypt", key_id=key_id, success=True)
+            self._audit.record("decrypt", key_id=key_id, caller_id=caller_id, success=True)
             return plain
 
 
@@ -558,7 +604,7 @@ class PyHSM:
     # Sign / Verify
     # ------------------------------------------------------------------
 
-    def sign(self, key_id: str, message) -> str:
+    def sign(self, key_id: str, message: str | bytes, *, caller_id: Optional[str] = None) -> str:
         """Sign a message using a stored RSA or EC key. Returns hex-encoded signature."""
         with self._key_lock(key_id):
             self._assert_session()
@@ -568,7 +614,7 @@ class PyHSM:
             if not (entry["key_type"].startswith("rsa") or entry["key_type"].startswith("ec")):
                 raise ValueError("Signing requires an RSA or EC key")
 
-            self._enforce_policy(entry, "sign")
+            self._enforce_policy(entry, "sign", caller_id)
 
             data = message.encode("utf-8") if isinstance(message, str) else message
 
@@ -594,17 +640,18 @@ class PyHSM:
                     hashes.SHA256(),
                 )
             elif entry["key_type"].startswith("ec"):
-                sig = private_key.sign(data, ec.ECDSA(hashes.SHA256()))
+                hash_alg = _ec_hash_for_key_type(entry["key_type"])
+                sig = private_key.sign(data, ec.ECDSA(hash_alg))
             else:
                 raise ValueError("Signing requires an RSA or EC key")
 
             entry["operation_count"] = entry.get("operation_count", 0) + 1
             self._store.update_key(key_id, entry)
             self._metrics.record_op("sign")
-            self._audit.record("sign", key_id=key_id, success=True)
+            self._audit.record("sign", key_id=key_id, caller_id=caller_id, success=True)
             return sig.hex()
 
-    def verify(self, key_id: str, message, signature_hex: str) -> bool:
+    def verify(self, key_id: str, message: str | bytes, signature_hex: str, *, caller_id: Optional[str] = None) -> bool:
         """
         Verify a signature using the stored PUBLIC key.
         Does NOT load the private key — only the public key PEM stored at generation time.
@@ -636,14 +683,17 @@ class PyHSM:
                         hashes.SHA256(),
                     )
                 elif entry["key_type"].startswith("ec"):
-                    public_key.verify(sig, data, ec.ECDSA(hashes.SHA256()))
+                    hash_alg = _ec_hash_for_key_type(entry["key_type"])
+                    public_key.verify(sig, data, ec.ECDSA(hash_alg))
                 else:
                     return False
                 entry["operation_count"] = entry.get("operation_count", 0) + 1
                 self._store.update_key(key_id, entry)
                 self._metrics.record_op("verify")
+                self._audit.record("verify", key_id=key_id, caller_id=caller_id, success=True)
                 return True
             except Exception:
+                self._audit.record("verify", key_id=key_id, caller_id=caller_id, success=False)
                 return False
 
 
@@ -668,7 +718,7 @@ class PyHSM:
     # JWK Import / Export (RFC 7517)
     # ------------------------------------------------------------------
 
-    def export_jwk(self, key_id: str) -> dict:
+    def export_jwk(self, key_id: str, *, caller_id: Optional[str] = None) -> dict:
         """
         Export a key as a JWK (JSON Web Key, RFC 7517).
 
@@ -715,6 +765,7 @@ class PyHSM:
         *,
         metadata: Optional[dict] = None,
         policy: Optional[dict] = None,
+        caller_id: Optional[str] = None,
     ) -> str:
         """
         Import a key from a JWK (JSON Web Key, RFC 7517).
@@ -753,7 +804,7 @@ class PyHSM:
                 "metadata": metadata or {},
             }
             self._store.save_key(key_id, entry)
-            self._audit.record("generateKey", key_id=key_id, success=True)
+            self._audit.record("generateKey", key_id=key_id, caller_id=caller_id, success=True)
             self._update_key_metrics()
             return key_id
 
@@ -833,3 +884,19 @@ def _gen_ec(curve) -> tuple[str, str]:
         serialization.PublicFormat.SubjectPublicKeyInfo,
     ).decode()
     return priv_pem, pub_pem
+
+
+def _ec_hash_for_key_type(key_type: str):
+    """Return the appropriate hash algorithm for the given EC key type.
+
+    NIST recommendations:
+      P-256 → SHA-256
+      P-384 → SHA-384
+      P-521 → SHA-512
+    """
+    if key_type == "ec-p384":
+        return hashes.SHA384()
+    elif key_type == "ec-p521":
+        return hashes.SHA512()
+    # Default for ec-p256 and any other ec- prefix
+    return hashes.SHA256()
