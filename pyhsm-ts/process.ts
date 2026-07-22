@@ -54,6 +54,8 @@ function handleRequest(hsm: PyHSM, req: IPCRequest): IPCResponse {
         return { ok: true, data: hsm.getMetrics() };
       case "backup":
         return { ok: true, data: hsm.createBackup(req.callerId) };
+      case "verifyBackup":
+        return { ok: true, data: hsm.verifyBackup(req.backupPath, req.callerId) };
       case "health":
         return { ok: true, data: { status: "healthy", uptime: hsm.getMetrics().uptimeMs } };
       default:

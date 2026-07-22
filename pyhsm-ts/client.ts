@@ -105,4 +105,10 @@ export class PyHSMClient {
     if (!res.ok) throw new Error(res.error);
     return res.data as string;
   }
+
+  async verifyBackup(backupPath: string): Promise<boolean> {
+    const res = await this.send({ type: "verifyBackup", backupPath, callerId: this.callerId });
+    if (!res.ok) throw new Error(res.error);
+    return res.data as boolean;
+  }
 }

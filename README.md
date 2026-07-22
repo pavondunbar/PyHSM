@@ -1,227 +1,388 @@
 # PyHSM
 
-A software-based Hardware Security Module (HSM) providing cryptographic key management, encryption, signing, and secure key storage. Available as a Python CLI tool and a production-hardened TypeScript library.
+A production-grade software Key Management Service (KMS) providing cryptographic key lifecycle management, authenticated encryption, digital signing, and tamper-evident audit logging.
 
-## Python CLI
+Available as a **Python CLI and library** and a **production-hardened TypeScript/Node.js library**.
 
-### Features
+---
 
-- **Key Generation**: AES-128, AES-256, RSA-2048, RSA-4096, EC P-256
-- **Encryption/Decryption**: AES-GCM authenticated encryption
-- **Signing/Verification**: RSA-PSS and ECDSA with SHA-256
-- **Secure Storage**: Keys encrypted at rest with AES-256-GCM, master key derived via PBKDF2 (480k iterations)
-- **Shamir's Secret Sharing**: Split any 256-bit secret into N shares with a K-of-N reconstruction threshold
+## Why PyHSM
 
-### Install
+Most applications that need key management face a difficult choice: implement it themselves (error-prone), pay for cloud KMS (vendor lock-in, data sovereignty concerns), or buy a hardware HSM ($20K+, complex). PyHSM is a third path — a well-engineered software KMS that you own, deploy anywhere, and extend freely.
+
+**What makes it production-grade:**
+
+- AES-256-GCM-SIV encryption (nonce-misuse resistant)
+- Argon2id key derivation (OWASP recommended, 64 MB memory-hard)
+- AES-KWP (RFC 5649) per-key wrapping — keys are double-encrypted at rest
+- Encrypt-then-MAC keystore with HMAC-SHA256 tamper detection
+- Atomic file writes — keystore never corrupts on crash
+- Key versioning — rotate without breaking old ciphertexts
+- Per-key policies: expiry, operation limits, caller ACLs, rate limiting
+- HMAC-chained append-only audit log with SIEM export
+- Process isolation via Unix domain socket IPC
+- Shamir M-of-N master password unlock ceremony
+- Startup Known-Answer Tests (KATs) before accepting any operations
+- Prometheus metrics
+- 128 tests across both layers
+
+---
+
+## Table of Contents
+
+- [Python Layer](#python-layer)
+  - [Installation](#python-installation)
+  - [CLI Usage](#cli-usage)
+  - [Library Usage](#python-library-usage)
+  - [Architecture](#python-architecture)
+- [TypeScript Layer](#typescript-layer)
+  - [Installation](#typescript-installation)
+  - [Library Usage](#typescript-library-usage)
+  - [Process Isolation Mode](#process-isolation-mode)
+  - [Architecture](#typescript-architecture)
+- [Shared: Shamir Secret Sharing](#shamirs-secret-sharing)
+- [Security Model](#security-model)
+- [Running Tests](#running-tests)
+- [Operations Guide](#operations-guide)
+
+---
+
+## Python Layer
+
+### Python Installation
 
 ```bash
-pip install cryptography
+pip install cryptography pytest
 ```
 
-### Usage
+### CLI Usage
+
+All commands require `--store` (keystore path) and a master password. The password can be passed via `-p` or entered interactively at a prompt (recommended for production).
 
 ```bash
 # Generate keys
-python cli.py -p mypassword generate my-aes-key --type aes-256
-python cli.py -p mypassword generate my-rsa-key --type rsa-2048
-python cli.py -p mypassword generate my-ec-key --type ec-p256
+python cli.py --store keystore.enc generate my-aes-key --type aes-256
+python cli.py --store keystore.enc generate my-rsa-key --type rsa-2048
+python cli.py --store keystore.enc generate my-ec-key  --type ec-p256
 
-# List keys
-python cli.py -p mypassword list
+# Generate a key with a policy
+python cli.py --store keystore.enc generate limited-key \
+  --type aes-256 \
+  --max-operations 500 \
+  --expires-at 2027-01-01T00:00:00Z \
+  --no-decrypt   # encrypt-only key
+
+# List keys (shows type, current version, creation date)
+python cli.py --store keystore.enc list
 
 # Encrypt / Decrypt
-python cli.py -p mypassword encrypt my-aes-key -d "secret message"
-python cli.py -p mypassword decrypt my-aes-key -d <ciphertext-hex>
+python cli.py --store keystore.enc encrypt my-aes-key -d "secret message"
+python cli.py --store keystore.enc decrypt my-aes-key -d <ciphertext-hex>
 
-# Sign / Verify
-python cli.py -p mypassword sign my-ec-key -d "message to sign"
-python cli.py -p mypassword verify my-ec-key "message to sign" <signature-hex>
+# Pipe via stdin
+echo "secret message" | python cli.py --store keystore.enc encrypt my-aes-key
 
-# Export public key
-python cli.py -p mypassword pubkey my-rsa-key
+# Sign / Verify (uses stored public key for verify — private key never exposed)
+python cli.py --store keystore.enc sign   my-ec-key -d "message to sign"
+python cli.py --store keystore.enc verify my-ec-key "message to sign" <sig-hex>
 
-# Delete a key
-python cli.py -p mypassword delete my-aes-key
+# Export public key (PEM)
+python cli.py --store keystore.enc pubkey my-rsa-key
+
+# Rotate an AES key (archives current version, generates new one)
+python cli.py --store keystore.enc rotate my-aes-key
+
+# Destroy a key (zeroizes all versions, removes from store)
+python cli.py --store keystore.enc delete my-aes-key
+
+# Metrics
+python cli.py --store keystore.enc metrics
+python cli.py --store keystore.enc metrics --prometheus
+
+# Audit log
+python cli.py --store keystore.enc audit                       # dump all entries
+python cli.py --store keystore.enc audit --verify              # verify HMAC chain
+python cli.py --store keystore.enc audit --operation encrypt   # filter by operation
+python cli.py --store keystore.enc audit --key-id my-aes-key   # filter by key
+python cli.py --store keystore.enc audit --since 2025-01-01T00:00:00Z
 ```
 
-Stdin is also supported — omit `-d` and pipe data in.
-
-### Shamir's Secret Sharing (Split / Reconstruct)
-
-Split a 256-bit secret (e.g., a crypto wallet seed) into shares distributed to trusted parties. Any K shares can reconstruct the original; fewer reveal nothing.
-
-```bash
-# Split a hex-encoded secret into 5 shares, requiring 3 to reconstruct
-python cli.py split -k 3 -n 5 -s "deadbeefcafebabe1234567890abcdef1122334455667788aabbccddeeff0011"
-
-# Each share is printed as JSON:
-# {"index": 1, "data": "b0ec51f6..."}
-# {"index": 2, "data": "2a7e8ced..."}
-# ...
-
-# Reconstruct from any 3 shares (pass via --share flags)
-python cli.py reconstruct \
-  --share '{"index":1,"data":"b0ec51f6..."}' \
-  --share '{"index":3,"data":"443f63f4..."}' \
-  --share '{"index":5,"data":"e30ec432..."}'
-
-# Or pipe shares via stdin (one JSON object per line)
-python cli.py split -k 3 -n 5 -s "$SECRET" | head -3 | python cli.py reconstruct
-```
-
-**Security model:**
-- The secret and shares only exist in memory — nothing is written to disk
-- No password is required (these commands don't touch the keystore)
-- K-1 or fewer shares reveal zero information about the secret (information-theoretic security)
-- Uses GF(256) arithmetic with the AES irreducible polynomial, matching the TypeScript implementation
-- **Automatic zeroization:** `reconstruct_secret` returns a mutable `bytearray` that is wiped from memory after use. Intermediate share buffers are also zeroized before the function returns.
-
-### Zeroization
-
-After reconstruction, secret material is explicitly overwritten with zeros to minimize its lifetime in memory. The CLI handles this automatically. In your own code, use the `zeroize` helper:
+### Python Library Usage
 
 ```python
-from hsm.shamir import reconstruct_secret, zeroize
+from hsm import PyHSM
 
-secret = reconstruct_secret(shares)
-try:
-    # Use the secret (e.g., sign a transaction)
-    signed_tx = sign(tx, private_key=bytes(secret))
-finally:
-    zeroize(secret)  # Overwrites the bytearray with zeros
+# Master password is always required — there is no insecure default
+hsm = PyHSM(
+    storage_path="keystore.enc",
+    master_password="your-master-password",
+    session_timeout_s=300,      # auto-lock after 5 min inactivity (0 = disabled)
+    rate_limit_max_ops=100,     # max ops per key per window
+    rate_limit_window_s=60,
+)
+
+# Generate keys
+hsm.generate_key("aes-key")                          # AES-256 by default
+hsm.generate_key("rsa-key", "rsa-2048")
+hsm.generate_key("ec-key",  "ec-p256")
+
+# Generate a key with a policy
+hsm.generate_key("restricted", policy={
+    "allow_encrypt": True,
+    "allow_decrypt": False,     # encrypt-only
+    "max_operations": 1000,
+    "expires_at": "2027-01-01T00:00:00Z",
+})
+
+# Encrypt / Decrypt (AES-256-GCM with version prefix)
+ciphertext = hsm.encrypt("aes-key", "secret message")  # returns hex string
+plaintext  = hsm.decrypt("aes-key", ciphertext)        # returns bytes
+
+# Rotate a key (old ciphertexts remain decryptable via version prefix)
+new_version = hsm.rotate_key("aes-key")
+
+# Sign / Verify
+signature = hsm.sign("ec-key", "message")
+is_valid   = hsm.verify("ec-key", "message", signature)  # uses stored public key only
+
+# Export public key (PEM)
+pub_pem = hsm.get_public_key("rsa-key")
+
+# Expiry enforcement (archives expired keys)
+hsm.enforce_expiry()
+
+# Metrics
+metrics_dict = hsm.get_metrics()
+prometheus   = hsm.get_prometheus_metrics()
+
+# Audit log
+audit = hsm.get_audit_log()
+audit.verify()                                          # returns -1 if clean
+entries = audit.export_jsonl(operation="encrypt")       # SIEM-ready list of dicts
+
+# Explicit close (zeroizes master password and key material from memory)
+hsm.close_session()
 ```
 
-**Note:** Python's garbage collector may retain copies of derived objects (e.g., the `bytes()` cast above). For maximum security, perform reconstruction and signing on an air-gapped machine and minimize conversions from the `bytearray`.
-
-**Use case:** Disaster recovery for a crypto wallet without trusting any single person or creating a single point of failure. Give 5 friends a share each; any 3 can recover your wallet if you lose access.
-
-### Architecture
+### Python Architecture
 
 ```
-cli.py          — Command-line interface
 hsm/
-  core.py       — PyHSM class (crypto operations)
-  storage.py    — KeyStore class (encrypted persistence)
-  shamir.py     — Shamir's Secret Sharing (GF(256) split/reconstruct)
+  core.py          — PyHSM class: key lifecycle, encrypt/decrypt, sign/verify
+  storage.py       — KeyStore: AES-256-GCM + HMAC-SHA256, atomic writes
+  shamir.py        — Shamir secret sharing over GF(256)
+  audit.py         — HMAC-chained append-only audit log
+  rate_limiter.py  — Sliding-window per-key rate limiter
+  metrics.py       — Prometheus-format metrics collector
+  self_test.py     — Startup Known-Answer Tests (KATs)
+  __init__.py      — Public API exports
+cli.py             — Full-featured command-line interface
+tests/
+  test_pyhsm.py    — 65 pytest tests
 ```
 
-## TypeScript / Node.js
+---
 
-A production-hardened TypeScript implementation lives in `./pyhsm-ts/`.
+## TypeScript Layer
 
-### Features
+A production-hardened Node.js library in `./pyhsm-ts/` with additional features: Argon2id KDF, AES-256-GCM-SIV (nonce-misuse resistant), SecureBuffer zeroization, and process isolation mode.
 
-- **AES-256-GCM-SIV** — nonce-misuse-resistant encryption
-- **Argon2id** — memory-hard key derivation (replaces PBKDF2)
-- **AES-KWP** (RFC 5649) — key wrapping for stored key material
-- **AES-KWP** (RFC 5649) — per-key wrapping before storage (defense-in-depth beyond the outer envelope)
-- **Key versioning** — rotate keys without breaking old ciphertexts
-- **Per-key ACLs** — restrict which services can use which keys
-- **Rate limiting** — prevent bulk decryption attacks
-- **HMAC tamper detection** — zeroizes all keys on keystore modification
-- **Shamir M-of-N unlock** — ceremony-based startup
-- **Session auto-lock** — keys zeroized after inactivity timeout
-- **Startup self-tests** — known-answer tests run before accepting operations
-- **HMAC-chained audit log** — tamper-evident operation history
-- **Prometheus metrics** — health monitoring
-- **Buffer-based secret storage** — master password and key material held in zeroizable Buffers, not strings
-- **Key ID validation** — rejects prototype pollution, path traversal, and invalid characters
-
-### Install
+### TypeScript Installation
 
 ```bash
 cd pyhsm-ts
 npm install
+npm run build
 ```
 
-### Build
+Requires Node.js ≥ 18. All dependency versions are pinned exactly.
 
-```bash
-npm run build     # Compiles to dist/
-npm run lint      # Type-check without emitting
-```
+### TypeScript Library Usage
 
-### Test
-
-```bash
-npm test          # Run full test suite (vitest)
-npm run test:watch  # Watch mode
-```
-
-### Usage
+#### Synchronous constructor (PBKDF2 fallback)
 
 ```typescript
-import { PyHSM } from './pyhsm-ts';
+import { PyHSM } from "./pyhsm-ts";
 
-// Initialize with a single passphrase (uses PBKDF2 sync fallback)
 const hsm = new PyHSM({
-  storePath: './pyhsm-keystore.enc',
-  masterPassword: 'my-passphrase',
+  storePath: "./keystore.enc",
+  masterPassword: "your-master-password",
+  sessionTimeoutMs: 300_000,
+  backupDir: "./backups",
 });
+```
 
-// Or use the async factory for Argon2id key derivation (preferred)
+#### Async factory — Argon2id KDF (recommended for production)
+
+```typescript
 const hsm = await PyHSM.create({
-  storePath: './pyhsm-keystore.enc',
-  masterPassword: 'my-passphrase',
+  storePath: "./keystore.enc",
+  masterPassword: "your-master-password",
 });
+```
 
-// Generate a key
-hsm.generateKey('my-aes-key');
+The `create()` factory guarantees Argon2id (64 MB / 3 passes / 4 threads) is used for
+all key derivation — including the first save on a new keystore. The synchronous
+constructor falls back to PBKDF2-SHA256 at 480,000 iterations.
 
-// Generate a key with a custom policy
-hsm.generateKey('restricted-key', {
+#### Key operations
+
+```typescript
+// Generate
+hsm.generateKey("my-key");
+
+// Generate with policy
+hsm.generateKey("restricted", {
   allowEncrypt: true,
   allowDecrypt: true,
   maxOperations: 1000,
-  expiresAt: '2027-01-01T00:00:00Z',
-  allowedCallers: ['service-a', 'service-b'],
+  expiresAt: "2027-01-01T00:00:00Z",
+  allowedCallers: ["service-a", "service-b"],
 });
 
-// Encrypt / Decrypt (AES-256-GCM-SIV)
-const ciphertext = hsm.encrypt('my-aes-key', 'secret message');
-const plaintext = hsm.decrypt('my-aes-key', ciphertext);
+// Encrypt / Decrypt (AES-256-GCM-SIV, base64 output with version prefix)
+const ct = hsm.encrypt("my-key", "secret message");
+const pt = hsm.decrypt("my-key", ct);              // returns string
 
-// Key rotation (old ciphertexts remain decryptable)
-hsm.rotateKey('my-aes-key');
+// Rotate (old ciphertexts remain decryptable)
+hsm.rotateKey("my-key");
 
-// Destroy a key (zeroizes all versions)
-hsm.destroyKey('my-aes-key');
+// Destroy (zeroizes all versions)
+hsm.destroyKey("my-key");
 
-// Close session (zeroizes memory)
+// Backup and verify
+const backupPath = hsm.createBackup();
+hsm.verifyBackup(backupPath);   // HMAC + decrypt check without loading into live store
+
+// Metrics
+const metrics = hsm.getMetrics();
+const prom    = hsm.getPrometheusMetrics();
+
+// Audit log
+const audit = hsm.getAuditLog();
+const clean  = audit.verify();                     // -1 = no tampering
+const events = audit.exportJsonl({ operation: "encrypt", since: "2025-01-01T00:00:00Z" });
+const ndjson = audit.toNdjson({ onlyFailed: true }); // SIEM-ready NDJSON string
+
+// Close (zeroizes all Buffers holding sensitive material)
 hsm.closeSession();
 ```
 
-### Shamir M-of-N Unlock
-
-Instead of a single passphrase, you can split the master password into N shares requiring K to reconstruct:
-
-### Key ID Rules
+#### Key ID rules
 
 Key IDs must match `^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$`:
 
 - 1–128 characters
 - Must start with a letter or digit
 - May contain letters, digits, `.`, `_`, `-`
-- Rejects `__proto__`, path traversal (`../`), spaces, etc.
+- Rejects path traversal (`../`), prototype pollution (`__proto__`), spaces
 
-### Shamir M-of-N Unlock
+### Process Isolation Mode
 
-Instead of a single passphrase, you can split the master password into N shares requiring K to reconstruct:
+For maximum security, run the HSM in a separate process. A vulnerability in your
+application cannot directly read key material in the HSM process's memory.
+
+**Start the HSM process:**
+
+```bash
+export PYHSM_MASTER_PASSWORD="your-master-password"
+export PYHSM_KEYSTORE_PATH="/secure/keystore.enc"
+export PYHSM_SOCKET_PATH="/run/pyhsm/pyhsm.sock"
+export PYHSM_CALLER_SECRET="shared-hmac-secret"
+export PYHSM_BACKUP_DIR="/secure/backups"
+
+npx tsx pyhsm-ts/process.ts
+```
+
+**Connect from your application:**
 
 ```typescript
-import { splitMasterPassword, PyHSM } from './pyhsm-ts';
-import type { ShamirShare } from './pyhsm-ts';
+import { PyHSMClient } from "./pyhsm-ts";
 
-// One-time setup: split the master password into 5 shares, requiring 3 to unlock
-const shares: ShamirShare[] = splitMasterPassword('my-passphrase', 3, 5);
-// Distribute one share to each operator:
-// { index: 1, data: "a1b2c3..." }
-// { index: 2, data: "d4e5f6..." }
-// ...
+const client = new PyHSMClient("/run/pyhsm/pyhsm.sock", "my-service");
 
-// Later: collect 3 shares from operators and unlock
+await client.generateKey("app-key");
+const ct = await client.encrypt("app-key", "secret");
+const pt = await client.decrypt("app-key", ct);
+
+await client.rotateKey("app-key");
+const path = await client.backup();
+const ok   = await client.verifyBackup(path);
+const h    = await client.health();
+const m    = await client.metrics();
+```
+
+### TypeScript Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `PYHSM_MASTER_PASSWORD` | — | Master password (**required** unless using `PYHSM_SHARES`) |
+| `PYHSM_SHARES` | — | Comma-separated Shamir share JSON objects |
+| `PYHSM_KEYSTORE_PATH` | `./pyhsm-keystore.enc` | Encrypted keystore location |
+| `PYHSM_AUDIT_LOG_PATH` | `<storePath>.audit.jsonl` | HMAC-chained audit log path |
+| `PYHSM_AUDIT_HMAC_KEY` | *(auto-generated)* | Hex 32-byte audit HMAC key |
+| `PYHSM_AUDIT_WEBHOOK` | — | URL for fire-and-forget audit event POST |
+| `PYHSM_BACKUP_DIR` | — | Directory for encrypted backups |
+| `PYHSM_SOCKET_PATH` | `/tmp/pyhsm.sock` | Unix domain socket path (IPC mode) |
+| `PYHSM_CALLER_SECRET` | — | Shared secret for IPC caller HMAC auth |
+| `PYHSM_SESSION_TIMEOUT_MS` | `300000` | Idle ms before auto-lock |
+| `PYHSM_RATE_LIMIT` | `100` | Max operations per key per window |
+| `PYHSM_RATE_WINDOW_MS` | `60000` | Rate limit window duration (ms) |
+| `PYHSM_FIPS` | `0` | Set `1` to enable FIPS mode (requires OpenSSL 3.x FIPS provider) |
+| `PYHSM_KEY_ID` | `pyhsm-master` | Default key ID for singleton helpers |
+
+### TypeScript Architecture
+
+```
+pyhsm-ts/
+  core.ts          — PyHSM class: key lifecycle, encrypt/decrypt, backup
+  types.ts         — TypeScript interfaces and key ID validation
+  shamir.ts        — Shamir secret sharing over GF(256)
+  audit.ts         — HMAC-chained audit log, SIEM export
+  rate-limiter.ts  — Sliding-window per-key rate limiter
+  metrics.ts       — Prometheus metrics collector
+  self-test.ts     — Startup Known-Answer Tests (KATs), FIPS mode
+  secure-buffer.ts — SecureBuffer: deterministic Buffer zeroization
+  process.ts       — IPC server (process isolation via Unix socket)
+  client.ts        — IPC client with HMAC caller auth
+  index.ts         — Public API exports and singleton factory
+  pyhsm.test.ts    — 63 tests (vitest)
+  OPERATIONS.md    — Full operator guide (env vars, deployment, procedures)
+  package.json     — Pinned exact dependency versions
+  tsconfig.json    — Strict TypeScript configuration
+```
+
+---
+
+## Shamir's Secret Sharing
+
+Both layers implement Shamir secret sharing over GF(256) with the AES irreducible polynomial. This can be used to split a master password or any secret into N shares where K are required to reconstruct — and K-1 or fewer shares reveal zero information (information-theoretic security).
+
+**Python:**
+
+```bash
+# Split a hex secret into 5 shares, 3 required
+python cli.py split -k 3 -n 5 -s "deadbeefcafe..."
+
+# Reconstruct from any 3
+python cli.py reconstruct \
+  --share '{"index":1,"data":"..."}' \
+  --share '{"index":3,"data":"..."}' \
+  --share '{"index":5,"data":"..."}'
+```
+
+**TypeScript:**
+
+```typescript
+import { splitMasterPassword, PyHSM } from "./pyhsm-ts";
+
+// One-time: split the master password into 5 shares, 3 required to unlock
+const shares = splitMasterPassword("my-master-password", 3, 5);
+// Distribute shares[0..4] to five separate key custodians
+
+// At startup: collect K shares from operators
 const hsm = new PyHSM({
-  storePath: './pyhsm-keystore.enc',
+  storePath: "./keystore.enc",
   shares: [
     JSON.stringify(shares[0]),
     JSON.stringify(shares[2]),
@@ -230,77 +391,66 @@ const hsm = new PyHSM({
 });
 ```
 
-Shares can also be provided via environment variable:
+Intermediate share buffers are zeroized from memory after reconstruction in both layers.
+
+---
+
+## Security Model
+
+| Property | Mechanism |
+|---|---|
+| Keys encrypted at rest | AES-256-GCM (Python) / AES-256-GCM-SIV (TypeScript) |
+| Keystore tamper detection | Encrypt-then-MAC: HMAC-SHA256 over ciphertext |
+| Key derivation | PBKDF2-SHA256 480k iter (Python) / Argon2id 64MB (TypeScript async) |
+| Per-key double encryption | AES-KWP RFC 5649 wrapping inside the outer envelope |
+| Memory zeroization | `bytearray` fill (Python) / `Buffer.fill(0)` via `SecureBuffer` (TypeScript) |
+| Nonce misuse resistance | AES-256-GCM-SIV (TypeScript); standard GCM + random nonce (Python) |
+| Atomic writes | `os.replace()` (Python) / `fs.renameSync` on temp file (TypeScript) |
+| Audit integrity | Per-entry HMAC chain — any modification breaks the sequence |
+| Crypto primitive verification | Known-Answer Tests run at startup before any operation |
+| Session isolation | Auto-lock on inactivity; explicit `close_session()` / `closeSession()` |
+| Process memory isolation | Optional: IPC mode runs HSM in a separate process (TypeScript) |
+| M-of-N startup ceremony | Shamir split/reconstruct on master password |
+
+**Honest scope statement:** PyHSM is a software KMS. It does not carry FIPS 140-2/3 validation (which requires NIST laboratory certification of the specific binary). It does not provide the physical tamper evidence of a hardware HSM. Key material is protected by OS-level process boundaries, not a secure enclave or physically separate processor. For regulated environments that mandate certified hardware, use a certified HSM; PyHSM is appropriate where software key management is acceptable.
+
+---
+
+## Running Tests
+
+**Python (pytest):**
 
 ```bash
-export PYHSM_SHARES='{"index":1,"data":"a1b2c3..."},{"index":3,"data":"d4e5f6..."},{"index":5,"data":"789abc..."}'
+python -m pytest tests/ -v
+# 65 tests
 ```
 
-### Configuration
+**TypeScript (vitest):**
 
-```typescript
-const hsm = new PyHSM({
-  storePath: './pyhsm-keystore.enc',
-  masterPassword: 'my-passphrase',
-  sessionTimeoutMs: 300000,          // Auto-lock after 5 min inactivity (default)
-  auditLogPath: './pyhsm.audit.jsonl', // Audit log location
-  backupDir: './backups',             // Encrypted backup directory
-  callerSecret: 'shared-secret',     // HMAC-based caller authentication
-});
+```bash
+cd pyhsm-ts
+npm test
+# 63 tests
 ```
 
-### Environment Variables
+**CI** runs both suites on every push and pull request, across Python 3.11/3.12/3.13 and Node.js 20. See `.github/workflows/ci.yml`.
 
-| Variable | Description |
-|----------|-------------|
-| `PYHSM_KEYSTORE_PATH` | Path to encrypted keystore file |
-| `PYHSM_MASTER_PASSWORD` | Master password (alternative to config) |
-| `PYHSM_SHARES` | Comma-separated JSON Shamir shares |
-| `PYHSM_AUDIT_LOG_PATH` | Audit log file path |
-| `PYHSM_BACKUP_DIR` | Backup directory |
-| `PYHSM_CALLER_SECRET` | Shared secret for caller auth |
-| `PYHSM_SESSION_TIMEOUT_MS` | Session timeout in milliseconds |
-| `PYHSM_RATE_LIMIT` | Max operations per window (default: 100) |
-| `PYHSM_RATE_WINDOW_MS` | Rate limit window in ms (default: 60000) |
-| `PYHSM_KEY_ID` | Default key ID for drop-in helpers |
-| `PYHSM_FIPS` | Set to `1` to enable FIPS mode (requires OpenSSL 3.x FIPS provider) |
+---
 
-### Architecture
+## Operations Guide
 
-```
-pyhsm-ts/
-  index.ts        — Exports, singleton factory, drop-in helpers
-  core.ts         — PyHSM class (encrypt, decrypt, key lifecycle)
-  types.ts        — TypeScript interfaces
-  core.ts         — PyHSM class (encrypt, decrypt, key lifecycle, AES-KWP wrapping)
-  types.ts        — TypeScript interfaces, key ID validation
-  shamir.ts       — Shamir's Secret Sharing (GF(256))
-  rate-limiter.ts — Per-key rate limiting
-  audit.ts        — HMAC-chained audit log
-  metrics.ts      — Prometheus metrics collector
-  self-test.ts    — Startup known-answer tests, FIPS mode
-  process.ts      — Process isolation (Unix socket IPC)
-  client.ts       — IPC client
-  pyhsm.test.ts   — Test suite (vitest)
-  package.json    — Dependencies (pinned versions)
-  tsconfig.json   — TypeScript configuration
-```
+See [`pyhsm-ts/OPERATIONS.md`](pyhsm-ts/OPERATIONS.md) for the full operator guide, including:
 
-## Security Notes
+- Deployment architectures (embedded vs. process-isolated)
+- All environment variables with descriptions and defaults
+- Shamir ceremony procedure
+- Key rotation, backup, and backup verification procedures
+- Audit log verification and SIEM export
+- Prometheus metrics reference
+- Security considerations
 
-- Keys never exist unencrypted on disk — the keystore is always AES-256-GCM encrypted
-- HMAC integrity check on every keystore load — tamper triggers immediate zeroization
-- Master key derived via Argon2id (64 MB memory, 3 iterations) or PBKDF2-SHA256 (480k iterations) as fallback
-- Each encryption uses a fresh random nonce with AES-256-GCM-SIV (nonce-misuse resistant)
-- Key material is zeroized on session close or tamper detection
-- Atomic file writes prevent keystore corruption
-- Individual keys are additionally wrapped with AES-KWP (RFC 5649) before being placed in the keystore
-- HMAC integrity check on every keystore load — tamper triggers immediate zeroization
-- Master key derived via Argon2id (64 MB memory, 3 iterations) or PBKDF2-SHA256 (480k iterations) as sync fallback
-- Master password and caller secret held in `Buffer` objects that are zeroized on session close
-- Each encryption uses a fresh random nonce with AES-256-GCM-SIV (nonce-misuse resistant)
-- Key material is zeroized on session close or tamper detection
-- Atomic file writes prevent keystore corruption
-- Key IDs are validated to prevent prototype pollution and path traversal
-- Shamir split/reconstruct operates entirely in memory — shares are never persisted
-- This is a **development/educational tool** — not a replacement for a certified hardware HSM
+---
+
+## License
+
+MIT

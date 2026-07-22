@@ -111,6 +111,59 @@ export class AuditLog {
     return -1;
   }
 
+  /**
+   * Export filtered audit log entries as an array of objects.
+   *
+   * All fields are included (including hmac chain field) so the output
+   * can be shipped directly to a SIEM (Splunk, Elasticsearch, Datadog, etc.)
+   * as newline-delimited JSON.
+   *
+   * @param operation  Filter to a single operation type.
+   * @param keyId      Filter to a specific key ID.
+   * @param callerId   Filter to a specific caller ID.
+   * @param since      ISO-8601 timestamp — include entries at or after this time.
+   * @param until      ISO-8601 timestamp — include entries at or before this time.
+   * @param onlyFailed Only include entries where success === false.
+   */
+  exportJsonl(opts: {
+    operation?: string;
+    keyId?: string;
+    callerId?: string;
+    since?: string;
+    until?: string;
+    onlyFailed?: boolean;
+  } = {}): AuditEntry[] {
+    if (!fs.existsSync(this.logPath)) return [];
+    const lines = fs.readFileSync(this.logPath, "utf8").trim().split("\n");
+    const results: AuditEntry[] = [];
+
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      let entry: AuditEntry;
+      try {
+        entry = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (opts.operation && entry.operation !== opts.operation) continue;
+      if (opts.keyId && entry.keyId !== opts.keyId) continue;
+      if (opts.callerId && entry.callerId !== opts.callerId) continue;
+      if (opts.since && entry.timestamp < opts.since) continue;
+      if (opts.until && entry.timestamp > opts.until) continue;
+      if (opts.onlyFailed && entry.success !== false) continue;
+      results.push(entry);
+    }
+    return results;
+  }
+
+  /**
+   * Render filtered entries as a newline-delimited JSON string,
+   * ready to pipe to a file or forward to a SIEM HTTP endpoint.
+   */
+  toNdjson(opts: Parameters<AuditLog["exportJsonl"]>[0] = {}): string {
+    return this.exportJsonl(opts).map((e) => JSON.stringify(e)).join("\n");
+  }
+
   private async shipToWebhook(entry: AuditEntry): Promise<void> {
     if (!this.webhookUrl) return;
     try {

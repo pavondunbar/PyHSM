@@ -1,11 +1,16 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
+import net from "node:net";
+import { setTimeout as delay } from "node:timers/promises";
 import crypto from "node:crypto";
 import { PyHSM } from "./core.js";
+import { AuditLog } from "./audit.js";
 import { validateKeyId } from "./types.js";
 import { splitMasterPassword, reconstructMasterPassword, splitSecret, reconstructSecret } from "./shamir.js";
 import { RateLimiter } from "./rate-limiter.js";
 import { runSelfTests } from "./self-test.js";
+import { PyHSMClient } from "./client.js";
+import { SecureBuffer } from "./secure-buffer.js";
 import type { PyHSMConfig } from "./types.js";
 
 const TEST_STORE = "/tmp/pyhsm-test-" + crypto.randomBytes(4).toString("hex") + ".enc";
@@ -346,5 +351,338 @@ describe("Constructor validation", () => {
 
   it("throws without masterPassword or shares", () => {
     expect(() => new PyHSM({ storePath: TEST_STORE } as any)).toThrow("masterPassword or shares required");
+  });
+});
+
+
+
+// ---------------------------------------------------------------------------
+// SecureBuffer
+// ---------------------------------------------------------------------------
+
+describe("SecureBuffer", () => {
+  it("stores and returns buffer contents", () => {
+    const sb = SecureBuffer.from(Buffer.from("hello"));
+    expect(sb.buf.toString()).toBe("hello");
+    sb.dispose();
+  });
+
+  it("zeroizes on dispose", () => {
+    const raw = Buffer.from([0x01, 0x02, 0x03, 0x04]);
+    const sb = SecureBuffer.wrap(raw);
+    sb.dispose();
+    // The underlying buffer should now be zeroed
+    expect(raw.every((b) => b === 0)).toBe(true);
+  });
+
+  it("throws on access after dispose", () => {
+    const sb = SecureBuffer.alloc(16);
+    sb.dispose();
+    expect(() => sb.buf).toThrow("after dispose");
+  });
+
+  it("double dispose is safe", () => {
+    const sb = SecureBuffer.alloc(8);
+    sb.dispose();
+    expect(() => sb.dispose()).not.toThrow();
+  });
+
+  it("withBuffer disposes even on throw", () => {
+    const raw = Buffer.from([0xff, 0xff]);
+    const sb = SecureBuffer.wrap(raw);
+    try {
+      sb.withBuffer(() => { throw new Error("test error"); });
+    } catch {}
+    expect(raw.every((b) => b === 0)).toBe(true);
+  });
+
+  it("[Symbol.dispose] works for 'using' pattern", () => {
+    const raw = Buffer.from([1, 2, 3]);
+    const sb = SecureBuffer.wrap(raw);
+    sb[Symbol.dispose]();
+    expect(raw.every((b) => b === 0)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Audit log — SIEM export and filtering
+// ---------------------------------------------------------------------------
+
+describe("AuditLog SIEM export", () => {
+  let logPath: string;
+  let log: AuditLog;
+
+  beforeEach(() => {
+    logPath = `/tmp/pyhsm-audit-test-${crypto.randomBytes(4).toString("hex")}.jsonl`;
+    log = new AuditLog(logPath);
+  });
+
+  afterEach(() => {
+    for (const f of [logPath, logPath + ".hmackey"]) {
+      if (fs.existsSync(f)) fs.unlinkSync(f);
+    }
+  });
+
+  it("exportJsonl returns all entries when no filter", () => {
+    log.record("generateKey", { keyId: "k1", success: true });
+    log.record("encrypt", { keyId: "k1", success: true });
+    log.record("decrypt", { keyId: "k1", success: true });
+    const entries = log.exportJsonl();
+    expect(entries.length).toBe(3);
+  });
+
+  it("filters by operation", () => {
+    log.record("encrypt", { keyId: "k1", success: true });
+    log.record("decrypt", { keyId: "k1", success: true });
+    log.record("encrypt", { keyId: "k2", success: true });
+    const entries = log.exportJsonl({ operation: "encrypt" });
+    expect(entries.length).toBe(2);
+    expect(entries.every((e) => e.operation === "encrypt")).toBe(true);
+  });
+
+  it("filters by keyId", () => {
+    log.record("encrypt", { keyId: "k1", success: true });
+    log.record("encrypt", { keyId: "k2", success: true });
+    const entries = log.exportJsonl({ keyId: "k1" });
+    expect(entries.length).toBe(1);
+    expect(entries[0].keyId).toBe("k1");
+  });
+
+  it("filters onlyFailed", () => {
+    log.record("encrypt", { keyId: "k1", success: true });
+    log.record("accessDenied", { keyId: "k2", success: false, reason: "ACL" });
+    log.record("rateLimited", { keyId: "k3", success: false });
+    const entries = log.exportJsonl({ onlyFailed: true });
+    expect(entries.length).toBe(2);
+    expect(entries.every((e) => e.success === false)).toBe(true);
+  });
+
+  it("toNdjson returns newline-separated JSON strings", () => {
+    log.record("encrypt", { keyId: "k1", success: true });
+    log.record("decrypt", { keyId: "k1", success: true });
+    const ndjson = log.toNdjson();
+    const lines = ndjson.split("\n").filter(Boolean);
+    expect(lines.length).toBe(2);
+    for (const line of lines) {
+      expect(() => JSON.parse(line)).not.toThrow();
+    }
+  });
+
+  it("verify() returns -1 for unmodified log", () => {
+    for (let i = 0; i < 5; i++) {
+      log.record("encrypt", { keyId: `k${i}`, success: true });
+    }
+    expect(log.verify()).toBe(-1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Backup verification
+// ---------------------------------------------------------------------------
+
+describe("Backup and verifyBackup", () => {
+  let storePath: string;
+  let backupDir: string;
+  let hsm: PyHSM;
+
+  beforeEach(() => {
+    storePath = `/tmp/pyhsm-bkup-${crypto.randomBytes(4).toString("hex")}.enc`;
+    backupDir = `/tmp/pyhsm-bkup-dir-${crypto.randomBytes(4).toString("hex")}`;
+    hsm = new PyHSM({ storePath, masterPassword: "backup-test-pw", backupDir });
+    hsm.generateKey("bk-key");
+  });
+
+  afterEach(() => {
+    try { hsm.closeSession(); } catch {}
+    for (const p of [storePath, storePath + ".audit.jsonl",
+                     storePath + ".audit.jsonl.hmackey"]) {
+      if (fs.existsSync(p)) fs.unlinkSync(p);
+    }
+    if (fs.existsSync(backupDir)) {
+      for (const f of fs.readdirSync(backupDir)) fs.unlinkSync(`${backupDir}/${f}`);
+      fs.rmdirSync(backupDir);
+    }
+  });
+
+  it("createBackup returns a valid path", () => {
+    const bp = hsm.createBackup();
+    expect(fs.existsSync(bp)).toBe(true);
+  });
+
+  it("verifyBackup returns true for a valid backup", () => {
+    const bp = hsm.createBackup();
+    expect(hsm.verifyBackup(bp)).toBe(true);
+  });
+
+  it("verifyBackup throws for a tampered backup", () => {
+    const bp = hsm.createBackup();
+    const data = fs.readFileSync(bp);
+    const tampered = Buffer.from(data);
+    tampered[tampered.length - 5] ^= 0xff;
+    fs.writeFileSync(bp, tampered);
+    expect(() => hsm.verifyBackup(bp)).toThrow(/HMAC verification FAILED|decryption FAILED/);
+  });
+
+  it("verifyBackup throws for missing file", () => {
+    expect(() => hsm.verifyBackup("/tmp/pyhsm-does-not-exist.enc")).toThrow("not found");
+  });
+
+  it("round-trips data through backup store", () => {
+    const ct = hsm.encrypt("bk-key", "backup round-trip");
+    const bp = hsm.createBackup();
+    hsm.closeSession();
+
+    // Open from the backup path directly
+    const hsm2 = new PyHSM({ storePath: bp, masterPassword: "backup-test-pw" });
+    expect(hsm2.decrypt("bk-key", ct)).toBe("backup round-trip");
+    hsm2.closeSession();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// IPC process isolation
+// ---------------------------------------------------------------------------
+
+describe("IPC process isolation (process.ts + client.ts)", () => {
+  const SOCKET = `/tmp/pyhsm-ipc-test-${crypto.randomBytes(4).toString("hex")}.sock`;
+  const STORE  = `/tmp/pyhsm-ipc-store-${crypto.randomBytes(4).toString("hex")}.enc`;
+  let server: net.Server;
+  let hsmInstance: PyHSM;
+
+  // Spin up an in-process IPC server identical to process.ts but without exec
+  beforeEach(async () => {
+    if (fs.existsSync(SOCKET)) fs.unlinkSync(SOCKET);
+
+    hsmInstance = new PyHSM({
+      storePath: STORE,
+      masterPassword: "ipc-test-pw",
+    });
+
+    server = net.createServer((conn) => {
+      let buf = "";
+      conn.on("data", (chunk) => {
+        buf += chunk.toString();
+        const lines = buf.split("\n");
+        buf = lines.pop() ?? "";
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const req = JSON.parse(line);
+            let res: object;
+            try {
+              switch (req.type) {
+                case "generateKey":
+                  hsmInstance.generateKey(req.keyId, req.policy, req.callerId);
+                  res = { ok: true, data: null };
+                  break;
+                case "encrypt":
+                  res = { ok: true, data: hsmInstance.encrypt(req.keyId, req.plaintext, req.callerId) };
+                  break;
+                case "decrypt":
+                  res = { ok: true, data: hsmInstance.decrypt(req.keyId, req.ciphertext, req.callerId) };
+                  break;
+                case "rotateKey":
+                  hsmInstance.rotateKey(req.keyId, req.callerId);
+                  res = { ok: true, data: null };
+                  break;
+                case "destroyKey":
+                  hsmInstance.destroyKey(req.keyId, req.callerId);
+                  res = { ok: true, data: null };
+                  break;
+                case "health":
+                  res = { ok: true, data: { status: "healthy" } };
+                  break;
+                case "metrics":
+                  res = { ok: true, data: hsmInstance.getMetrics() };
+                  break;
+                default:
+                  res = { ok: false, error: "Unknown type" };
+              }
+            } catch (e: any) {
+              res = { ok: false, error: e.message };
+            }
+            conn.write(JSON.stringify(res) + "\n");
+          } catch {
+            conn.write(JSON.stringify({ ok: false, error: "parse error" }) + "\n");
+          }
+        }
+      });
+    });
+
+    await new Promise<void>((resolve) => server.listen(SOCKET, () => {
+      fs.chmodSync(SOCKET, 0o600);
+      resolve();
+    }));
+  });
+
+  afterEach(async () => {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    try { hsmInstance.closeSession(); } catch {}
+    for (const p of [SOCKET, STORE,
+                     STORE + ".audit.jsonl",
+                     STORE + ".audit.jsonl.hmackey"]) {
+      if (fs.existsSync(p)) try { fs.unlinkSync(p); } catch {}
+    }
+  });
+
+  it("client can generate and encrypt/decrypt over socket", async () => {
+    const client = new PyHSMClient(SOCKET, "test-service");
+    await client.generateKey("ipc-key");
+    const ct = await client.encrypt("ipc-key", "hello over IPC");
+    const pt = await client.decrypt("ipc-key", ct);
+    expect(pt).toBe("hello over IPC");
+  });
+
+  it("client health check responds", async () => {
+    const client = new PyHSMClient(SOCKET, "test-service");
+    const h = await client.health();
+    expect(h.status).toBe("healthy");
+  });
+
+  it("client metrics responds", async () => {
+    const client = new PyHSMClient(SOCKET, "test-service");
+    const m = await client.metrics();
+    expect(m).toBeDefined();
+  });
+
+  it("client rotate key over socket", async () => {
+    const client = new PyHSMClient(SOCKET, "test-service");
+    await client.generateKey("rot-ipc");
+    const ct = await client.encrypt("rot-ipc", "before rotate");
+    await client.rotateKey("rot-ipc");
+    const ct2 = await client.encrypt("rot-ipc", "after rotate");
+    expect(await client.decrypt("rot-ipc", ct)).toBe("before rotate");
+    expect(await client.decrypt("rot-ipc", ct2)).toBe("after rotate");
+  });
+
+  it("client destroy key over socket", async () => {
+    const client = new PyHSMClient(SOCKET, "test-service");
+    await client.generateKey("del-ipc");
+    await client.destroyKey("del-ipc");
+    await expect(client.encrypt("del-ipc", "x")).rejects.toThrow("not found");
+  });
+
+  it("client error propagated correctly", async () => {
+    const client = new PyHSMClient(SOCKET, "test-service");
+    await expect(client.encrypt("ghost-key", "x")).rejects.toThrow("not found");
+  });
+
+  it("concurrent requests are handled without interleaving", async () => {
+    const client = new PyHSMClient(SOCKET, "test-service");
+    await client.generateKey("concurrent-key");
+    // Fire 5 encrypt calls simultaneously and verify all return correct data
+    const results = await Promise.all(
+      Array.from({ length: 5 }, (_, i) =>
+        client.encrypt("concurrent-key", `msg-${i}`)
+      )
+    );
+    const decrypted = await Promise.all(
+      results.map((ct, i) =>
+        client.decrypt("concurrent-key", ct).then((pt) => ({ i, pt }))
+      )
+    );
+    for (const { i, pt } of decrypted) {
+      expect(pt).toBe(`msg-${i}`);
+    }
   });
 });

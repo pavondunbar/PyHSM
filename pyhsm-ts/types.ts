@@ -63,7 +63,8 @@ export type AuditOperation =
   | "selfTestFail"
   | "rateLimited"
   | "accessDenied"
-  | "backup";
+  | "backup"
+  | "verifyBackup";
 
 export interface AuditEntry {
   timestamp: string;
@@ -99,6 +100,7 @@ export type IPCRequest =
   | { type: "rotateKey"; keyId: string; callerId: string }
   | { type: "metrics"; callerId: string }
   | { type: "backup"; callerId: string }
+  | { type: "verifyBackup"; backupPath: string; callerId: string }
   | { type: "health"; callerId: string };
 
 export type IPCResponse =

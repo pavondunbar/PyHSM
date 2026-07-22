@@ -7,6 +7,8 @@ export { RateLimiter } from "./rate-limiter.js";
 export { MetricsCollector } from "./metrics.js";
 export { runSelfTests, enableFipsIfRequested, isFipsEnabled } from "./self-test.js";
 export { splitMasterPassword, reconstructMasterPassword, splitSecret, reconstructSecret } from "./shamir.js";
+export { SecureBuffer, zeroBuffer } from "./secure-buffer.js";
+export { PyHSMClient } from "./client.js";
 export type { ShamirShare } from "./shamir.js";
 export type * from "./types.js";
 

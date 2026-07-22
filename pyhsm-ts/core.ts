@@ -26,6 +26,7 @@ import { RateLimiter } from "./rate-limiter.js";
 import { MetricsCollector } from "./metrics.js";
 import { runSelfTests } from "./self-test.js";
 import { reconstructMasterPassword, type ShamirShare } from "./shamir.js";
+import { SecureBuffer, zeroBuffer } from "./secure-buffer.js";
 
 const SALT_LEN = 16;
 const NONCE_LEN = 12;
@@ -43,10 +44,6 @@ function constantTimeEqual(a: string, b: string): boolean {
   const bufB = Buffer.from(b);
   if (bufA.length !== bufB.length) return false;
   return crypto.timingSafeEqual(bufA, bufB);
-}
-
-function zeroBuffer(buf: Buffer): void {
-  buf.fill(0);
 }
 
 export class PyHSM {
@@ -186,8 +183,10 @@ export class PyHSM {
     instance.audit.record("sessionOpen", { success: true });
     instance.updateKeyMetrics();
 
-    // If no pre-existing file, derive a fresh salt for future saves
-    if (!instance._cachedSalt) {
+    // For both new and existing keystores, ensure we have an Argon2id-derived
+    // key cached so the very first save() always uses Argon2id — never the
+    // PBKDF2 sync fallback that fires when _cachedDerivedKey is null.
+    if (!instance._cachedDerivedKey || !instance._cachedSalt) {
       instance._cachedSalt = crypto.randomBytes(SALT_LEN);
       instance._cachedDerivedKey = await instance.deriveKeyAsync(instance._cachedSalt);
     }
@@ -240,6 +239,9 @@ export class PyHSM {
   }
 
   private zeroize(): void {
+    // Overwrite keyData strings — V8 strings are immutable so we can only
+    // replace the reference, but SecureBuffer wraps the master password
+    // Buffer and fill(0)s it deterministically.
     for (const entry of Object.values(this.store.keys)) {
       for (const v of entry.versions) {
         v.keyData = "0".repeat(v.keyData.length);
@@ -276,18 +278,26 @@ export class PyHSM {
     return Buffer.from(raw);
   }
 
-  /** AES-KWP (RFC 5649) key wrapping — wraps key material for storage. */
+  /**
+   * AES-KWP (RFC 5649) key wrapping — wraps key material for storage.
+   *
+   * The RFC 5649 Alternative Initial Value (AIV) constant is the 4-byte
+   * big-endian value 0xa65959a6 (NOT four repetitions of 0xa6).
+   * Node.js's aes-256-wrap-pad cipher expects this 4-byte IV.
+   */
   private wrapKey(kek: Buffer, keyData: Buffer): Buffer {
-    // Node.js supports aes-256-wrap-pad but @types/node doesn't include it in CipherCCMTypes
     const algo: string = "aes-256-wrap-pad";
-    const cipher = crypto.createCipheriv(algo, kek, Buffer.alloc(4, 0xa6));
+    // RFC 5649 §3 AIV prefix: 0xa65959a6 in big-endian
+    const aiv = Buffer.from([0xa6, 0x59, 0x59, 0xa6]);
+    const cipher = crypto.createCipheriv(algo, kek, aiv);
     return Buffer.concat([cipher.update(keyData), cipher.final()]);
   }
 
-  /** AES-KWP unwrap. */
+  /** AES-KWP unwrap (RFC 5649). Uses the same AIV constant. */
   private unwrapKey(kek: Buffer, wrapped: Buffer): Buffer {
     const algo: string = "aes-256-wrap-pad";
-    const decipher = crypto.createDecipheriv(algo, kek, Buffer.alloc(4, 0xa6));
+    const aiv = Buffer.from([0xa6, 0x59, 0x59, 0xa6]);
+    const decipher = crypto.createDecipheriv(algo, kek, aiv);
     return Buffer.concat([decipher.update(wrapped), decipher.final()]);
   }
 
@@ -464,18 +474,23 @@ export class PyHSM {
 
   /** Wrap raw key material and return hex string for storage. */
   private wrapForStorage(rawKey: Buffer): string {
-    const kek = this.deriveKek();
-    const wrapped = this.wrapKey(kek, rawKey);
-    zeroBuffer(kek);
-    return wrapped.toString("hex");
+    const kekBuf = SecureBuffer.wrap(this.deriveKek());
+    try {
+      const wrapped = this.wrapKey(kekBuf.buf, rawKey);
+      return wrapped.toString("hex");
+    } finally {
+      kekBuf.dispose();
+    }
   }
 
   /** Unwrap stored key material, returning raw Buffer. Caller must zeroize. */
   private unwrapFromStorage(wrappedHex: string): Buffer {
-    const kek = this.deriveKek();
-    const raw = this.unwrapKey(kek, Buffer.from(wrappedHex, "hex"));
-    zeroBuffer(kek);
-    return raw;
+    const kekBuf = SecureBuffer.wrap(this.deriveKek());
+    try {
+      return this.unwrapKey(kekBuf.buf, Buffer.from(wrappedHex, "hex"));
+    } finally {
+      kekBuf.dispose();
+    }
   }
 
   // --- Key Operations ---
@@ -574,22 +589,26 @@ export class PyHSM {
       throw new Error(`PyHSM: key '${keyId}' current version is archived`);
     }
 
-    const aesKey = this.unwrapFromStorage(current.keyData);
+    const aesKeyBuf = SecureBuffer.wrap(this.unwrapFromStorage(current.keyData));
+    let result: string;
+    try {
+      const nonce = crypto.randomBytes(NONCE_LEN);
+      const sivCipher = siv(new Uint8Array(aesKeyBuf.buf), new Uint8Array(nonce));
+      const ct = sivCipher.encrypt(new TextEncoder().encode(plaintext));
 
-    const nonce = crypto.randomBytes(NONCE_LEN);
-    const sivCipher = siv(new Uint8Array(aesKey), new Uint8Array(nonce));
-    const ct = sivCipher.encrypt(new TextEncoder().encode(plaintext));
-    zeroBuffer(aesKey);
-
-    const versionBuf = Buffer.alloc(VERSION_PREFIX_LEN);
-    versionBuf.writeUInt32BE(current.version);
+      const versionBuf = Buffer.alloc(VERSION_PREFIX_LEN);
+      versionBuf.writeUInt32BE(current.version);
+      result = Buffer.concat([versionBuf, Buffer.from(nonce), Buffer.from(ct)]).toString("base64");
+    } finally {
+      aesKeyBuf.dispose();
+    }
 
     entry.operationCount++;
     this.metrics.recordOp("encrypt");
     this.audit.record("encrypt", { keyId, callerId, success: true });
     if (entry.operationCount % 10 === 0) this.save();
 
-    return Buffer.concat([versionBuf, Buffer.from(nonce), Buffer.from(ct)]).toString("base64");
+    return result;
   }
 
   /**
@@ -615,21 +634,24 @@ export class PyHSM {
       throw new Error(`PyHSM: key version ${version} not found for '${keyId}'`);
     }
 
-    const aesKey = this.unwrapFromStorage(vEntry.keyData);
-
-    const nonce = new Uint8Array(buf.subarray(VERSION_PREFIX_LEN, VERSION_PREFIX_LEN + NONCE_LEN));
-    const ct = new Uint8Array(buf.subarray(VERSION_PREFIX_LEN + NONCE_LEN));
-
-    const sivDecipher = siv(new Uint8Array(aesKey), nonce);
-    const plainBytes = sivDecipher.decrypt(ct);
-    zeroBuffer(aesKey);
+    const aesKeyBuf = SecureBuffer.wrap(this.unwrapFromStorage(vEntry.keyData));
+    let plainText: string;
+    try {
+      const nonce = new Uint8Array(buf.subarray(VERSION_PREFIX_LEN, VERSION_PREFIX_LEN + NONCE_LEN));
+      const ct = new Uint8Array(buf.subarray(VERSION_PREFIX_LEN + NONCE_LEN));
+      const sivDecipher = siv(new Uint8Array(aesKeyBuf.buf), nonce);
+      const plainBytes = sivDecipher.decrypt(ct);
+      plainText = new TextDecoder().decode(plainBytes);
+    } finally {
+      aesKeyBuf.dispose();
+    }
 
     entry.operationCount++;
     this.metrics.recordOp("decrypt");
     this.audit.record("decrypt", { keyId, callerId, success: true });
     if (entry.operationCount % 10 === 0) this.save();
 
-    return new TextDecoder().decode(plainBytes);
+    return plainText;
   }
 
   // --- Backup ---
@@ -648,6 +670,57 @@ export class PyHSM {
 
     this.audit.record("backup", { callerId, success: true });
     return backupPath;
+  }
+
+  /**
+   * Verify a backup file can be decrypted and has a valid HMAC.
+   * Does NOT load the backup into the live store.
+   * Returns true if the backup is intact, throws if tampered or unreadable.
+   */
+  verifyBackup(backupPath: string, callerId = "system"): boolean {
+    this.assertSession();
+
+    if (!fs.existsSync(backupPath)) {
+      throw new Error(`PyHSM: backup file not found: ${backupPath}`);
+    }
+
+    const raw = fs.readFileSync(backupPath);
+
+    if (raw.length < SALT_LEN + 32 + NONCE_LEN + TAG_LEN) {
+      throw new Error(`PyHSM: backup file too short — likely corrupted: ${backupPath}`);
+    }
+
+    const salt = raw.subarray(0, SALT_LEN);
+    const storedHmac = raw.subarray(SALT_LEN, SALT_LEN + 32);
+    const payload = raw.subarray(SALT_LEN + 32);
+    const key = this.deriveKey(Buffer.from(salt));
+
+    const expectedHmac = this.computeHmac(payload, key);
+    if (!crypto.timingSafeEqual(storedHmac, expectedHmac)) {
+      zeroBuffer(key);
+      this.audit.record("verifyBackup", { callerId, success: false });
+      throw new Error(`PyHSM: backup HMAC verification FAILED — file may be corrupted or tampered: ${backupPath}`);
+    }
+
+    // Attempt decryption to confirm the file is fully readable
+    const nonce = payload.subarray(0, NONCE_LEN);
+    const ct = payload.subarray(NONCE_LEN);
+    const tag = ct.subarray(ct.length - TAG_LEN);
+    const encrypted = ct.subarray(0, ct.length - TAG_LEN);
+
+    const decipher = crypto.createDecipheriv("aes-256-gcm", key, nonce);
+    decipher.setAuthTag(tag);
+    try {
+      Buffer.concat([decipher.update(encrypted), decipher.final()]);
+    } catch {
+      zeroBuffer(key);
+      this.audit.record("verifyBackup", { callerId, success: false });
+      throw new Error(`PyHSM: backup decryption FAILED — file may be corrupted: ${backupPath}`);
+    }
+
+    zeroBuffer(key);
+    this.audit.record("verifyBackup", { callerId, success: true });
+    return true;
   }
 
   // --- Expiry Enforcement ---
