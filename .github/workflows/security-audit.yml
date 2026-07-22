@@ -1,0 +1,108 @@
+# Security Audit Workflow
+#
+# Continuously monitors upstream dependencies for known vulnerabilities.
+# Supports PyHSM's 72-hour critical patch commitment by:
+#   1. Running daily scheduled scans (catches CVEs as they're published)
+#   2. Auditing every Dependabot PR before merge
+#   3. Auditing every push to main (catches manual dependency changes)
+#
+# If a critical vulnerability is detected, the workflow fails loudly —
+# triggering GitHub notifications to maintainers.
+
+name: Security Audit
+
+on:
+  schedule:
+    # Run daily at 06:00 UTC — catches overnight CVE publications
+    - cron: "0 6 * * *"
+  push:
+    branches: [main]
+    paths:
+      - "pyproject.toml"
+      - "pyhsm-ts/package.json"
+      - "pyhsm-ts/package-lock.json"
+  pull_request:
+    branches: [main]
+    paths:
+      - "pyproject.toml"
+      - "pyhsm-ts/package.json"
+      - "pyhsm-ts/package-lock.json"
+  workflow_dispatch: # Allow manual trigger
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Python dependency audit
+  # ---------------------------------------------------------------------------
+  python-audit:
+    name: Python Security Audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pip-audit
+
+      - name: Run pip-audit (check for known vulnerabilities)
+        run: pip-audit --requirement <(echo "cryptography>=43.0.0,<48.0.0") --strict --desc
+
+      - name: Install project and audit full dependency tree
+        run: |
+          pip install .
+          pip-audit --strict --desc
+
+  # ---------------------------------------------------------------------------
+  # TypeScript/Node.js dependency audit
+  # ---------------------------------------------------------------------------
+  typescript-audit:
+    name: TypeScript Security Audit
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: pyhsm-ts
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: pyhsm-ts/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run npm audit (production dependencies only)
+        run: npm audit --omit=dev
+
+      - name: Check for critical/high severity vulnerabilities
+        run: |
+          # Fail the build on critical or high severity issues
+          npm audit --omit=dev --audit-level=high
+
+  # ---------------------------------------------------------------------------
+  # Combined gate
+  # ---------------------------------------------------------------------------
+  security-gate:
+    name: Security Audit Passed
+    needs: [python-audit, typescript-audit]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Check audit results
+        run: |
+          if [ "${{ needs.python-audit.result }}" != "success" ] || \
+             [ "${{ needs.typescript-audit.result }}" != "success" ]; then
+            echo "::error::Security audit FAILED — review dependency vulnerabilities immediately."
+            echo "This may require action under PyHSM's 72-hour critical patch commitment."
+            exit 1
+          fi
+          echo "All security audits passed."

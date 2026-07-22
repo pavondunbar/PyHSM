@@ -18,6 +18,7 @@ export function validateKeyId(keyId: string): void {
 export interface KeyPolicy {
   allowEncrypt: boolean;
   allowDecrypt: boolean;
+  allowSign?: boolean;
   maxOperations?: number;
   expiresAt?: string; // ISO timestamp
   allowedCallers?: string[]; // caller IDs that can use this key
@@ -37,6 +38,7 @@ export interface KeyEntry {
   keyType: string;
   currentVersion: number;
   versions: KeyVersion[];
+  publicKeyPem?: string; // stored at generation time for asymmetric keys
   policy: KeyPolicy;
   operationCount: number;
   createdAt: string;
@@ -46,12 +48,15 @@ export interface KeyEntry {
 export interface KeystoreData {
   version: 3;
   keys: Record<string, KeyEntry>;
+  kekSalt?: string; // hex-encoded 16-byte salt for KEK derivation (PBKDF2→HKDF)
 }
 
 // --- Audit ---
 export type AuditOperation =
   | "encrypt"
   | "decrypt"
+  | "sign"
+  | "verify"
   | "generateKey"
   | "destroyKey"
   | "rotateKey"
@@ -82,6 +87,8 @@ export interface HSMMetrics {
   totalOperations: number;
   encryptOps: number;
   decryptOps: number;
+  signOps: number;
+  verifyOps: number;
   errors: number;
   rateLimitHits: number;
   accessDenials: number;

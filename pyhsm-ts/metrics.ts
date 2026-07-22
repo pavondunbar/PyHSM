@@ -11,6 +11,8 @@ export class MetricsCollector {
     totalOps: 0,
     encryptOps: 0,
     decryptOps: 0,
+    signOps: 0,
+    verifyOps: 0,
     errors: 0,
     rateLimitHits: 0,
     accessDenials: 0,
@@ -19,10 +21,12 @@ export class MetricsCollector {
   private activeKeys = 0;
   private archivedKeys = 0;
 
-  recordOp(type: "encrypt" | "decrypt"): void {
+  recordOp(type: "encrypt" | "decrypt" | "sign" | "verify"): void {
     this.counters.totalOps++;
     if (type === "encrypt") this.counters.encryptOps++;
-    else this.counters.decryptOps++;
+    else if (type === "decrypt") this.counters.decryptOps++;
+    else if (type === "sign") this.counters.signOps++;
+    else if (type === "verify") this.counters.verifyOps++;
     this.lastOpAt = new Date().toISOString();
   }
 
@@ -48,6 +52,8 @@ export class MetricsCollector {
       totalOperations: this.counters.totalOps,
       encryptOps: this.counters.encryptOps,
       decryptOps: this.counters.decryptOps,
+      signOps: this.counters.signOps,
+      verifyOps: this.counters.verifyOps,
       errors: this.counters.errors,
       rateLimitHits: this.counters.rateLimitHits,
       accessDenials: this.counters.accessDenials,
@@ -66,6 +72,8 @@ export class MetricsCollector {
       `# TYPE pyhsm_operations_total counter`,
       `pyhsm_operations_total{type="encrypt"} ${m.encryptOps}`,
       `pyhsm_operations_total{type="decrypt"} ${m.decryptOps}`,
+      `pyhsm_operations_total{type="sign"} ${m.signOps}`,
+      `pyhsm_operations_total{type="verify"} ${m.verifyOps}`,
       `# HELP pyhsm_errors_total Total HSM errors`,
       `# TYPE pyhsm_errors_total counter`,
       `pyhsm_errors_total ${m.errors}`,

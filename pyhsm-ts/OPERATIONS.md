@@ -62,7 +62,6 @@ cannot directly read key material in the HSM process's address space.
 |---------------------------|-----------|---------------------------------------------------|
 | `PYHSM_CALLER_SECRET`    | *(none)*  | Shared secret for IPC caller HMAC authentication. |
 | `PYHSM_AUDIT_HMAC_KEY`   | *(auto)*  | Hex-encoded 32-byte key for audit HMAC chain. Auto-generated and stored at `<audit_log_path>.hmackey` if not set. Independent of master password — audit verification survives master password rotation. |
-| `PYHSM_FIPS`             | `0`       | Set to `1` to enable FIPS mode (requires OpenSSL 3.x FIPS provider). |
 
 ### Tuning
 

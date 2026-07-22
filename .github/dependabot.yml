@@ -1,0 +1,49 @@
+# Dependabot configuration for automated dependency monitoring.
+# Supports PyHSM's security advisory and 72-hour patch commitment
+# by ensuring upstream vulnerabilities are surfaced immediately.
+
+version: 2
+
+updates:
+  # Python dependencies (cryptography is the critical one)
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "daily"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+      - "security"
+      - "python"
+    commit-message:
+      prefix: "deps(py)"
+    # Only monitor security updates for production deps
+    allow:
+      - dependency-type: "direct"
+
+  # TypeScript/Node.js dependencies (@noble/ciphers, argon2)
+  - package-ecosystem: "npm"
+    directory: "/pyhsm-ts"
+    schedule:
+      interval: "daily"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+      - "security"
+      - "typescript"
+    commit-message:
+      prefix: "deps(ts)"
+    allow:
+      - dependency-type: "direct"
+
+  # GitHub Actions — keep CI actions pinned and patched
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "ci"
+    commit-message:
+      prefix: "ci"

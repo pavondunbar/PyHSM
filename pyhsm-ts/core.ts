@@ -60,8 +60,18 @@ function constantTimeEqual(a: string, b: string): boolean {
   return equal && bufA.length === bufB.length;
 }
 
+/**
+ * Return the appropriate hash algorithm for the given EC key type.
+ * NIST recommendations: P-256 → SHA-256, P-384 → SHA-384, P-521 → SHA-512
+ */
+function ecHashForKeyType(keyType: string): string {
+  if (keyType === "ec-p384") return "sha384";
+  if (keyType === "ec-p521") return "sha512";
+  return "sha256"; // ec-p256 default
+}
+
 export class PyHSM {
-  private store: KeystoreData = { version: 3, keys: {} };
+  private store: KeystoreData = { version: 3, keys: {}, kekSalt: undefined };
   private storePath!: string;
   private backend!: StorageBackend;
   private masterPasswordBuf: Buffer = Buffer.alloc(0);
@@ -229,7 +239,7 @@ export class PyHSM {
         v.keyData = "0".repeat(v.keyData.length);
       }
     }
-    this.store = { version: 3, keys: {} };
+    this.store = { version: 3, keys: {}, kekSalt: undefined };
     zeroBuffer(this.masterPasswordBuf);
     if (this._cachedDerivedKey) { zeroBuffer(this._cachedDerivedKey); this._cachedDerivedKey = null; }
     if (this._cachedSalt) { zeroBuffer(this._cachedSalt); this._cachedSalt = null; }
@@ -295,8 +305,31 @@ export class PyHSM {
     return Buffer.concat([decipher.update(wrapped), decipher.final()]);
   }
 
-  /** Derive a wrapping key (KEK) from the master password for per-key wrapping. */
+  /** Derive a wrapping key (KEK) from the master password via PBKDF2→HKDF.
+   *
+   * Uses a dedicated KEK salt stored inside the encrypted keystore JSON.
+   * The KEK is derived through: PBKDF2(password, kekSalt) → HKDF-Expand("pyhsm-kek-v1")
+   *
+   * This ensures the KEK benefits from the same key-stretching as other subkeys,
+   * and cannot be derived without both the master password AND the salt
+   * (which is encrypted at rest).
+   *
+   * Falls back to legacy HMAC derivation for keystores created before this change
+   * (those lack a kekSalt field). Legacy keystores are migrated on first write.
+   */
   private deriveKek(): Buffer {
+    const kekSalt = this.store.kekSalt;
+    if (kekSalt) {
+      // New derivation: full PBKDF2 + HKDF path (matches Python layer)
+      const saltBuf = Buffer.from(kekSalt, "hex");
+      const master = this.deriveKey(saltBuf);
+      const kek = Buffer.from(
+        crypto.hkdfSync("sha256", master, Buffer.alloc(0), "pyhsm-kek-v1", 32)
+      );
+      zeroBuffer(master);
+      return kek;
+    }
+    // Legacy fallback for pre-existing keystores without kekSalt
     return crypto.createHmac("sha256", this.masterPasswordBuf).update("pyhsm-kek-v1").digest();
   }
 
@@ -305,7 +338,11 @@ export class PyHSM {
   }
 
   private load(): void {
-    if (!this.backend.exists()) return;
+    if (!this.backend.exists()) {
+      // New keystore — initialize kekSalt so all key wrapping uses PBKDF2→HKDF from the start
+      this.store.kekSalt = crypto.randomBytes(SALT_LEN).toString("hex");
+      return;
+    }
     const raw = this.backend.read();
 
     if (raw.length < SALT_LEN + 32 + NONCE_LEN + TAG_LEN) {
@@ -342,7 +379,7 @@ export class PyHSM {
 
     // Migrate from v2 format
     if (!parsed.version || parsed.version < 3) {
-      this.store = { version: 3, keys: {} };
+      this.store = { version: 3, keys: {}, kekSalt: undefined };
       const oldKeys = parsed.keys || parsed;
       for (const [id, entry] of Object.entries(oldKeys)) {
         const e = entry as Record<string, unknown>;
@@ -364,6 +401,52 @@ export class PyHSM {
     } else {
       this.store = parsed;
     }
+
+    // Migrate KEK derivation: if keystore lacks a kekSalt, generate one
+    // and re-wrap all key material from legacy HMAC KEK to PBKDF2→HKDF KEK
+    if (!this.store.kekSalt) {
+      this.migrateKek();
+    }
+  }
+
+  /**
+   * Migrate existing key material from legacy HMAC-based KEK to the new
+   * PBKDF2→HKDF KEK derivation path. Generates a kekSalt, unwraps all keys
+   * with the old KEK, and re-wraps with the new KEK.
+   */
+  private migrateKek(): void {
+    // Derive old (legacy) KEK via simple HMAC
+    const oldKek = crypto.createHmac("sha256", this.masterPasswordBuf)
+      .update("pyhsm-kek-v1").digest();
+
+    // Generate new KEK salt and derive new KEK via PBKDF2→HKDF
+    const newKekSalt = crypto.randomBytes(SALT_LEN);
+    this.store.kekSalt = newKekSalt.toString("hex");
+    const master = this.deriveKey(newKekSalt);
+    const newKek = Buffer.from(
+      crypto.hkdfSync("sha256", master, Buffer.alloc(0), "pyhsm-kek-v1", 32)
+    );
+    zeroBuffer(master);
+
+    try {
+      for (const entry of Object.values(this.store.keys)) {
+        for (const v of entry.versions) {
+          if (!v.keyData) continue;
+          const wrapped = Buffer.from(v.keyData, "hex");
+          // Unwrap with old KEK, re-wrap with new KEK
+          const raw = this.unwrapKey(oldKek, wrapped);
+          const rewrapped = this.wrapKey(newKek, raw);
+          zeroBuffer(raw);
+          v.keyData = rewrapped.toString("hex");
+        }
+      }
+    } finally {
+      zeroBuffer(oldKek);
+      zeroBuffer(newKek);
+    }
+
+    // Save immediately to persist the migration
+    this.save();
   }
 
   private save(): void {
@@ -420,7 +503,7 @@ export class PyHSM {
 
   // --- Policy Enforcement ---
 
-  private enforcePolicy(entry: KeyEntry, operation: "encrypt" | "decrypt", callerId: string): void {
+  private enforcePolicy(entry: KeyEntry, operation: "encrypt" | "decrypt" | "sign", callerId: string): void {
     if (!this.rateLimiter.allow(entry.keyId)) {
       this.metrics.recordRateLimit();
       this.audit.record("rateLimited", { keyId: entry.keyId, callerId, success: false });
@@ -444,6 +527,9 @@ export class PyHSM {
     }
     if (operation === "decrypt" && !entry.policy.allowDecrypt) {
       throw new Error(`PyHSM: key '${entry.keyId}' policy denies decrypt`);
+    }
+    if (operation === "sign" && entry.policy.allowSign === false) {
+      throw new Error(`PyHSM: key '${entry.keyId}' policy denies sign`);
     }
 
     if (entry.policy.maxOperations !== undefined && entry.operationCount >= entry.policy.maxOperations) {
@@ -489,18 +575,71 @@ export class PyHSM {
 
   // --- Key Operations ---
 
-  generateKey(keyId: string, policy?: Partial<KeyPolicy>, callerId = "system"): void {
+  generateKey(keyId: string, keyTypeOrPolicy?: string | Partial<KeyPolicy>, policyOrCallerId?: Partial<KeyPolicy> | string, callerIdArg?: string): void {
     this.assertSession();
     validateKeyId(keyId);
     if (this.store.keys[keyId]) throw new Error(`PyHSM: key '${keyId}' already exists`);
 
-    const rawKey = crypto.randomBytes(32);
-    const wrappedHex = this.wrapForStorage(rawKey);
-    zeroBuffer(rawKey);
+    // Resolve overloaded arguments:
+    //   generateKey(id, policy?, callerId?)          — original AES-only API
+    //   generateKey(id, keyType, policy?, callerId?) — new multi-type API
+    let keyType = "aes-256";
+    let policy: Partial<KeyPolicy> | undefined;
+    let callerId = "system";
+
+    if (typeof keyTypeOrPolicy === "string") {
+      // generateKey(id, keyType, policy?, callerId?)
+      keyType = keyTypeOrPolicy;
+      if (typeof policyOrCallerId === "object") {
+        policy = policyOrCallerId;
+        if (callerIdArg) callerId = callerIdArg;
+      } else if (typeof policyOrCallerId === "string") {
+        callerId = policyOrCallerId;
+      }
+    } else if (typeof keyTypeOrPolicy === "object") {
+      // generateKey(id, policy, callerId?)
+      policy = keyTypeOrPolicy;
+      if (typeof policyOrCallerId === "string") callerId = policyOrCallerId;
+    } else if (typeof keyTypeOrPolicy === "undefined") {
+      // generateKey(id) — defaults
+      if (typeof policyOrCallerId === "string") callerId = policyOrCallerId;
+    }
+
+    let wrappedHex: string;
+    let publicKeyPem: string | undefined;
+
+    if (keyType === "aes-256" || keyType === "aes-128") {
+      const keyLen = keyType === "aes-256" ? 32 : 16;
+      const rawKey = crypto.randomBytes(keyLen);
+      wrappedHex = this.wrapForStorage(rawKey);
+      zeroBuffer(rawKey);
+    } else if (keyType === "rsa-2048" || keyType === "rsa-4096") {
+      const modulusLength = keyType === "rsa-2048" ? 2048 : 4096;
+      const { privateKey, publicKey } = crypto.generateKeyPairSync("rsa", {
+        modulusLength,
+        publicExponent: 65537,
+        publicKeyEncoding: { type: "spki", format: "pem" },
+        privateKeyEncoding: { type: "pkcs8", format: "pem" },
+      });
+      wrappedHex = this.wrapForStorage(Buffer.from(privateKey as string, "utf8"));
+      publicKeyPem = publicKey as string;
+    } else if (keyType === "ec-p256" || keyType === "ec-p384" || keyType === "ec-p521") {
+      const namedCurve = keyType === "ec-p256" ? "P-256"
+        : keyType === "ec-p384" ? "P-384" : "P-521";
+      const { privateKey, publicKey } = crypto.generateKeyPairSync("ec", {
+        namedCurve,
+        publicKeyEncoding: { type: "spki", format: "pem" },
+        privateKeyEncoding: { type: "pkcs8", format: "pem" },
+      });
+      wrappedHex = this.wrapForStorage(Buffer.from(privateKey as string, "utf8"));
+      publicKeyPem = publicKey as string;
+    } else {
+      throw new Error(`PyHSM: unsupported key type '${keyType}'`);
+    }
 
     this.store.keys[keyId] = {
       keyId,
-      keyType: "aes-256",
+      keyType,
       currentVersion: 1,
       versions: [{
         version: 1,
@@ -508,6 +647,7 @@ export class PyHSM {
         createdAt: new Date().toISOString(),
         archived: false,
       }],
+      publicKeyPem,
       policy: { allowEncrypt: true, allowDecrypt: true, ...policy },
       operationCount: 0,
       createdAt: new Date().toISOString(),
@@ -615,15 +755,11 @@ export class PyHSM {
         createdAt: new Date().toISOString(),
         archived: false,
       }],
+      publicKeyPem: publicKeyPem ?? undefined,
       policy: { allowEncrypt: true, allowDecrypt: true, ...policy },
       operationCount: 0,
       createdAt: new Date().toISOString(),
     };
-
-    // Store public key PEM if asymmetric (for future use)
-    if (publicKeyPem) {
-      (this.store.keys[keyId] as unknown as Record<string, unknown>).publicKeyPem = publicKeyPem;
-    }
 
     this.audit.record("generateKey", { keyId, callerId, success: true });
     this.save();
@@ -717,6 +853,135 @@ export class PyHSM {
     this.save();
 
     return plainText;
+  }
+
+  // --- Sign / Verify ---
+
+  /**
+   * Sign a message using a stored RSA or EC key.
+   * Returns hex-encoded signature.
+   *
+   * RSA keys use RSA-PSS with SHA-256.
+   * EC keys use ECDSA with the NIST-recommended hash for the curve:
+   *   P-256 → SHA-256, P-384 → SHA-384, P-521 → SHA-512
+   */
+  sign(keyId: string, message: string | Buffer, callerId = "system"): string {
+    this.assertSession();
+    validateKeyId(keyId);
+    const entry = this.store.keys[keyId];
+    if (!entry) throw new Error(`PyHSM: key '${keyId}' not found`);
+
+    if (!entry.keyType.startsWith("rsa") && !entry.keyType.startsWith("ec")) {
+      throw new Error(`PyHSM: signing requires an RSA or EC key`);
+    }
+
+    this.enforcePolicy(entry, "sign", callerId);
+
+    const current = entry.versions.find((v) => v.version === entry.currentVersion);
+    if (!current) throw new Error(`PyHSM: no current version for key '${keyId}'`);
+
+    const data = typeof message === "string" ? Buffer.from(message, "utf8") : message;
+
+    // Unwrap private key PEM
+    const privateKeyPem = this.unwrapFromStorage(current.keyData);
+    let sig: Buffer;
+    try {
+      const privateKey = crypto.createPrivateKey({
+        key: privateKeyPem,
+        format: "pem",
+      });
+
+      if (entry.keyType.startsWith("rsa")) {
+        sig = crypto.sign("sha256", data, {
+          key: privateKey,
+          padding: crypto.constants.RSA_PKCS1_PSS_PADDING,
+          saltLength: crypto.constants.RSA_PSS_SALTLEN_MAX_SIGN,
+        });
+      } else {
+        // EC — select hash algorithm based on curve
+        const hashAlg = ecHashForKeyType(entry.keyType);
+        sig = crypto.sign(hashAlg, data, privateKey);
+      }
+    } finally {
+      zeroBuffer(privateKeyPem);
+    }
+
+    entry.operationCount++;
+    this.metrics.recordOp("sign");
+    this.audit.record("sign", { keyId, callerId, success: true });
+    this.save();
+
+    return sig.toString("hex");
+  }
+
+  /**
+   * Verify a signature using the stored PUBLIC key.
+   * Does NOT load the private key — only the public key PEM stored at generation time.
+   * Returns true if valid, false otherwise.
+   */
+  verify(keyId: string, message: string | Buffer, signatureHex: string, callerId = "system"): boolean {
+    this.assertSession();
+    validateKeyId(keyId);
+    const entry = this.store.keys[keyId];
+    if (!entry) throw new Error(`PyHSM: key '${keyId}' not found`);
+
+    if (!entry.keyType.startsWith("rsa") && !entry.keyType.startsWith("ec")) {
+      throw new Error(`PyHSM: verification requires an RSA or EC key`);
+    }
+
+    if (!entry.publicKeyPem) {
+      throw new Error(`PyHSM: key '${keyId}' has no public key`);
+    }
+
+    const data = typeof message === "string" ? Buffer.from(message, "utf8") : message;
+    const sig = Buffer.from(signatureHex, "hex");
+
+    const publicKey = crypto.createPublicKey({
+      key: entry.publicKeyPem,
+      format: "pem",
+    });
+
+    let valid: boolean;
+    try {
+      if (entry.keyType.startsWith("rsa")) {
+        valid = crypto.verify("sha256", data, {
+          key: publicKey,
+          padding: crypto.constants.RSA_PKCS1_PSS_PADDING,
+          saltLength: crypto.constants.RSA_PSS_SALTLEN_MAX_SIGN,
+        }, sig);
+      } else {
+        const hashAlg = ecHashForKeyType(entry.keyType);
+        valid = crypto.verify(hashAlg, data, publicKey, sig);
+      }
+    } catch {
+      valid = false;
+    }
+
+    entry.operationCount++;
+    this.metrics.recordOp("verify");
+    this.audit.record("verify", { keyId, callerId, success: valid });
+    this.save();
+
+    return valid;
+  }
+
+  /**
+   * Export the public key (PEM) for an asymmetric key.
+   * Never touches the private key.
+   */
+  getPublicKey(keyId: string): string {
+    this.assertSession();
+    validateKeyId(keyId);
+    const entry = this.store.keys[keyId];
+    if (!entry) throw new Error(`PyHSM: key '${keyId}' not found`);
+
+    if (entry.keyType.startsWith("aes")) {
+      throw new Error(`PyHSM: AES keys have no public component`);
+    }
+    if (!entry.publicKeyPem) {
+      throw new Error(`PyHSM: no public key stored for '${keyId}'`);
+    }
+    return entry.publicKeyPem;
   }
 
   // --- Backup ---

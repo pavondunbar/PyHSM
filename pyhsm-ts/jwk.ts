@@ -88,6 +88,7 @@ export function importJwk(jwk: JWK): {
       const crv = jwk.crv as string;
       if (crv === "P-256") keyType = "ec-p256";
       else if (crv === "P-384") keyType = "ec-p384";
+      else if (crv === "P-521") keyType = "ec-p521";
       else throw new Error(`Unsupported EC curve: ${crv}`);
     } else {
       // Determine RSA key size from modulus

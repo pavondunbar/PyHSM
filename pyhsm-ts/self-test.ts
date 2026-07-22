@@ -2,7 +2,7 @@
  * PyHSM Startup Self-Test (Known Answer Tests)
  *
  * Verifies crypto primitives produce expected outputs before accepting operations.
- * Required for FIPS 140-2 Level 1 compliance.
+ * These KATs run at startup before the HSM accepts any cryptographic requests.
  */
 import crypto from "node:crypto";
 
@@ -83,42 +83,11 @@ function testRng(): KATResult {
 }
 
 /**
- * Enable OpenSSL FIPS mode if available.
- * When PYHSM_FIPS=1, forces FIPS-validated primitives only.
- * Requires Node.js built with OpenSSL 3.x FIPS provider installed on the system.
- */
-export function enableFipsIfRequested(): boolean {
-  if (process.env.PYHSM_FIPS !== "1") return false;
-  try {
-    crypto.setFips(true);
-    return true;
-  } catch (e: any) {
-    throw new Error(
-      `PyHSM: FIPS mode requested but unavailable. ` +
-      `Ensure Node.js is linked against OpenSSL 3.x with the FIPS provider installed. ` +
-      `(${e.message})`
-    );
-  }
-}
-
-/** Check if FIPS mode is currently active. */
-export function isFipsEnabled(): boolean {
-  return crypto.getFips() === 1;
-}
-
-/**
  * Run all Known Answer Tests. Throws if any fail.
  * Must be called before the PyHSM accepts any operations.
  */
 export function runSelfTests(): KATResult[] {
-  // Attempt FIPS activation before running tests
-  const fipsActive = enableFipsIfRequested();
-
   const results = [testAesGcm(), testPbkdf2(), testHmac(), testRng()];
-
-  if (fipsActive) {
-    results.push({ test: "FIPS-mode", passed: true });
-  }
 
   const failures = results.filter((r) => !r.passed);
 

@@ -540,6 +540,146 @@ describe("Backup and verifyBackup", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Sign / Verify (RSA-PSS and ECDSA)
+// ---------------------------------------------------------------------------
+
+describe("Sign and Verify", () => {
+  let hsm: PyHSM;
+
+  beforeEach(() => {
+    cleanup();
+    hsm = new PyHSM(makeConfig());
+  });
+
+  afterEach(() => {
+    try { hsm.closeSession(); } catch {}
+    cleanup();
+  });
+
+  describe("EC P-256", () => {
+    it("generates EC P-256 key", () => {
+      hsm.generateKey("ec-key", "ec-p256");
+      expect(hsm.hasKey("ec-key")).toBe(true);
+    });
+
+    it("signs and verifies a message", () => {
+      hsm.generateKey("ec-key", "ec-p256");
+      const sig = hsm.sign("ec-key", "hello world");
+      expect(hsm.verify("ec-key", "hello world", sig)).toBe(true);
+    });
+
+    it("verify fails with wrong message", () => {
+      hsm.generateKey("ec-key", "ec-p256");
+      const sig = hsm.sign("ec-key", "correct");
+      expect(hsm.verify("ec-key", "wrong", sig)).toBe(false);
+    });
+
+    it("verify fails with tampered signature", () => {
+      hsm.generateKey("ec-key", "ec-p256");
+      const sig = hsm.sign("ec-key", "msg");
+      const tampered = sig.slice(0, -4) + "0000";
+      expect(hsm.verify("ec-key", "msg", tampered)).toBe(false);
+    });
+
+    it("exports public key PEM", () => {
+      hsm.generateKey("ec-key", "ec-p256");
+      const pem = hsm.getPublicKey("ec-key");
+      expect(pem).toContain("BEGIN PUBLIC KEY");
+    });
+  });
+
+  describe("EC P-384", () => {
+    it("signs and verifies with SHA-384", () => {
+      hsm.generateKey("ec384", "ec-p384");
+      const sig = hsm.sign("ec384", "test message");
+      expect(hsm.verify("ec384", "test message", sig)).toBe(true);
+      expect(hsm.verify("ec384", "wrong", sig)).toBe(false);
+    });
+  });
+
+  describe("EC P-521", () => {
+    it("signs and verifies with SHA-512", () => {
+      hsm.generateKey("ec521", "ec-p521");
+      const sig = hsm.sign("ec521", "test message");
+      expect(hsm.verify("ec521", "test message", sig)).toBe(true);
+      expect(hsm.verify("ec521", "wrong", sig)).toBe(false);
+    });
+  });
+
+  describe("RSA-2048", () => {
+    it("generates RSA-2048 key", () => {
+      hsm.generateKey("rsa-key", "rsa-2048");
+      expect(hsm.hasKey("rsa-key")).toBe(true);
+    });
+
+    it("signs and verifies with RSA-PSS", () => {
+      hsm.generateKey("rsa-key", "rsa-2048");
+      const sig = hsm.sign("rsa-key", "hello RSA");
+      expect(hsm.verify("rsa-key", "hello RSA", sig)).toBe(true);
+    });
+
+    it("verify fails with wrong message", () => {
+      hsm.generateKey("rsa-key", "rsa-2048");
+      const sig = hsm.sign("rsa-key", "correct");
+      expect(hsm.verify("rsa-key", "wrong", sig)).toBe(false);
+    });
+
+    it("exports public key PEM", () => {
+      hsm.generateKey("rsa-key", "rsa-2048");
+      const pem = hsm.getPublicKey("rsa-key");
+      expect(pem).toContain("BEGIN PUBLIC KEY");
+    });
+  });
+
+  describe("error cases", () => {
+    it("sign throws for AES key", () => {
+      hsm.generateKey("aes-key");
+      expect(() => hsm.sign("aes-key", "msg")).toThrow("RSA or EC");
+    });
+
+    it("verify throws for AES key", () => {
+      hsm.generateKey("aes-key");
+      expect(() => hsm.verify("aes-key", "msg", "00".repeat(32))).toThrow("RSA or EC");
+    });
+
+    it("getPublicKey throws for AES key", () => {
+      hsm.generateKey("aes-key");
+      expect(() => hsm.getPublicKey("aes-key")).toThrow("no public component");
+    });
+
+    it("sign throws for non-existent key", () => {
+      expect(() => hsm.sign("ghost", "msg")).toThrow("not found");
+    });
+
+    it("rejects unsupported key type", () => {
+      expect(() => hsm.generateKey("bad", "rsa-1024")).toThrow("unsupported key type");
+    });
+  });
+
+  describe("persistence", () => {
+    it("EC key persists across sessions", () => {
+      hsm.generateKey("ec-persist", "ec-p256");
+      const sig = hsm.sign("ec-persist", "persist test");
+      hsm.closeSession();
+
+      const hsm2 = new PyHSM(makeConfig());
+      expect(hsm2.verify("ec-persist", "persist test", sig)).toBe(true);
+      hsm2.closeSession();
+    });
+
+    it("RSA key persists across sessions", () => {
+      hsm.generateKey("rsa-persist", "rsa-2048");
+      const sig = hsm.sign("rsa-persist", "persist test");
+      hsm.closeSession();
+
+      const hsm2 = new PyHSM(makeConfig());
+      expect(hsm2.verify("rsa-persist", "persist test", sig)).toBe(true);
+      hsm2.closeSession();
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // IPC process isolation
 // ---------------------------------------------------------------------------
 

@@ -454,7 +454,6 @@ const m    = await client.metrics();
 | `PYHSM_SESSION_TIMEOUT_MS` | `300000` | Idle ms before auto-lock |
 | `PYHSM_RATE_LIMIT` | `100` | Max operations per key per window |
 | `PYHSM_RATE_WINDOW_MS` | `60000` | Rate limit window duration (ms) |
-| `PYHSM_FIPS` | `0` | Set `1` to enable FIPS mode (requires OpenSSL 3.x FIPS provider) |
 | `PYHSM_KEY_ID` | `pyhsm-master` | Default key ID for singleton helpers |
 
 ### TypeScript Architecture

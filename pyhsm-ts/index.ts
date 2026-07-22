@@ -5,7 +5,7 @@ export { PyHSM } from "./core.js";
 export { AuditLog } from "./audit.js";
 export { RateLimiter } from "./rate-limiter.js";
 export { MetricsCollector } from "./metrics.js";
-export { runSelfTests, enableFipsIfRequested, isFipsEnabled } from "./self-test.js";
+export { runSelfTests } from "./self-test.js";
 export { splitMasterPassword, reconstructMasterPassword, splitSecret, reconstructSecret } from "./shamir.js";
 export { SecureBuffer, zeroBuffer } from "./secure-buffer.js";
 export { PyHSMClient } from "./client.js";
