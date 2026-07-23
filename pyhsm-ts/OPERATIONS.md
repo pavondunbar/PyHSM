@@ -36,6 +36,9 @@ encrypted keystore envelope. The application process communicates over a Unix do
 socket (NDJSON protocol) via the `PyHSMClient`. A vulnerability in the application
 cannot directly read key material in the HSM process's address space.
 
+The IPC server enforces a 1 MB maximum message size per connection to prevent
+memory exhaustion from malicious or buggy clients.
+
 ---
 
 ## Environment Variables
@@ -75,7 +78,7 @@ cannot directly read key material in the HSM process's address space.
 
 | Variable                  | Default  | Description                               |
 |---------------------------|----------|-------------------------------------------|
-| `PYHSM_AUDIT_WEBHOOK`    | *(none)* | URL for fire-and-forget audit event POST. |
+| `PYHSM_AUDIT_WEBHOOK`    | *(none)* | URL for non-blocking audit event POST (shipped in a background thread/fire-and-forget). |
 
 ---
 
@@ -282,15 +285,17 @@ Available metrics:
 
 11. **Audit log independence**: The audit HMAC key is derived from the master password via HKDF-Expand (info: `pyhsm-audit-hmac-v1`) in the Python layer — no plaintext key file on disk. In the TypeScript layer, it is stored separately at `<log_path>.hmackey` (auto-generated on first use). Can be overridden via `PYHSM_AUDIT_HMAC_KEY` env var in both layers.
 
-12. **Concurrency (Python)**: Per-key operations (encrypt, decrypt, sign, verify) use sharded locks — operations on different keys execute in parallel. Only lifecycle operations (generate, rotate, destroy) acquire the global lock.
+12. **Concurrency (Python)**: Per-key operations (encrypt, decrypt, sign, verify) use sharded locks — operations on different keys execute in parallel. Only lifecycle operations (generate, rotate, destroy) acquire the global lock. The keystore persistence layer (`_save_store`) uses a dedicated save lock to serialize writes, preventing concurrent per-key operations from interleaving their serialize → encrypt → write sequences.
 
-13. **Flush-on-every-operation (TypeScript)**: The keystore is persisted after every encrypt/decrypt operation, ensuring operation counts and rate limiting state survive crashes without data loss.
+13. **Deferred persistence (TypeScript)**: Encrypt, decrypt, sign, and verify increment operation counts in memory and mark the store as dirty. The keystore is persisted on the next structural mutation (generate, rotate, destroy, import, backup) or on session close. This eliminates a full serialize+encrypt+write cycle on every read-path operation while ensuring operation counts and `maxOperations` policy enforcement survive process restarts. If the process crashes between operations, at most a few operation count increments may be lost — the keys themselves remain safely encrypted on disk from the last mutation.
 
 14. **Operation counting consistency**: All cryptographic operations (encrypt, decrypt, sign, verify) increment the per-key `operation_count` and persist state. The `max_operations` policy applies uniformly across all operation types.
 
 15. **Caller ACL enforcement (Python)**: Keys can define an `allowed_callers` list in their policy. When set, every operation must provide a `caller_id` that matches one of the allowed callers. Unauthorized access is denied, logged as an `accessDenied` audit entry with the caller identity, and raises an error. All operations record `caller_id` in the audit log when provided.
 
-16. **EC curve hash pairing (Python)**: ECDSA signing uses NIST-recommended hash algorithms per curve: P-256 → SHA-256, P-384 → SHA-384, P-521 → SHA-512. This ensures the hash security level matches the curve security level.
+16. **Rate limiter ordering (Python)**: Policy enforcement checks are ordered to prevent denial-of-service: caller ACL, operation permission, max operations, and expiry are all validated before the rate limiter consumes a token. This ensures unauthorized or policy-denied requests cannot exhaust the rate-limit window for legitimate callers.
+
+17. **EC curve hash pairing (Python)**: ECDSA signing uses NIST-recommended hash algorithms per curve: P-256 → SHA-256, P-384 → SHA-384, P-521 → SHA-512. This ensures the hash security level matches the curve security level.
 
 ---
 

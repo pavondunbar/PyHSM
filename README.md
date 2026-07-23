@@ -38,7 +38,7 @@ Most applications that need key management face a difficult choice: implement it
 - JWK (RFC 7517) key import/export for interoperability (supports P-256, P-384, P-521, RSA, AES)
 - EC P-256, P-384, and P-521 signing with NIST-recommended hash algorithms (SHA-256, SHA-384, SHA-512)
 - Fully typed Python API (PEP 561 `py.typed` marker included)
-- 147 tests across both layers
+- 165 tests across both layers
 
 ---
 
@@ -447,7 +447,7 @@ const m    = await client.metrics();
 | `PYHSM_KEYSTORE_PATH` | `./pyhsm-keystore.enc` | Encrypted keystore location |
 | `PYHSM_AUDIT_LOG_PATH` | `<storePath>.audit.jsonl` | HMAC-chained audit log path |
 | `PYHSM_AUDIT_HMAC_KEY` | *(auto-generated)* | Hex 32-byte audit HMAC key |
-| `PYHSM_AUDIT_WEBHOOK` | — | URL for fire-and-forget audit event POST |
+| `PYHSM_AUDIT_WEBHOOK` | — | URL for non-blocking audit event POST |
 | `PYHSM_BACKUP_DIR` | — | Directory for encrypted backups |
 | `PYHSM_SOCKET_PATH` | `/tmp/pyhsm.sock` | Unix domain socket path (IPC mode) |
 | `PYHSM_CALLER_SECRET` | — | Shared secret for IPC caller HMAC auth |
@@ -474,7 +474,7 @@ pyhsm-ts/
   process.ts          — IPC server (process isolation via Unix socket)
   client.ts           — IPC client with HMAC caller auth
   index.ts            — Public API exports and singleton factory
-  pyhsm.test.ts       — 63 tests (vitest)
+  pyhsm.test.ts       — 81 tests (vitest)
   OPERATIONS.md       — Full operator guide (env vars, deployment, procedures)
   package.json        — Pinned exact dependency versions
   tsconfig.json       — Strict TypeScript configuration
@@ -545,7 +545,7 @@ Intermediate share buffers are zeroized from memory after reconstruction in both
 | Constant-time comparisons | `hmac.compare_digest` (Python) / length-padded `timingSafeEqual` (TypeScript) |
 | Crypto primitive verification | Known-Answer Tests against RFC vectors at startup |
 | Session isolation | Auto-lock on inactivity; explicit `close_session()` / `closeSession()` |
-| Concurrency | Per-key sharded locks (Python) — parallel operations on different keys |
+| Concurrency | Per-key sharded locks (Python) — parallel operations on different keys; serialized save lock prevents write races |
 | Process memory isolation | Optional: IPC mode runs HSM in a separate process (TypeScript) |
 | M-of-N startup ceremony | Shamir split/reconstruct on master password |
 | Pluggable storage | `StorageBackend` interface — swap file I/O for database, S3, etc. |
@@ -571,7 +571,7 @@ python -m pytest tests/ -v
 ```bash
 cd pyhsm-ts
 npm test
-# 63 tests
+# 81 tests
 ```
 
 **CI** runs both suites on every push and pull request, across Python 3.11/3.12/3.13 and Node.js 20. See `.github/workflows/ci.yml`.
