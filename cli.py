@@ -18,11 +18,16 @@ from hsm.shamir import split_secret, reconstruct_secret, zeroize
 
 def get_hsm(args) -> PyHSM:
     password = args.password or getpass.getpass("Master password: ")
-    return PyHSM(
+    import os
+    is_new = not os.path.exists(args.store)
+    hsm = PyHSM(
         storage_path=args.store,
         master_password=password,
         session_timeout_s=0,  # CLI is short-lived; disable background timeout thread
     )
+    if is_new:
+        print(f"Created new keystore: {args.store}", file=sys.stderr)
+    return hsm
 
 
 # ---------------------------------------------------------------------------

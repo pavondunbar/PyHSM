@@ -1,3 +1,31 @@
+Metadata-Version: 2.4
+Name: vectorguard-pyhsm
+Version: 1.2.0
+Summary: Production-grade software Key Management Service (KMS) — key lifecycle, authenticated encryption, digital signing, and tamper-evident audit logging.
+Author: Pavon Dunbar
+License-Expression: MIT
+Project-URL: Homepage, https://github.com/pavondunbar/PyHSM
+Project-URL: Repository, https://github.com/pavondunbar/PyHSM
+Project-URL: Issues, https://github.com/pavondunbar/PyHSM/issues
+Keywords: hsm,kms,cryptography,key-management,encryption,signing,audit
+Classifier: Development Status :: 5 - Production/Stable
+Classifier: Intended Audience :: Developers
+Classifier: Operating System :: OS Independent
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Programming Language :: Python :: 3.13
+Classifier: Topic :: Security :: Cryptography
+Classifier: Topic :: Software Development :: Libraries
+Classifier: Typing :: Typed
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: cryptography<48.0.0,>=43.0.0
+Provides-Extra: dev
+Requires-Dist: pytest<9.0.0,>=8.0.0; extra == "dev"
+Dynamic: license-file
+
 # PyHSM
 
 A production-grade software Key Management Service (KMS) providing cryptographic key lifecycle management, authenticated encryption, digital signing, and tamper-evident audit logging.
@@ -88,14 +116,6 @@ Global flags (`--store`, `-p`) can appear **before or after** the subcommand —
 vectorguard-pyhsm --store keystore.enc -p "pw" generate my-key
 vectorguard-pyhsm --store keystore.enc generate my-key -p "pw"
 vectorguard-pyhsm generate my-key --store keystore.enc --password "pw"
-```
-
-If the keystore file does not yet exist, the CLI prints a notice to stderr so you can tell when you're accidentally pointing at the wrong path:
-
-```
-$ vectorguard-pyhsm --store /wrong/path.enc list -p "pw"
-Created new keystore: /wrong/path.enc
-No keys stored.
 ```
 
 ```bash
