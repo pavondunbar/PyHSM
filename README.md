@@ -79,56 +79,66 @@ pip install ".[dev]"
 
 ### CLI Usage
 
-All commands require `--store` (keystore path) and a master password. The password can be passed via `-p` or entered interactively at a prompt (recommended for production).
+All commands require `--store` (keystore path) and a master password. The password can be passed via `-p`/`--password` or entered interactively at a prompt (recommended for production).
+
+Global flags (`--store`, `-p`) can appear **before or after** the subcommand — put them wherever feels natural:
+
+```bash
+# These are all equivalent:
+vectorguard-pyhsm --store keystore.enc -p "pw" generate my-key
+vectorguard-pyhsm --store keystore.enc generate my-key -p "pw"
+vectorguard-pyhsm generate my-key --store keystore.enc --password "pw"
+```
 
 ```bash
 # Generate keys
-python cli.py --store keystore.enc generate my-aes-key --type aes-256
-python cli.py --store keystore.enc generate my-rsa-key --type rsa-2048
-python cli.py --store keystore.enc generate my-ec-key  --type ec-p256
-python cli.py --store keystore.enc generate my-ec384   --type ec-p384
-python cli.py --store keystore.enc generate my-ec521   --type ec-p521
+vectorguard-pyhsm --store keystore.enc generate my-aes-key --type aes-256 -p "pw"
+vectorguard-pyhsm --store keystore.enc generate my-rsa-key --type rsa-2048 -p "pw"
+vectorguard-pyhsm --store keystore.enc generate my-ec-key  --type ec-p256 -p "pw"
+vectorguard-pyhsm --store keystore.enc generate my-ec384   --type ec-p384 -p "pw"
+vectorguard-pyhsm --store keystore.enc generate my-ec521   --type ec-p521 -p "pw"
 
 # Generate a key with a policy
-python cli.py --store keystore.enc generate limited-key \
+vectorguard-pyhsm --store keystore.enc generate limited-key \
   --type aes-256 \
   --max-operations 500 \
   --expires-at 2027-01-01T00:00:00Z \
-  --no-decrypt   # encrypt-only key
+  --no-decrypt \
+  -p "pw"
 
 # List keys (shows type, current version, creation date)
-python cli.py --store keystore.enc list
+vectorguard-pyhsm --store keystore.enc list -p "pw"
 
 # Encrypt / Decrypt
-python cli.py --store keystore.enc encrypt my-aes-key -d "secret message"
-python cli.py --store keystore.enc decrypt my-aes-key -d <ciphertext-hex>
+vectorguard-pyhsm --store keystore.enc encrypt my-aes-key -d "secret message" -p "pw"
+vectorguard-pyhsm --store keystore.enc decrypt my-aes-key -d <ciphertext-hex> -p "pw"
 
 # Pipe via stdin
-echo "secret message" | python cli.py --store keystore.enc encrypt my-aes-key
+echo "secret message" | vectorguard-pyhsm --store keystore.enc encrypt my-aes-key -p "pw"
 
 # Sign / Verify (uses stored public key for verify — private key never exposed)
-python cli.py --store keystore.enc sign   my-ec-key -d "message to sign"
-python cli.py --store keystore.enc verify my-ec-key "message to sign" <sig-hex>
+vectorguard-pyhsm --store keystore.enc sign   my-ec-key -d "message to sign" -p "pw"
+vectorguard-pyhsm --store keystore.enc verify my-ec-key "message to sign" <sig-hex> -p "pw"
 
 # Export public key (PEM)
-python cli.py --store keystore.enc pubkey my-rsa-key
+vectorguard-pyhsm --store keystore.enc pubkey my-rsa-key -p "pw"
 
 # Rotate an AES key (archives current version, generates new one)
-python cli.py --store keystore.enc rotate my-aes-key
+vectorguard-pyhsm --store keystore.enc rotate my-aes-key -p "pw"
 
 # Destroy a key (zeroizes all versions, removes from store)
-python cli.py --store keystore.enc delete my-aes-key
+vectorguard-pyhsm --store keystore.enc delete my-aes-key -p "pw"
 
 # Metrics
-python cli.py --store keystore.enc metrics
-python cli.py --store keystore.enc metrics --prometheus
+vectorguard-pyhsm --store keystore.enc metrics -p "pw"
+vectorguard-pyhsm --store keystore.enc metrics --prometheus -p "pw"
 
 # Audit log
-python cli.py --store keystore.enc audit                       # dump all entries
-python cli.py --store keystore.enc audit --verify              # verify HMAC chain
-python cli.py --store keystore.enc audit --operation encrypt   # filter by operation
-python cli.py --store keystore.enc audit --key-id my-aes-key   # filter by key
-python cli.py --store keystore.enc audit --since 2025-01-01T00:00:00Z
+vectorguard-pyhsm --store keystore.enc audit -p "pw"                       # dump all entries
+vectorguard-pyhsm --store keystore.enc audit --verify -p "pw"              # verify HMAC chain
+vectorguard-pyhsm --store keystore.enc audit --operation encrypt -p "pw"   # filter by operation
+vectorguard-pyhsm --store keystore.enc audit --key-id my-aes-key -p "pw"   # filter by key
+vectorguard-pyhsm --store keystore.enc audit --since 2025-01-01T00:00:00Z -p "pw"
 ```
 
 ### Python Library Usage
@@ -490,10 +500,10 @@ Both layers implement Shamir secret sharing over GF(256) with the AES irreducibl
 
 ```bash
 # Split a hex secret into 5 shares, 3 required
-python cli.py split -k 3 -n 5 -s "deadbeefcafe..."
+vectorguard-pyhsm split -k 3 -n 5 -s "deadbeefcafe..."
 
 # Reconstruct from any 3
-python cli.py reconstruct \
+vectorguard-pyhsm reconstruct \
   --share '{"index":1,"data":"..."}' \
   --share '{"index":3,"data":"..."}' \
   --share '{"index":5,"data":"..."}'
