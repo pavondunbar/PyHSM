@@ -176,8 +176,14 @@ def main() -> None:
     parser.add_argument("--password", "-p", help="Master password (or use prompt)")
     sub = parser.add_subparsers(dest="command", required=True)
 
+    # Shared parent parser for global options — allows --store and -p
+    # to appear before OR after the subcommand.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--store", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    common.add_argument("--password", "-p", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+
     # generate
-    gen = sub.add_parser("generate", help="Generate a new key")
+    gen = sub.add_parser("generate", parents=[common], help="Generate a new key")
     gen.add_argument("key_id")
     gen.add_argument("--type", default="aes-256",
                      choices=["aes-128", "aes-256", "rsa-2048", "rsa-4096", "ec-p256", "ec-p384", "ec-p521"])
@@ -188,68 +194,68 @@ def main() -> None:
     gen.set_defaults(func=cmd_generate)
 
     # list
-    ls = sub.add_parser("list", help="List stored keys")
+    ls = sub.add_parser("list", parents=[common], help="List stored keys")
     ls.set_defaults(func=cmd_list)
 
     # rotate
-    rot = sub.add_parser("rotate", help="Rotate an AES key to a new version")
+    rot = sub.add_parser("rotate", parents=[common], help="Rotate an AES key to a new version")
     rot.add_argument("key_id")
     rot.set_defaults(func=cmd_rotate)
 
     # delete
-    rm = sub.add_parser("delete", help="Destroy a key")
+    rm = sub.add_parser("delete", parents=[common], help="Destroy a key")
     rm.add_argument("key_id")
     rm.set_defaults(func=cmd_delete)
 
     # encrypt
-    enc = sub.add_parser("encrypt", help="Encrypt data with an AES key")
+    enc = sub.add_parser("encrypt", parents=[common], help="Encrypt data with an AES key")
     enc.add_argument("key_id")
     enc.add_argument("--data", "-d", help="Data to encrypt (or pipe via stdin)")
     enc.set_defaults(func=cmd_encrypt)
 
     # decrypt
-    dec = sub.add_parser("decrypt", help="Decrypt data with an AES key")
+    dec = sub.add_parser("decrypt", parents=[common], help="Decrypt data with an AES key")
     dec.add_argument("key_id")
     dec.add_argument("--data", "-d", help="Hex ciphertext (or pipe via stdin)")
     dec.set_defaults(func=cmd_decrypt)
 
     # sign
-    sgn = sub.add_parser("sign", help="Sign data with an asymmetric key")
+    sgn = sub.add_parser("sign", parents=[common], help="Sign data with an asymmetric key")
     sgn.add_argument("key_id")
     sgn.add_argument("--data", "-d", help="Data to sign (or pipe via stdin)")
     sgn.set_defaults(func=cmd_sign)
 
     # verify
-    ver = sub.add_parser("verify", help="Verify a signature")
+    ver = sub.add_parser("verify", parents=[common], help="Verify a signature")
     ver.add_argument("key_id")
     ver.add_argument("message")
     ver.add_argument("signature")
     ver.set_defaults(func=cmd_verify)
 
     # pubkey
-    pub = sub.add_parser("pubkey", help="Export public key (PEM)")
+    pub = sub.add_parser("pubkey", parents=[common], help="Export public key (PEM)")
     pub.add_argument("key_id")
     pub.set_defaults(func=cmd_pubkey)
 
     # split
-    sp = sub.add_parser("split", help="Split a hex secret into Shamir shares")
+    sp = sub.add_parser("split", parents=[common], help="Split a hex secret into Shamir shares")
     sp.add_argument("--threshold", "-k", type=int, required=True)
     sp.add_argument("--shares", "-n", type=int, required=True)
     sp.add_argument("--secret", "-s", help="Hex-encoded secret (or pipe via stdin)")
     sp.set_defaults(func=cmd_split)
 
     # reconstruct
-    rc = sub.add_parser("reconstruct", help="Reconstruct a secret from Shamir shares")
+    rc = sub.add_parser("reconstruct", parents=[common], help="Reconstruct a secret from Shamir shares")
     rc.add_argument("--share", action="append", help="JSON share (repeat or pipe via stdin)")
     rc.set_defaults(func=cmd_reconstruct)
 
     # metrics
-    met = sub.add_parser("metrics", help="Show operational metrics")
+    met = sub.add_parser("metrics", parents=[common], help="Show operational metrics")
     met.add_argument("--prometheus", action="store_true", help="Output in Prometheus format")
     met.set_defaults(func=cmd_metrics)
 
     # audit
-    aud = sub.add_parser("audit", help="Inspect or verify the audit log")
+    aud = sub.add_parser("audit", parents=[common], help="Inspect or verify the audit log")
     aud.add_argument("--verify", action="store_true", help="Verify HMAC chain integrity")
     aud.add_argument("--operation", help="Filter by operation type")
     aud.add_argument("--key-id", help="Filter by key ID")

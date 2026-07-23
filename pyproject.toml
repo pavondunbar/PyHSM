@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vectorguard-pyhsm"
-version = "1.0.0"
+version = "1.1.0"
 description = "Production-grade software Key Management Service (KMS) — key lifecycle, authenticated encryption, digital signing, and tamper-evident audit logging."
 readme = "README.md"
 license = "MIT"
