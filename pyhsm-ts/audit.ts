@@ -56,7 +56,10 @@ export class AuditLog {
   }
 
   private computeHmac(entry: Omit<AuditEntry, "hmac">): string {
-    const payload = JSON.stringify(entry) + this.lastHmac;
+    // Use sorted keys for deterministic serialization — matches the Python
+    // layer's sort_keys=True and prevents subtle breakage if optional fields
+    // are added in different insertion orders in the future.
+    const payload = JSON.stringify(entry, Object.keys(entry).sort()) + this.lastHmac;
     return crypto.createHmac("sha256", this.hmacKey).update(payload).digest("hex");
   }
 
@@ -103,7 +106,7 @@ export class AuditLog {
       const entry: AuditEntry = JSON.parse(line);
       const { hmac, ...rest } = entry;
       const expected = crypto.createHmac("sha256", this.hmacKey)
-        .update(JSON.stringify(rest) + prevHmac)
+        .update(JSON.stringify(rest, Object.keys(rest).sort()) + prevHmac)
         .digest("hex");
       if (hmac !== expected) return entry.sequence;
       prevHmac = hmac;

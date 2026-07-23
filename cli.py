@@ -260,6 +260,12 @@ def main() -> None:
     args = parser.parse_args()
     try:
         args.func(args)
+    except KeyboardInterrupt:
+        print("\nAborted.", file=sys.stderr)
+        sys.exit(130)
+    except BrokenPipeError:
+        # Silently handle broken pipe (e.g. piping to head)
+        sys.exit(0)
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)

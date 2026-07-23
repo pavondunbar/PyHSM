@@ -231,6 +231,9 @@ export class PyHSM {
   closeSession(): void {
     if (!this.sessionActive) return;
     this.audit.record("sessionClose", { success: true });
+    // IMPORTANT: save() MUST precede zeroize(). save() needs masterPasswordBuf
+    // to derive encryption keys. Reordering these calls will silently corrupt
+    // the keystore (encrypting with a zeroed key).
     this.save();
     this.zeroize();
     this.sessionActive = false;
