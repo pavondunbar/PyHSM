@@ -31,6 +31,7 @@ import hashlib
 import hmac as _hmac
 import json
 import os
+import threading
 from typing import Optional
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -144,6 +145,7 @@ class KeyStore:
         self.path = path or getattr(self._backend, "path", "<custom-backend>")
 
         self._master_password: bytearray = bytearray(master_password.encode("utf-8"))
+        self._save_lock = threading.Lock()  # serializes _save_store calls from concurrent per-key ops
         self._needs_kek_migration = False
         self._keys: dict = self._load_store()
 
@@ -356,20 +358,28 @@ class KeyStore:
         return keys
 
     def _save_store(self) -> None:
-        salt = os.urandom(_SALT_LEN)
-        enc_key, mac_key = self._derive_subkeys(salt)
-        nonce = os.urandom(_NONCE_LEN)
+        """Serialize and persist the keystore. Thread-safe via _save_lock.
 
-        # Serialize: convert bytearray key_data to hex strings for JSON
-        serializable = _externalize_key_data(self._keys)
-        ct = AESGCM(bytes(enc_key)).encrypt(nonce, json.dumps(serializable).encode("utf-8"), None)
-        payload = nonce + ct
-        mac = _hmac.new(bytes(mac_key), payload, hashlib.sha256).digest()
-        zeroize_bytearray(enc_key)
-        zeroize_bytearray(mac_key)
+        Multiple per-key operations may call update_key concurrently (each
+        holding only their per-key lock). This lock ensures the serialize →
+        encrypt → write sequence is atomic, preventing one write from
+        clobbering another's in-memory state changes.
+        """
+        with self._save_lock:
+            salt = os.urandom(_SALT_LEN)
+            enc_key, mac_key = self._derive_subkeys(salt)
+            nonce = os.urandom(_NONCE_LEN)
 
-        file_data = salt + mac + payload
-        self._backend.write(file_data)
+            # Serialize: convert bytearray key_data to hex strings for JSON
+            serializable = _externalize_key_data(self._keys)
+            ct = AESGCM(bytes(enc_key)).encrypt(nonce, json.dumps(serializable).encode("utf-8"), None)
+            payload = nonce + ct
+            mac = _hmac.new(bytes(mac_key), payload, hashlib.sha256).digest()
+            zeroize_bytearray(enc_key)
+            zeroize_bytearray(mac_key)
+
+            file_data = salt + mac + payload
+            self._backend.write(file_data)
 
     # ------------------------------------------------------------------
     # Key CRUD

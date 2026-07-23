@@ -12,6 +12,7 @@ import hashlib
 import hmac as _hmac
 import json
 import os
+import threading
 import urllib.request
 from datetime import datetime, timezone
 from typing import Optional
@@ -209,7 +210,20 @@ class AuditLog:
         return results
 
     def _ship_to_webhook(self, entry: dict) -> None:
-        """Best-effort HTTP POST of a single audit entry."""
+        """Best-effort, non-blocking HTTP POST of a single audit entry.
+
+        Dispatched in a daemon thread so that webhook latency or failures
+        never block HSM operations. If the webhook is unreachable, the
+        entry is silently dropped (it's already persisted to the local log).
+        """
+        threading.Thread(
+            target=self._do_ship_to_webhook,
+            args=(entry,),
+            daemon=True,
+        ).start()
+
+    def _do_ship_to_webhook(self, entry: dict) -> None:
+        """Actual HTTP POST — runs in a background thread."""
         try:
             data = json.dumps(entry).encode()
             req = urllib.request.Request(
@@ -218,7 +232,6 @@ class AuditLog:
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
-            # Short timeout; failure is silently ignored
             urllib.request.urlopen(req, timeout=5)
         except Exception:
             pass

@@ -84,6 +84,13 @@ export class PyHSM {
   private _cachedDerivedKey: Buffer | null = null;
   private _cachedSalt: Buffer | null = null;
 
+  // Dirty flag: true when operationCount changes need to be flushed.
+  // encrypt/decrypt/sign/verify increment operationCount in memory and set
+  // this flag. The next structural mutation (rotate, destroy, close) or
+  // explicit flushDirty() will persist them. This eliminates a full
+  // serialize+encrypt+write cycle on every read-path operation.
+  private _dirty = false;
+
   // Sub-modules
   private audit!: AuditLog;
   private rateLimiter!: RateLimiter;
@@ -228,6 +235,26 @@ export class PyHSM {
     this.zeroize();
     this.sessionActive = false;
     if (this.sessionTimer) { clearTimeout(this.sessionTimer); this.sessionTimer = null; }
+  }
+
+  /**
+   * Mark the in-memory store as dirty (operation counts changed).
+   * The actual save is deferred until the next mutation or session close.
+   */
+  private markDirty(): void {
+    this._dirty = true;
+  }
+
+  /**
+   * Flush pending operation-count changes to disk if dirty.
+   * Called before mutations (generate, rotate, destroy) and on close
+   * so that operation counts are never lost.
+   */
+  private flushIfDirty(): void {
+    if (this._dirty) {
+      this.save();
+      this._dirty = false;
+    }
   }
 
   private zeroize(): void {
@@ -473,6 +500,7 @@ export class PyHSM {
 
     const fileData = Buffer.concat([salt, hmac, payload]);
     this.backend.write(fileData);
+    this._dirty = false;
   }
 
   private handleTamper(reason: string): void {
@@ -577,6 +605,7 @@ export class PyHSM {
 
   generateKey(keyId: string, keyTypeOrPolicy?: string | Partial<KeyPolicy>, policyOrCallerId?: Partial<KeyPolicy> | string, callerIdArg?: string): void {
     this.assertSession();
+    this.flushIfDirty();
     validateKeyId(keyId);
     if (this.store.keys[keyId]) throw new Error(`PyHSM: key '${keyId}' already exists`);
 
@@ -660,6 +689,7 @@ export class PyHSM {
 
   rotateKey(keyId: string, callerId = "system"): void {
     this.assertSession();
+    this.flushIfDirty();
     validateKeyId(keyId);
     const entry = this.store.keys[keyId];
     if (!entry) throw new Error(`PyHSM: key '${keyId}' not found`);
@@ -687,6 +717,7 @@ export class PyHSM {
 
   destroyKey(keyId: string, callerId = "system"): void {
     this.assertSession();
+    this.flushIfDirty();
     validateKeyId(keyId);
     const entry = this.store.keys[keyId];
     if (!entry) throw new Error(`PyHSM: key '${keyId}' not found`);
@@ -737,6 +768,7 @@ export class PyHSM {
    */
   importKeyJwk(keyId: string, jwk: JWK, policy?: Partial<KeyPolicy>, callerId = "system"): void {
     this.assertSession();
+    this.flushIfDirty();
     validateKeyId(keyId);
     if (this.store.keys[keyId]) throw new Error(`PyHSM: key '${keyId}' already exists`);
 
@@ -807,7 +839,7 @@ export class PyHSM {
     entry.operationCount++;
     this.metrics.recordOp("encrypt");
     this.audit.record("encrypt", { keyId, callerId, success: true });
-    this.save();
+    this.markDirty();
 
     return result;
   }
@@ -850,7 +882,7 @@ export class PyHSM {
     entry.operationCount++;
     this.metrics.recordOp("decrypt");
     this.audit.record("decrypt", { keyId, callerId, success: true });
-    this.save();
+    this.markDirty();
 
     return plainText;
   }
@@ -909,7 +941,7 @@ export class PyHSM {
     entry.operationCount++;
     this.metrics.recordOp("sign");
     this.audit.record("sign", { keyId, callerId, success: true });
-    this.save();
+    this.markDirty();
 
     return sig.toString("hex");
   }
@@ -960,7 +992,7 @@ export class PyHSM {
     entry.operationCount++;
     this.metrics.recordOp("verify");
     this.audit.record("verify", { keyId, callerId, success: valid });
-    this.save();
+    this.markDirty();
 
     return valid;
   }
@@ -988,6 +1020,7 @@ export class PyHSM {
 
   createBackup(callerId = "system"): string {
     this.assertSession();
+    this.flushIfDirty();
     const dir = this.backupDir;
     if (!dir) throw new Error("PyHSM: PYHSM_BACKUP_DIR not configured");
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
