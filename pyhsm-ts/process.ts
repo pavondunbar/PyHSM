@@ -17,6 +17,10 @@ import type { IPCRequest, IPCResponse, PyHSMConfig } from "./types.js";
 const SOCKET_PATH = process.env.PYHSM_SOCKET_PATH || "/tmp/pyhsm.sock";
 const CALLER_SECRET = process.env.PYHSM_CALLER_SECRET || null;
 
+// Maximum IPC message size (1 MB) — prevents memory exhaustion from malicious
+// or buggy clients sending unbounded payloads to the trusted HSM process.
+const MAX_IPC_MESSAGE_SIZE = 1 * 1024 * 1024;
+
 function createHSM(): PyHSM {
   const config: PyHSMConfig = {
     storePath: process.env.PYHSM_KEYSTORE_PATH || "./pyhsm-keystore.enc",
@@ -79,6 +83,14 @@ function startServer(): void {
 
     conn.on("data", (chunk) => {
       buffer += chunk.toString();
+
+      // Guard against memory exhaustion from oversized messages
+      if (buffer.length > MAX_IPC_MESSAGE_SIZE) {
+        conn.write(JSON.stringify({ ok: false, error: "Message too large" }) + "\n");
+        conn.destroy();
+        return;
+      }
+
       // Messages are newline-delimited JSON
       const lines = buffer.split("\n");
       buffer = lines.pop() || "";

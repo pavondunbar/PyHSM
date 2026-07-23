@@ -249,16 +249,18 @@ class PyHSM:
     # ------------------------------------------------------------------
 
     def _enforce_policy(self, entry: dict, operation: str, caller_id: Optional[str] = None) -> None:
-        """Check per-key policy; raise ValueError if any constraint is violated."""
+        """Check per-key policy; raise ValueError if any constraint is violated.
+
+        Order of checks is deliberate: ACL and policy checks (which have no
+        side effects) run first. The rate limiter — which consumes a token —
+        runs last so that rejected requests (unauthorized caller, denied
+        operation, expired key) do not burn rate-limit tokens and cannot be
+        used to DOS legitimate callers.
+        """
         policy = entry.get("policy", {})
         key_id = entry.get("key_id", "?")
 
-        if not self._rate_limiter.allow(key_id):
-            self._metrics.record_rate_limit()
-            self._audit.record("rateLimited", key_id=key_id, caller_id=caller_id, success=False)
-            raise ValueError(f"PyHSM: key '{key_id}' is rate-limited")
-
-        # Check caller ACL if policy defines allowed_callers
+        # 1. Caller ACL (no side effects)
         allowed_callers = policy.get("allowed_callers")
         if allowed_callers and caller_id not in allowed_callers:
             self._audit.record("accessDenied", key_id=key_id, caller_id=caller_id, success=False,
@@ -267,6 +269,7 @@ class PyHSM:
                 f"PyHSM: caller '{caller_id}' is not authorized for key '{key_id}'"
             )
 
+        # 2. Operation permission (no side effects)
         if operation == "encrypt" and not policy.get("allow_encrypt", True):
             raise ValueError(f"PyHSM: key '{key_id}' policy denies encrypt")
         if operation == "decrypt" and not policy.get("allow_decrypt", True):
@@ -274,15 +277,25 @@ class PyHSM:
         if operation == "sign" and not policy.get("allow_sign", True):
             raise ValueError(f"PyHSM: key '{key_id}' policy denies sign")
 
+        # 3. Max operations (no side effects)
         max_ops = policy.get("max_operations")
         if max_ops is not None and entry.get("operation_count", 0) >= max_ops:
             raise ValueError(f"PyHSM: key '{key_id}' exceeded max operations ({max_ops})")
 
+        # 4. Expiry (no side effects)
         expires_at = policy.get("expires_at")
         if expires_at:
             exp = datetime.fromisoformat(expires_at)
             if datetime.now(timezone.utc) > exp:
                 raise ValueError(f"PyHSM: key '{key_id}' has expired")
+
+        # 5. Rate limiter LAST — consumes a token only when the request is
+        #    otherwise valid. Prevents unauthorized callers from exhausting
+        #    the rate-limit window for legitimate users.
+        if not self._rate_limiter.allow(key_id):
+            self._metrics.record_rate_limit()
+            self._audit.record("rateLimited", key_id=key_id, caller_id=caller_id, success=False)
+            raise ValueError(f"PyHSM: key '{key_id}' is rate-limited")
 
     # ------------------------------------------------------------------
     # Key generation

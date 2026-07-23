@@ -171,7 +171,7 @@ def cmd_audit(args) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(prog="pyhsm", description="PyHSM CLI")
+    parser = argparse.ArgumentParser(prog="vectorguard-pyhsm", description="PyHSM CLI")
     parser.add_argument("--store", default="keystore.enc", help="Keystore file path")
     parser.add_argument("--password", "-p", help="Master password (or use prompt)")
     sub = parser.add_subparsers(dest="command", required=True)

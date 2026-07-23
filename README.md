@@ -68,7 +68,7 @@ Most applications that need key management face a difficult choice: implement it
 
 ```bash
 # Install from PyPI
-pip install pyhsm
+pip install vectorguard-pyhsm
 
 # Or install from source (with pyproject.toml)
 pip install .
