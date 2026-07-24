@@ -44,8 +44,95 @@ Most applications that need key management face a difficult choice: implement it
 
 ---
 
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Your Application                                                        │
+│                                                                          │
+│  hsm.sign("eth-wallet", tx_hash)                                         │
+│  hsm.encrypt("app-key", data)                                            │
+│                                                                          │
+│  ► Raw key material is NEVER returned to this layer                      │
+└──────────────────────────────────┬───────────────────────────────────────┘
+                                   │ API call (or IPC via Unix socket)
+                                   ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  PyHSM Core                                                              │
+│                                                                          │
+│  ┌─────────────┐ ┌──────────────┐ ┌────────────┐ ┌──────────────────┐   │
+│  │ Key Unwrap  │ │ Policy Check │ │ Crypto Op  │ │ Audit + Metrics  │   │
+│  │ (AES-KWP)  │→│ ACL, Rate,   │→│ Sign/Enc/  │→│ HMAC-chained log │   │
+│  │             │ │ Expiry, Ops  │ │ Dec/Verify │ │                  │   │
+│  └─────────────┘ └──────────────┘ └────────────┘ └──────────────────┘   │
+│                                          │                               │
+│                                    Key zeroized                           │
+│                                    from memory                            │
+└──────────────────────────────────────┬───────────────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Persistent Storage                                                      │
+│                                                                          │
+│  keystore.enc                          keystore.enc.audit.jsonl           │
+│  ┌───────────────────────────────┐     ┌──────────────────────────────┐  │
+│  │ AES-256-GCM Outer Envelope    │     │ HMAC-chained append-only log │  │
+│  │ + HMAC-SHA256 Tamper Seal     │     │ (tamper-evident)             │  │
+│  │  ┌─────────────────────────┐  │     └──────────────────────────────┘  │
+│  │  │ AES-KWP Per-Key Wrapping│  │                                       │
+│  │  │  • eth-wallet (secp256k1)│  │                                       │
+│  │  │  • sol-wallet (ed25519) │  │                                       │
+│  │  │  • app-key (aes-256)    │  │                                       │
+│  │  └─────────────────────────┘  │                                       │
+│  └───────────────────────────────┘                                       │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Performance
+
+Benchmarks measured on Python 3.13, macOS (Apple Silicon). Each operation includes
+the full security pipeline: key unwrapping, policy enforcement, cryptographic
+operation, audit logging, and keystore persistence.
+
+| Operation | Ops/sec | Avg Latency | p50 | p99 |
+|---|---|---|---|---|
+| AES-256 encrypt | ~10 | 103 ms | 103 ms | 110 ms |
+| AES-256 decrypt | ~10 | 104 ms | 104 ms | 105 ms |
+| RSA-2048 sign | ~6 | 158 ms | 158 ms | 158 ms |
+| RSA-2048 verify | ~10 | 104 ms | 104 ms | 104 ms |
+| EC P-256 sign | ~10 | 104 ms | 104 ms | 105 ms |
+| EC P-256 verify | ~10 | 104 ms | 104 ms | 105 ms |
+| secp256k1 sign | ~9 | 105 ms | 105 ms | 106 ms |
+| secp256k1 verify | ~10 | 105 ms | 105 ms | 135 ms |
+| Ed25519 sign | ~10 | 104 ms | 105 ms | 106 ms |
+| Ed25519 verify | ~9 | 106 ms | 104 ms | 165 ms |
+| Key generate (AES-256) | ~10 | 104 ms | 104 ms | 107 ms |
+| Key generate (secp256k1) | ~10 | 105 ms | 105 ms | 105 ms |
+| Key generate (Ed25519) | ~10 | 104 ms | 104 ms | 105 ms |
+| Key rotate (AES-256) | ~10 | 104 ms | 104 ms | 105 ms |
+
+**Where the time goes:** ~103 ms is keystore persistence (encrypt + HMAC + atomic write).
+The actual cryptographic operation is sub-millisecond for symmetric and EC operations.
+RSA-2048 signing adds ~54 ms of computation on top of persistence.
+
+**For higher throughput:** The TypeScript layer uses deferred persistence — operation
+counts are flushed on the next structural mutation or session close, giving significantly
+higher ops/sec for encrypt/decrypt/sign/verify workloads.
+
+Run the benchmarks yourself:
+
+```bash
+python benchmarks/bench.py
+```
+
+---
+
 ## Table of Contents
 
+- [Architecture](#architecture)
+- [Performance](#performance)
 - [Python Layer](#python-layer)
   - [Installation](#python-installation)
   - [CLI Usage](#cli-usage)
@@ -60,8 +147,11 @@ Most applications that need key management face a difficult choice: implement it
 - [Shared: Shamir Secret Sharing](#shamirs-secret-sharing)
 - [Blockchain Transaction Signing](#blockchain-transaction-signing-secp256k1--ed25519)
 - [Security Model](#security-model)
+- [Threat Model](#threat-model)
+- [Performance Benchmarks](#performance)
 - [Running Tests](#running-tests)
 - [Operations Guide](#operations-guide)
+- [FAQ](#faq)
 
 ---
 
@@ -736,6 +826,32 @@ const sig = await client.encrypt("eth-wallet", txHash);
 | Type safety | PEP 561 `py.typed` marker; `str | bytes` annotations on public API |
 
 **Honest scope statement:** PyHSM is a software KMS. It does not carry FIPS 140-2/3 validation (which requires NIST laboratory certification of the specific binary). It does not provide the physical tamper evidence of a hardware HSM. Key material is protected by OS-level process boundaries, not a secure enclave or physically separate processor. For regulated environments that mandate certified hardware, use a certified HSM; PyHSM is appropriate where software key management is acceptable.
+
+---
+
+## Threat Model
+
+See [THREAT_MODEL.md](THREAT_MODEL.md) for the full formal threat model, including:
+
+- Assets protected and trust boundary diagrams
+- Five threat actor profiles (T1–T5) with specific mitigations
+- Cryptographic design decisions and rationale
+- Assumptions and known limitations
+- Comparison to hardware HSM threat coverage
+
+---
+
+## FAQ
+
+See [docs/FAQ.md](docs/FAQ.md) for detailed answers to common architecture and security questions, including:
+
+- Why build a software HSM instead of using Vault?
+- How do you prevent key extraction?
+- How is key rotation implemented?
+- How are audit logs protected from tampering?
+- What cryptographic guarantees do you provide?
+- What threat model did you design against?
+- Why should I use this instead of AWS KMS?
 
 ---
 
