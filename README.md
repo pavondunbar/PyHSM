@@ -58,6 +58,7 @@ Most applications that need key management face a difficult choice: implement it
   - [Process Isolation Mode](#process-isolation-mode)
   - [Architecture](#typescript-architecture)
 - [Shared: Shamir Secret Sharing](#shamirs-secret-sharing)
+- [Blockchain Transaction Signing](#blockchain-transaction-signing-secp256k1--ed25519)
 - [Security Model](#security-model)
 - [Running Tests](#running-tests)
 - [Operations Guide](#operations-guide)
@@ -592,6 +593,114 @@ const hsm = new PyHSM({
 ```
 
 Intermediate share buffers are zeroized from memory after reconstruction in both layers.
+
+---
+
+## Blockchain Transaction Signing (secp256k1 / Ed25519)
+
+PyHSM can serve as a self-hosted signing infrastructure for Ethereum, Bitcoin, Solana, and other blockchain networks. The private key is imported once, encrypted at rest, and never exposed again — all signing happens through PyHSM.
+
+### Step 1: Import an Existing Private Key (One-Time)
+
+```python
+from hsm import PyHSM
+import base64
+
+def b64url(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+
+# Raw private key (e.g., from MetaMask export or key generation)
+raw_key_hex = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+privkey_bytes = bytes.fromhex(raw_key_hex.removeprefix("0x"))
+
+# Derive public key coordinates (using eth_keys, coincurve, or similar)
+from eth_keys import keys
+pk = keys.PrivateKey(privkey_bytes)
+x_bytes = pk.public_key.to_bytes()[:32]
+y_bytes = pk.public_key.to_bytes()[32:]
+
+# Import into PyHSM — key is now AES-KWP double-encrypted at rest
+hsm = PyHSM(storage_path="/secure/keystore.enc", master_password="strong-pw")
+hsm.import_key_jwk("eth-wallet", {
+    "kty": "EC",
+    "crv": "secp256k1",
+    "x": b64url(x_bytes),
+    "y": b64url(y_bytes),
+    "d": b64url(privkey_bytes),
+})
+hsm.close_session()
+
+# DELETE the raw private key from disk/memory — it now lives only in PyHSM
+```
+
+Or generate a fresh wallet key directly:
+
+```python
+hsm = PyHSM(storage_path="/secure/keystore.enc", master_password="strong-pw")
+hsm.generate_key("eth-wallet", "ec-secp256k1")
+
+# Derive the Ethereum address from the public key PEM
+pub_pem = hsm.get_public_key("eth-wallet")
+```
+
+### Step 2: Sign Transactions Through PyHSM
+
+```python
+hsm = PyHSM(storage_path="/secure/keystore.enc", master_password="strong-pw")
+
+# Your application builds and hashes the transaction
+tx_hash_hex = "0x..."  # keccak256 of the unsigned RLP-encoded transaction
+
+# Sign through PyHSM — private key is unwrapped, used, and immediately zeroized
+signature_hex = hsm.sign("eth-wallet", bytes.fromhex(tx_hash_hex.removeprefix("0x")),
+                         caller_id="tx-service")
+
+# Parse the DER-encoded ECDSA signature into (r, s) for Ethereum
+from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+r, s = decode_dss_signature(bytes.fromhex(signature_hex))
+
+# Determine v (recovery ID) and broadcast the signed transaction
+```
+
+### Step 3: Ed25519 (Solana / Cosmos)
+
+```python
+hsm = PyHSM(storage_path="/secure/keystore.enc", master_password="strong-pw")
+hsm.generate_key("sol-wallet", "ed25519")
+
+# Sign a Solana transaction payload
+signature_hex = hsm.sign("sol-wallet", transaction_bytes, caller_id="sol-service")
+
+# Ed25519 signatures are 64 bytes — use directly with Solana SDK
+signature_bytes = bytes.fromhex(signature_hex)
+```
+
+### TypeScript (Process Isolation)
+
+For maximum security, run PyHSM in a separate process so even an application-layer
+exploit cannot read key material:
+
+```typescript
+// Start the HSM process:
+// PYHSM_MASTER_PASSWORD="..." npx tsx pyhsm-ts/process.ts
+
+import { PyHSMClient } from "./pyhsm-ts";
+const client = new PyHSMClient("/run/pyhsm/pyhsm.sock", "tx-service");
+
+// Sign — key never enters the application process memory
+const sig = await client.encrypt("eth-wallet", txHash);
+```
+
+### Security Gains for Blockchain Use
+
+| Threat | Without PyHSM | With PyHSM |
+|---|---|---|
+| Key in `.env` or config | Plaintext on disk | AES-256-GCM + AES-KWP double-encrypted |
+| Server compromise (memory dump) | Key exposed | Key in memory only during sign, then zeroized |
+| Insider theft | Copy the key file silently | Requires master password + keystore (or M-of-N Shamir shares) |
+| No signing audit trail | Attacker signs silently | HMAC-chained audit log records every operation with caller_id |
+| Unlimited signing after theft | No constraints | Rate limiting + `max_operations` policy + `expires_at` |
+| Single admin controls keys | One person holds everything | Shamir 3-of-5 unlock ceremony |
 
 ---
 

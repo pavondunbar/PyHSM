@@ -394,6 +394,100 @@ Imported keys are wrapped with AES-KWP before storage, matching the security pro
 
 ---
 
+## Blockchain Transaction Signing
+
+PyHSM supports secp256k1 (Ethereum, Bitcoin, EVM chains) and Ed25519 (Solana, Cosmos) natively. The private key is imported once, encrypted at rest with AES-KWP double-wrapping, and never exposed again.
+
+### Workflow
+
+1. **Import the private key** (one-time) — key is encrypted and stored
+2. **Sign through PyHSM** — key is unwrapped in memory for microseconds, then zeroized
+3. **Extract (r, s, v) and broadcast** — your app handles the network layer
+
+### Python: secp256k1 (Ethereum/Bitcoin)
+
+```python
+from hsm import PyHSM
+import base64
+
+def b64url(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+
+hsm = PyHSM(storage_path="/secure/keystore.enc", master_password="strong-pw")
+
+# Option A: Import an existing private key
+# Derive x, y from private key using eth_keys or coincurve
+hsm.import_key_jwk("eth-wallet", {
+    "kty": "EC",
+    "crv": "secp256k1",
+    "x": b64url(x_bytes),
+    "y": b64url(y_bytes),
+    "d": b64url(privkey_bytes),
+})
+
+# Option B: Generate a fresh key
+hsm.generate_key("eth-wallet", "ec-secp256k1")
+
+# Sign a transaction hash
+tx_hash = bytes.fromhex("deadbeef...")  # keccak256 of unsigned tx
+signature_hex = hsm.sign("eth-wallet", tx_hash, caller_id="tx-service")
+
+# Parse DER → (r, s) for Ethereum
+from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+r, s = decode_dss_signature(bytes.fromhex(signature_hex))
+```
+
+### TypeScript: secp256k1 (Process Isolation)
+
+```typescript
+import { PyHSMClient } from "./pyhsm-ts";
+
+const client = new PyHSMClient("/run/pyhsm/pyhsm.sock", "tx-service");
+
+// Generate or import key (one-time)
+await client.generateKey("eth-wallet");  // uses default AES; for secp256k1, use embedded mode
+
+// Sign — private key never enters the application process
+const sig = await client.sign("eth-wallet", txHashHex);
+```
+
+### Python: Ed25519 (Solana/Cosmos)
+
+```python
+hsm = PyHSM(storage_path="/secure/keystore.enc", master_password="strong-pw")
+hsm.generate_key("sol-wallet", "ed25519")
+
+# Sign — returns 64-byte Ed25519 signature (hex-encoded)
+sig_hex = hsm.sign("sol-wallet", transaction_bytes, caller_id="sol-service")
+signature = bytes.fromhex(sig_hex)  # 64 bytes, use directly with Solana SDK
+```
+
+### Recommended Policies for Hot Wallets
+
+```python
+hsm.generate_key("hot-wallet", "ec-secp256k1", policy={
+    "allow_encrypt": False,
+    "allow_decrypt": False,
+    "allow_sign": True,
+    "max_operations": 10000,          # hard cap on total signatures
+    "expires_at": "2027-01-01T00:00:00Z",
+    "allowed_callers": ["tx-service", "relayer"],  # only these services can sign
+})
+```
+
+### Security Properties
+
+- Private key encrypted at rest (AES-256-GCM + AES-KWP double-wrapping)
+- Key material in memory only during signing, then deterministically zeroized
+- Every signature recorded in HMAC-chained audit log with caller identity
+- Rate limiting prevents runaway signing (e.g., compromised service draining a wallet)
+- `max_operations` provides a hard lifetime cap on signatures
+- `allowed_callers` restricts which services can request signatures
+- Shamir M-of-N ceremony for master password prevents single-person key access
+- Process isolation mode keeps keys in a separate address space from the application
+
+---
+
 ## Implementing a Custom Storage Backend
 
 To store keystore data in a database, S3, or other system, implement the `StorageBackend` interface:
