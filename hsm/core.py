@@ -24,7 +24,7 @@ import threading
 from datetime import datetime, timezone
 from typing import Optional
 
-from cryptography.hazmat.primitives.asymmetric import rsa, ec, padding
+from cryptography.hazmat.primitives.asymmetric import rsa, ec, padding, ed25519
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.keywrap import aes_key_wrap_with_padding, aes_key_unwrap_with_padding
@@ -40,6 +40,7 @@ from .jwk import (
     export_symmetric_jwk,
     export_ec_jwk,
     export_rsa_jwk,
+    export_ed25519_jwk,
     import_jwk as _import_jwk,
 )
 
@@ -313,7 +314,8 @@ class PyHSM:
         """
         Generate a new cryptographic key.
 
-        Supported types: aes-128, aes-256, rsa-2048, rsa-4096, ec-p256, ec-p384, ec-p521.
+        Supported types: aes-128, aes-256, rsa-2048, rsa-4096, ec-p256, ec-p384, ec-p521,
+                         ec-secp256k1, ed25519.
         Returns the key_id.
         """
         with self._global_lock:
@@ -342,6 +344,12 @@ class PyHSM:
                 key_data = self._wrap_key_data(priv_pem.encode())
             elif key_type == "ec-p521":
                 priv_pem, public_key_pem = _gen_ec(ec.SECP521R1())
+                key_data = self._wrap_key_data(priv_pem.encode())
+            elif key_type == "ec-secp256k1":
+                priv_pem, public_key_pem = _gen_ec(ec.SECP256K1())
+                key_data = self._wrap_key_data(priv_pem.encode())
+            elif key_type == "ed25519":
+                priv_pem, public_key_pem = _gen_ed25519()
                 key_data = self._wrap_key_data(priv_pem.encode())
             else:
                 raise ValueError(f"Unsupported key type: {key_type}")
@@ -618,14 +626,14 @@ class PyHSM:
     # ------------------------------------------------------------------
 
     def sign(self, key_id: str, message: str | bytes, *, caller_id: Optional[str] = None) -> str:
-        """Sign a message using a stored RSA or EC key. Returns hex-encoded signature."""
+        """Sign a message using a stored RSA, EC, or Ed25519 key. Returns hex-encoded signature."""
         with self._key_lock(key_id):
             self._assert_session()
             _validate_key_id(key_id)
             entry = self._store.load_key(key_id)
 
-            if not (entry["key_type"].startswith("rsa") or entry["key_type"].startswith("ec")):
-                raise ValueError("Signing requires an RSA or EC key")
+            if not (entry["key_type"].startswith("rsa") or entry["key_type"].startswith("ec") or entry["key_type"] == "ed25519"):
+                raise ValueError("Signing requires an RSA, EC, or Ed25519 key")
 
             self._enforce_policy(entry, "sign", caller_id)
 
@@ -652,11 +660,13 @@ class PyHSM:
                     ),
                     hashes.SHA256(),
                 )
+            elif entry["key_type"] == "ed25519":
+                sig = private_key.sign(data)
             elif entry["key_type"].startswith("ec"):
                 hash_alg = _ec_hash_for_key_type(entry["key_type"])
                 sig = private_key.sign(data, ec.ECDSA(hash_alg))
             else:
-                raise ValueError("Signing requires an RSA or EC key")
+                raise ValueError("Signing requires an RSA, EC, or Ed25519 key")
 
             entry["operation_count"] = entry.get("operation_count", 0) + 1
             self._store.update_key(key_id, entry)
@@ -695,6 +705,8 @@ class PyHSM:
                         ),
                         hashes.SHA256(),
                     )
+                elif entry["key_type"] == "ed25519":
+                    public_key.verify(sig, data)
                 elif entry["key_type"].startswith("ec"):
                     hash_alg = _ec_hash_for_key_type(entry["key_type"])
                     public_key.verify(sig, data, ec.ECDSA(hash_alg))
@@ -760,6 +772,8 @@ class PyHSM:
             try:
                 if key_type.startswith("aes"):
                     return export_symmetric_jwk(raw_key, key_id=key_id)
+                elif key_type == "ed25519":
+                    return export_ed25519_jwk(raw_key, key_id=key_id)
                 elif key_type.startswith("ec"):
                     return export_ec_jwk(raw_key, key_id=key_id)
                 elif key_type.startswith("rsa"):
@@ -899,6 +913,21 @@ def _gen_ec(curve) -> tuple[str, str]:
     return priv_pem, pub_pem
 
 
+def _gen_ed25519() -> tuple[str, str]:
+    """Generate an Ed25519 keypair. Returns (private_pem, public_pem)."""
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    priv_pem = private_key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode()
+    pub_pem = private_key.public_key().public_bytes(
+        serialization.Encoding.PEM,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    ).decode()
+    return priv_pem, pub_pem
+
+
 def _ec_hash_for_key_type(key_type: str):
     """Return the appropriate hash algorithm for the given EC key type.
 
@@ -906,10 +935,11 @@ def _ec_hash_for_key_type(key_type: str):
       P-256 → SHA-256
       P-384 → SHA-384
       P-521 → SHA-512
+      secp256k1 → SHA-256 (standard for Bitcoin/Ethereum ECDSA)
     """
     if key_type == "ec-p384":
         return hashes.SHA384()
     elif key_type == "ec-p521":
         return hashes.SHA512()
-    # Default for ec-p256 and any other ec- prefix
+    # Default for ec-p256, ec-secp256k1, and any other ec- prefix
     return hashes.SHA256()

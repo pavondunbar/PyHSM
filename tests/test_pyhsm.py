@@ -260,7 +260,7 @@ class TestEncryptDecrypt:
 
     def test_aes_key_for_sign_raises(self, hsm):
         hsm.generate_key("aes-only")
-        with pytest.raises(ValueError, match="RSA or EC"):
+        with pytest.raises(ValueError, match="RSA, EC, or Ed25519"):
             hsm.sign("aes-only", "data")
 
     def test_asymmetric_key_for_encrypt_raises(self, hsm):

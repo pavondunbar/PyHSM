@@ -295,7 +295,7 @@ Available metrics:
 
 16. **Rate limiter ordering (Python)**: Policy enforcement checks are ordered to prevent denial-of-service: caller ACL, operation permission, max operations, and expiry are all validated before the rate limiter consumes a token. This ensures unauthorized or policy-denied requests cannot exhaust the rate-limit window for legitimate callers.
 
-17. **EC curve hash pairing (Python)**: ECDSA signing uses NIST-recommended hash algorithms per curve: P-256 → SHA-256, P-384 → SHA-384, P-521 → SHA-512. This ensures the hash security level matches the curve security level.
+17. **EC curve hash pairing (Python)**: ECDSA signing uses NIST-recommended hash algorithms per curve: P-256 → SHA-256, P-384 → SHA-384, P-521 → SHA-512, secp256k1 → SHA-256. This ensures the hash security level matches the curve security level. Ed25519 uses its own built-in hash (SHA-512 internally as part of EdDSA) and does not require a separate hash algorithm parameter.
 
 ---
 
@@ -315,6 +315,12 @@ jwk = hsm.export_jwk("my-aes-key")
 
 ec_jwk = hsm.export_jwk("my-ec-key")
 # {"kty": "EC", "crv": "P-256", "x": "...", "y": "...", "d": "...", "kid": "my-ec-key"}
+
+secp_jwk = hsm.export_jwk("my-secp256k1-key")
+# {"kty": "EC", "crv": "secp256k1", "x": "...", "y": "...", "d": "...", "kid": "my-secp256k1-key"}
+
+ed_jwk = hsm.export_jwk("my-ed25519-key")
+# {"kty": "OKP", "crv": "Ed25519", "x": "...", "d": "...", "kid": "my-ed25519-key"}
 
 rsa_jwk = hsm.export_jwk("my-rsa-key")
 # {"kty": "RSA", "n": "...", "e": "...", "d": "...", ...}
@@ -345,6 +351,23 @@ hsm.import_key_jwk("idp-key", jwk_from_provider, policy={
     "allow_encrypt": False,
     "allow_sign": True,
 })
+
+# Import an Ethereum/Bitcoin private key (secp256k1)
+hsm.import_key_jwk("eth-wallet", {
+    "kty": "EC",
+    "crv": "secp256k1",
+    "x": "...",
+    "y": "...",
+    "d": "...",
+})
+
+# Import an Ed25519 key (Solana, SSH, etc.)
+hsm.import_key_jwk("sol-wallet", {
+    "kty": "OKP",
+    "crv": "Ed25519",
+    "x": "...",   # 32-byte public key (base64url)
+    "d": "...",   # 32-byte private key seed (base64url)
+})
 ```
 
 **TypeScript:**
@@ -362,6 +385,8 @@ hsm.importKeyJwk("external-key", jwkObject, { allowEncrypt: true, allowDecrypt: 
 | `EC` (P-256) | `ec-p256` | ECDSA signing (SHA-256) |
 | `EC` (P-384) | `ec-p384` | ECDSA signing (SHA-384) |
 | `EC` (P-521) | `ec-p521` | ECDSA signing (SHA-512) |
+| `EC` (secp256k1) | `ec-secp256k1` | ECDSA signing (SHA-256) — Bitcoin/Ethereum |
+| `OKP` (Ed25519) | `ed25519` | EdDSA signing — Solana, SSH, high-performance |
 | `RSA` (2048-bit) | `rsa-2048` | RSA-PSS signing |
 | `RSA` (4096-bit) | `rsa-4096` | RSA-PSS signing |
 

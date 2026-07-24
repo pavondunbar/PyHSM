@@ -9,7 +9,7 @@ from .rate_limiter import RateLimiter
 from .metrics import MetricsCollector
 from .self_test import run_self_tests
 from .shamir import split_secret, reconstruct_secret, zeroize
-from .jwk import export_symmetric_jwk, export_ec_jwk, export_rsa_jwk
+from .jwk import export_symmetric_jwk, export_ec_jwk, export_rsa_jwk, export_ed25519_jwk
 
 __all__ = [
     "PyHSM",
@@ -30,4 +30,5 @@ __all__ = [
     "export_symmetric_jwk",
     "export_ec_jwk",
     "export_rsa_jwk",
+    "export_ed25519_jwk",
 ]

@@ -63,11 +63,12 @@ function constantTimeEqual(a: string, b: string): boolean {
 /**
  * Return the appropriate hash algorithm for the given EC key type.
  * NIST recommendations: P-256 → SHA-256, P-384 → SHA-384, P-521 → SHA-512
+ * secp256k1 → SHA-256 (standard for Bitcoin/Ethereum ECDSA)
  */
 function ecHashForKeyType(keyType: string): string {
   if (keyType === "ec-p384") return "sha384";
   if (keyType === "ec-p521") return "sha512";
-  return "sha256"; // ec-p256 default
+  return "sha256"; // ec-p256, ec-secp256k1 default
 }
 
 export class PyHSM {
@@ -655,11 +656,20 @@ export class PyHSM {
       });
       wrappedHex = this.wrapForStorage(Buffer.from(privateKey as string, "utf8"));
       publicKeyPem = publicKey as string;
-    } else if (keyType === "ec-p256" || keyType === "ec-p384" || keyType === "ec-p521") {
+    } else if (keyType === "ec-p256" || keyType === "ec-p384" || keyType === "ec-p521" || keyType === "ec-secp256k1") {
       const namedCurve = keyType === "ec-p256" ? "P-256"
-        : keyType === "ec-p384" ? "P-384" : "P-521";
+        : keyType === "ec-p384" ? "P-384"
+        : keyType === "ec-p521" ? "P-521"
+        : "secp256k1";
       const { privateKey, publicKey } = crypto.generateKeyPairSync("ec", {
         namedCurve,
+        publicKeyEncoding: { type: "spki", format: "pem" },
+        privateKeyEncoding: { type: "pkcs8", format: "pem" },
+      });
+      wrappedHex = this.wrapForStorage(Buffer.from(privateKey as string, "utf8"));
+      publicKeyPem = publicKey as string;
+    } else if (keyType === "ed25519") {
+      const { privateKey, publicKey } = crypto.generateKeyPairSync("ed25519", {
         publicKeyEncoding: { type: "spki", format: "pem" },
         privateKeyEncoding: { type: "pkcs8", format: "pem" },
       });
@@ -893,12 +903,13 @@ export class PyHSM {
   // --- Sign / Verify ---
 
   /**
-   * Sign a message using a stored RSA or EC key.
+   * Sign a message using a stored RSA, EC, or Ed25519 key.
    * Returns hex-encoded signature.
    *
    * RSA keys use RSA-PSS with SHA-256.
    * EC keys use ECDSA with the NIST-recommended hash for the curve:
-   *   P-256 → SHA-256, P-384 → SHA-384, P-521 → SHA-512
+   *   P-256 → SHA-256, P-384 → SHA-384, P-521 → SHA-512, secp256k1 → SHA-256
+   * Ed25519 keys use EdDSA (no separate hash needed).
    */
   sign(keyId: string, message: string | Buffer, callerId = "system"): string {
     this.assertSession();
@@ -906,8 +917,8 @@ export class PyHSM {
     const entry = this.store.keys[keyId];
     if (!entry) throw new Error(`PyHSM: key '${keyId}' not found`);
 
-    if (!entry.keyType.startsWith("rsa") && !entry.keyType.startsWith("ec")) {
-      throw new Error(`PyHSM: signing requires an RSA or EC key`);
+    if (!entry.keyType.startsWith("rsa") && !entry.keyType.startsWith("ec") && entry.keyType !== "ed25519") {
+      throw new Error(`PyHSM: signing requires an RSA, EC, or Ed25519 key`);
     }
 
     this.enforcePolicy(entry, "sign", callerId);
@@ -932,6 +943,8 @@ export class PyHSM {
           padding: crypto.constants.RSA_PKCS1_PSS_PADDING,
           saltLength: crypto.constants.RSA_PSS_SALTLEN_MAX_SIGN,
         });
+      } else if (entry.keyType === "ed25519") {
+        sig = crypto.sign(null, data, privateKey);
       } else {
         // EC — select hash algorithm based on curve
         const hashAlg = ecHashForKeyType(entry.keyType);
@@ -960,8 +973,8 @@ export class PyHSM {
     const entry = this.store.keys[keyId];
     if (!entry) throw new Error(`PyHSM: key '${keyId}' not found`);
 
-    if (!entry.keyType.startsWith("rsa") && !entry.keyType.startsWith("ec")) {
-      throw new Error(`PyHSM: verification requires an RSA or EC key`);
+    if (!entry.keyType.startsWith("rsa") && !entry.keyType.startsWith("ec") && entry.keyType !== "ed25519") {
+      throw new Error(`PyHSM: verification requires an RSA, EC, or Ed25519 key`);
     }
 
     if (!entry.publicKeyPem) {
@@ -984,6 +997,8 @@ export class PyHSM {
           padding: crypto.constants.RSA_PKCS1_PSS_PADDING,
           saltLength: crypto.constants.RSA_PSS_SALTLEN_MAX_SIGN,
         }, sig);
+      } else if (entry.keyType === "ed25519") {
+        valid = crypto.verify(null, data, publicKey, sig);
       } else {
         const hashAlg = ecHashForKeyType(entry.keyType);
         valid = crypto.verify(hashAlg, data, publicKey, sig);

@@ -35,8 +35,10 @@ Most applications that need key management face a difficult choice: implement it
 - Startup Known-Answer Tests (KATs) before accepting any operations
 - Prometheus metrics
 - Backward-compatible ciphertext format versioning (v1 legacy, v2 AAD-bound)
-- JWK (RFC 7517) key import/export for interoperability (supports P-256, P-384, P-521, RSA, AES)
-- EC P-256, P-384, and P-521 signing with NIST-recommended hash algorithms (SHA-256, SHA-384, SHA-512)
+- JWK (RFC 7517) key import/export for interoperability (supports P-256, P-384, P-521, secp256k1, Ed25519, RSA, AES)
+- EC P-256, P-384, P-521, and secp256k1 signing with ECDSA (SHA-256, SHA-384, SHA-512)
+- Ed25519 (EdDSA) signing for high-performance, compact signatures (Solana, Cosmos, SSH keys)
+- secp256k1 support for Ethereum, Bitcoin, and EVM-compatible blockchain transaction signing
 - Fully typed Python API (PEP 561 `py.typed` marker included)
 - 165 tests across both layers
 
@@ -105,6 +107,8 @@ vectorguard-pyhsm --store keystore.enc generate my-rsa-key --type rsa-2048 -p "p
 vectorguard-pyhsm --store keystore.enc generate my-ec-key  --type ec-p256 -p "pw"
 vectorguard-pyhsm --store keystore.enc generate my-ec384   --type ec-p384 -p "pw"
 vectorguard-pyhsm --store keystore.enc generate my-ec521   --type ec-p521 -p "pw"
+vectorguard-pyhsm --store keystore.enc generate my-secp256k1 --type ec-secp256k1 -p "pw"
+vectorguard-pyhsm --store keystore.enc generate my-ed25519   --type ed25519 -p "pw"
 
 # Generate a key with a policy
 vectorguard-pyhsm --store keystore.enc generate limited-key \
@@ -169,6 +173,8 @@ hsm.generate_key("rsa-key", "rsa-2048")
 hsm.generate_key("ec-key",  "ec-p256")
 hsm.generate_key("ec384",   "ec-p384")              # NIST P-384 (SHA-384)
 hsm.generate_key("ec521",   "ec-p521")              # NIST P-521 (SHA-512)
+hsm.generate_key("eth-key", "ec-secp256k1")         # Bitcoin/Ethereum (SHA-256)
+hsm.generate_key("sol-key", "ed25519")              # Ed25519 (Solana, SSH, high-perf signing)
 
 # Generate a key with a policy (including caller ACL)
 hsm.generate_key("restricted", policy={
@@ -198,6 +204,14 @@ is_valid   = hsm.verify("ec-key", "message", signature)  # uses stored public ke
 sig384 = hsm.sign("ec384", "message", caller_id="signer-service")
 is_valid = hsm.verify("ec384", "message", sig384, caller_id="verifier")
 
+# Sign with secp256k1 (Ethereum/Bitcoin transaction signing)
+sig_eth = hsm.sign("eth-key", tx_hash, caller_id="tx-service")
+is_valid = hsm.verify("eth-key", tx_hash, sig_eth, caller_id="verifier")
+
+# Sign with Ed25519 (high-performance, compact 64-byte signatures)
+sig_ed = hsm.sign("sol-key", "message", caller_id="signing-service")
+is_valid = hsm.verify("sol-key", "message", sig_ed, caller_id="verifier")
+
 # Export public key (PEM)
 pub_pem = hsm.get_public_key("rsa-key")
 
@@ -218,12 +232,31 @@ jwk = hsm.export_jwk("aes-key")                        # {"kty": "oct", "k": "..
 ec_jwk = hsm.export_jwk("ec-key")                      # {"kty": "EC", "crv": "P-256", ...}
 ec384_jwk = hsm.export_jwk("ec384")                    # {"kty": "EC", "crv": "P-384", ...}
 ec521_jwk = hsm.export_jwk("ec521")                    # {"kty": "EC", "crv": "P-521", ...}
+secp_jwk = hsm.export_jwk("eth-key")                   # {"kty": "EC", "crv": "secp256k1", ...}
+ed_jwk = hsm.export_jwk("sol-key")                     # {"kty": "OKP", "crv": "Ed25519", ...}
 
 # JWK import — bring keys from external systems
 hsm.import_key_jwk("imported-key", {
     "kty": "oct",
     "k": "base64url-encoded-key-material",
     "alg": "A256GCM",
+})
+
+# Import an Ethereum/Bitcoin private key via JWK
+hsm.import_key_jwk("eth-wallet", {
+    "kty": "EC",
+    "crv": "secp256k1",
+    "x": "...",   # base64url public key x-coordinate
+    "y": "...",   # base64url public key y-coordinate
+    "d": "...",   # base64url private key scalar
+})
+
+# Import an Ed25519 key (e.g., from Solana or SSH)
+hsm.import_key_jwk("ed-key", {
+    "kty": "OKP",
+    "crv": "Ed25519",
+    "x": "...",   # base64url 32-byte public key
+    "d": "...",   # base64url 32-byte private key seed
 })
 
 # Explicit close (zeroizes master password and key material from memory)
@@ -270,7 +303,7 @@ hsm/
                       bytearray key_data for deterministic zeroization
   backends.py       — StorageBackend ABC, FileBackend (atomic writes), MemoryBackend
   secure_memory.py  — SecureBytes: deterministic bytearray zeroization, context manager
-  jwk.py            — JWK (RFC 7517) import/export: oct, EC (P-256/P-384/P-521), RSA
+  jwk.py            — JWK (RFC 7517) import/export: oct, EC (P-256/P-384/P-521/secp256k1), OKP (Ed25519), RSA
   shamir.py         — Shamir secret sharing over GF(256)
   audit.py          — HMAC-chained append-only audit log (HMAC key derived from master password)
   rate_limiter.py   — Sliding-window per-key rate limiter
@@ -352,6 +385,10 @@ const hsm = new PyHSM({
 // Generate
 hsm.generateKey("my-key");
 
+// Generate with specific key types
+hsm.generateKey("eth-key", "ec-secp256k1");    // Bitcoin/Ethereum signing
+hsm.generateKey("sol-key", "ed25519");          // Solana/SSH/high-performance signing
+
 // Generate with policy
 hsm.generateKey("restricted", {
   allowEncrypt: true,
@@ -409,6 +446,23 @@ hsm.importKeyJwk("idp-signing-key", {
   x: "...",
   y: "...",
   d: "...",
+});
+
+// Import an Ethereum/Bitcoin private key (secp256k1)
+hsm.importKeyJwk("eth-wallet", {
+  kty: "EC",
+  crv: "secp256k1",
+  x: "...",
+  y: "...",
+  d: "...",
+});
+
+// Import an Ed25519 key (Solana, SSH, etc.)
+hsm.importKeyJwk("sol-wallet", {
+  kty: "OKP",
+  crv: "Ed25519",
+  x: "...",   // 32-byte public key (base64url)
+  d: "...",   // 32-byte private key seed (base64url)
 });
 ```
 
@@ -482,7 +536,7 @@ pyhsm-ts/
                         AES-KWP per-key wrapping, HKDF key separation, pluggable StorageBackend
   storage-backend.ts  — StorageBackend interface, FileBackend, MemoryBackend
   types.ts            — TypeScript interfaces, key ID validation, config with backend option
-  jwk.ts              — JWK (RFC 7517) import/export: oct, EC, RSA key types
+  jwk.ts              — JWK (RFC 7517) import/export: oct, EC (P-256/P-384/P-521/secp256k1), OKP (Ed25519), RSA
   shamir.ts           — Shamir secret sharing over GF(256)
   audit.ts            — HMAC-chained audit log, SIEM export
   rate-limiter.ts     — Sliding-window per-key rate limiter
@@ -567,8 +621,9 @@ Intermediate share buffers are zeroized from memory after reconstruction in both
 | Process memory isolation | Optional: IPC mode runs HSM in a separate process (TypeScript) |
 | M-of-N startup ceremony | Shamir split/reconstruct on master password |
 | Pluggable storage | `StorageBackend` interface — swap file I/O for database, S3, etc. |
-| Key interoperability | JWK (RFC 7517) import/export — supports P-256, P-384, P-521, RSA, AES |
-| EC curve support | P-256 (SHA-256), P-384 (SHA-384), P-521 (SHA-512) — NIST-recommended hash pairing |
+| Key interoperability | JWK (RFC 7517) import/export — supports P-256, P-384, P-521, secp256k1, Ed25519, RSA, AES |
+| EC curve support | P-256 (SHA-256), P-384 (SHA-384), P-521 (SHA-512), secp256k1 (SHA-256) — NIST/SEC recommended hash pairing |
+| EdDSA support | Ed25519 signing — high-performance 64-byte signatures (Solana, Cosmos, SSH keys) |
 | Type safety | PEP 561 `py.typed` marker; `str | bytes` annotations on public API |
 
 **Honest scope statement:** PyHSM is a software KMS. It does not carry FIPS 140-2/3 validation (which requires NIST laboratory certification of the specific binary). It does not provide the physical tamper evidence of a hardware HSM. Key material is protected by OS-level process boundaries, not a secure enclave or physically separate processor. For regulated environments that mandate certified hardware, use a certified HSM; PyHSM is appropriate where software key management is acceptable.

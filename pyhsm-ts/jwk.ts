@@ -6,8 +6,9 @@
  *
  * Supported key types:
  *   - AES-128, AES-256 → {"kty": "oct", "k": <base64url>, ...}
- *   - EC P-256          → {"kty": "EC", "crv": "P-256", ...}
- *   - RSA               → {"kty": "RSA", ...}
+ *   - EC P-256/P-384/P-521/secp256k1 → {"kty": "EC", "crv": ..., ...}
+ *   - Ed25519          → {"kty": "OKP", "crv": "Ed25519", ...}
+ *   - RSA              → {"kty": "RSA", ...}
  */
 import crypto from "node:crypto";
 
@@ -56,7 +57,8 @@ export function exportAsymmetricJwk(privateKeyDer: Buffer, keyId?: string): JWK 
  * Import a JWK and return { keyType, rawKeyBytes, publicKeyPem }.
  *
  * - kty="oct" → AES symmetric key (returns raw bytes, no publicKeyPem)
- * - kty="EC"  → returns PEM-encoded private key bytes + public key PEM
+ * - kty="EC"  → returns PEM-encoded private key bytes + public key PEM (P-256, P-384, P-521, secp256k1)
+ * - kty="OKP" → returns PEM-encoded private key bytes + public key PEM (Ed25519)
  * - kty="RSA" → returns PEM-encoded private key bytes + public key PEM
  */
 export function importJwk(jwk: JWK): {
@@ -89,6 +91,7 @@ export function importJwk(jwk: JWK): {
       if (crv === "P-256") keyType = "ec-p256";
       else if (crv === "P-384") keyType = "ec-p384";
       else if (crv === "P-521") keyType = "ec-p521";
+      else if (crv === "secp256k1") keyType = "ec-secp256k1";
       else throw new Error(`Unsupported EC curve: ${crv}`);
     } else {
       // Determine RSA key size from modulus
@@ -99,6 +102,26 @@ export function importJwk(jwk: JWK): {
 
     return {
       keyType,
+      rawKeyBytes: Buffer.from(privateKeyPem, "utf8"),
+      publicKeyPem,
+    };
+  }
+
+  if (kty === "OKP") {
+    const crv = jwk.crv as string;
+    if (crv !== "Ed25519") {
+      throw new Error(`Unsupported OKP curve: ${crv}`);
+    }
+
+    // Use Node.js crypto to convert JWK → KeyObject → PEM
+    const privateKeyObj = crypto.createPrivateKey({ key: jwk as crypto.JsonWebKey, format: "jwk" });
+    const privateKeyPem = privateKeyObj.export({ type: "pkcs8", format: "pem" }) as string;
+
+    const publicKeyObj = crypto.createPublicKey(privateKeyObj);
+    const publicKeyPem = publicKeyObj.export({ type: "spki", format: "pem" }) as string;
+
+    return {
+      keyType: "ed25519",
       rawKeyBytes: Buffer.from(privateKeyPem, "utf8"),
       publicKeyPem,
     };

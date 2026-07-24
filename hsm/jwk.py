@@ -6,12 +6,14 @@ other KMS systems, identity providers, and standards-based tooling.
 
 Supported key types for export:
   - AES-128, AES-256 → {"kty": "oct", "k": <base64url>, ...}
-  - EC P-256/P-384/P-521 → {"kty": "EC", "crv": "P-256"|"P-384"|"P-521", ...}
+  - EC P-256/P-384/P-521/secp256k1 → {"kty": "EC", "crv": "P-256"|"P-384"|"P-521"|"secp256k1", ...}
+  - Ed25519           → {"kty": "OKP", "crv": "Ed25519", ...}
   - RSA-2048/4096     → {"kty": "RSA", "n": ..., "e": ..., "d": ..., ...}
 
 Supported key types for import:
   - {"kty": "oct"}    → AES symmetric key
-  - {"kty": "EC"}     → ECDSA key (P-256, P-384, P-521)
+  - {"kty": "EC"}     → ECDSA key (P-256, P-384, P-521, secp256k1)
+  - {"kty": "OKP"}    → Ed25519 key
   - {"kty": "RSA"}    → RSA key
 """
 
@@ -21,7 +23,7 @@ import base64
 import json
 from typing import Optional
 
-from cryptography.hazmat.primitives.asymmetric import ec, rsa
+from cryptography.hazmat.primitives.asymmetric import ec, rsa, ed25519
 from cryptography.hazmat.primitives import serialization
 
 
@@ -70,6 +72,7 @@ def export_ec_jwk(private_key_pem: bytes, key_id: Optional[str] = None) -> dict:
     Export an EC private key (PEM) as a JWK.
 
     Returns a dict with kty="EC", crv, x, y, d fields.
+    Supports P-256, P-384, P-521, and secp256k1.
     """
     private_key = serialization.load_pem_private_key(private_key_pem, password=None)
     if not isinstance(private_key, ec.EllipticCurvePrivateKey):
@@ -89,6 +92,9 @@ def export_ec_jwk(private_key_pem: bytes, key_id: Optional[str] = None) -> dict:
     elif isinstance(curve, ec.SECP521R1):
         crv = "P-521"
         coord_size = 66
+    elif isinstance(curve, ec.SECP256K1):
+        crv = "secp256k1"
+        coord_size = 32
     else:
         raise ValueError(f"Unsupported curve: {curve.name}")
 
@@ -98,6 +104,40 @@ def export_ec_jwk(private_key_pem: bytes, key_id: Optional[str] = None) -> dict:
         "x": _b64url_encode(_int_to_bytes(public_numbers.x, coord_size)),
         "y": _b64url_encode(_int_to_bytes(public_numbers.y, coord_size)),
         "d": _b64url_encode(_int_to_bytes(private_numbers.private_value, coord_size)),
+        "key_ops": ["sign", "verify"],
+    }
+    if key_id:
+        jwk["kid"] = key_id
+    return jwk
+
+
+def export_ed25519_jwk(private_key_pem: bytes, key_id: Optional[str] = None) -> dict:
+    """
+    Export an Ed25519 private key (PEM) as a JWK.
+
+    Returns a dict with kty="OKP", crv="Ed25519", x (public), d (private).
+    Uses RFC 8037 (CFRG Elliptic Curves) format.
+    """
+    private_key = serialization.load_pem_private_key(private_key_pem, password=None)
+    if not isinstance(private_key, ed25519.Ed25519PrivateKey):
+        raise ValueError("Not an Ed25519 private key")
+
+    # Extract raw 32-byte private key seed and public key
+    raw_private = private_key.private_bytes(
+        serialization.Encoding.Raw,
+        serialization.PrivateFormat.Raw,
+        serialization.NoEncryption(),
+    )
+    raw_public = private_key.public_key().public_bytes(
+        serialization.Encoding.Raw,
+        serialization.PublicFormat.Raw,
+    )
+
+    jwk: dict = {
+        "kty": "OKP",
+        "crv": "Ed25519",
+        "x": _b64url_encode(raw_public),
+        "d": _b64url_encode(raw_private),
         "key_ops": ["sign", "verify"],
     }
     if key_id:
@@ -142,7 +182,8 @@ def import_jwk(jwk: dict) -> tuple[str, bytes, Optional[str]]:
     Import a JWK and return (key_type, raw_key_bytes, public_key_pem_or_None).
 
     Returns:
-      key_type: "aes-128", "aes-256", "ec-p256", "rsa-2048", "rsa-4096"
+      key_type: "aes-128", "aes-256", "ec-p256", "ec-p384", "ec-p521",
+                "ec-secp256k1", "ed25519", "rsa-2048", "rsa-4096"
       raw_key_bytes: raw symmetric key bytes OR PEM-encoded private key bytes
       public_key_pem: PEM string for asymmetric keys, None for symmetric
     """
@@ -168,6 +209,9 @@ def import_jwk(jwk: dict) -> tuple[str, bytes, Optional[str]]:
         elif crv == "P-521":
             curve = ec.SECP521R1()
             coord_size = 66
+        elif crv == "secp256k1":
+            curve = ec.SECP256K1()
+            coord_size = 32
         else:
             raise ValueError(f"Unsupported curve: {crv}")
 
@@ -189,8 +233,38 @@ def import_jwk(jwk: dict) -> tuple[str, bytes, Optional[str]]:
             serialization.PublicFormat.SubjectPublicKeyInfo,
         ).decode()
 
-        key_type = {"P-256": "ec-p256", "P-384": "ec-p384", "P-521": "ec-p521"}[crv]
+        key_type_map = {
+            "P-256": "ec-p256",
+            "P-384": "ec-p384",
+            "P-521": "ec-p521",
+            "secp256k1": "ec-secp256k1",
+        }
+        key_type = key_type_map[crv]
         return key_type, priv_pem, pub_pem
+
+    elif kty == "OKP":
+        crv = jwk.get("crv")
+        if crv != "Ed25519":
+            raise ValueError(f"Unsupported OKP curve: {crv}")
+
+        # Import Ed25519 from raw seed (d) and derive public key
+        raw_d = _b64url_decode(jwk["d"])
+        if len(raw_d) != 32:
+            raise ValueError(f"Ed25519 private key must be 32 bytes, got {len(raw_d)}")
+
+        private_key = ed25519.Ed25519PrivateKey.from_private_bytes(raw_d)
+
+        priv_pem = private_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+        pub_pem = private_key.public_key().public_bytes(
+            serialization.Encoding.PEM,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        ).decode()
+
+        return "ed25519", priv_pem, pub_pem
 
     elif kty == "RSA":
         n = _bytes_to_int(_b64url_decode(jwk["n"]))

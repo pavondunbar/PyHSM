@@ -191,7 +191,8 @@ def main() -> None:
     gen = sub.add_parser("generate", parents=[common], help="Generate a new key")
     gen.add_argument("key_id")
     gen.add_argument("--type", default="aes-256",
-                     choices=["aes-128", "aes-256", "rsa-2048", "rsa-4096", "ec-p256", "ec-p384", "ec-p521"])
+                     choices=["aes-128", "aes-256", "rsa-2048", "rsa-4096",
+                              "ec-p256", "ec-p384", "ec-p521", "ec-secp256k1", "ed25519"])
     gen.add_argument("--no-encrypt", action="store_true", help="Deny encrypt operations")
     gen.add_argument("--no-decrypt", action="store_true", help="Deny decrypt operations")
     gen.add_argument("--max-operations", type=int, help="Max total operations on this key")

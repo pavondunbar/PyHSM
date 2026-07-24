@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: vectorguard-pyhsm
-Version: 1.2.0
+Version: 1.3.0
 Summary: Production-grade software Key Management Service (KMS) — key lifecycle, authenticated encryption, digital signing, and tamper-evident audit logging.
 Author: Pavon Dunbar
 License-Expression: MIT
@@ -116,6 +116,14 @@ Global flags (`--store`, `-p`) can appear **before or after** the subcommand —
 vectorguard-pyhsm --store keystore.enc -p "pw" generate my-key
 vectorguard-pyhsm --store keystore.enc generate my-key -p "pw"
 vectorguard-pyhsm generate my-key --store keystore.enc --password "pw"
+```
+
+If the keystore file does not yet exist, the CLI prints a notice to stderr so you can tell when you're accidentally pointing at the wrong path:
+
+```
+$ vectorguard-pyhsm --store /wrong/path.enc list -p "pw"
+Created new keystore: /wrong/path.enc
+No keys stored.
 ```
 
 ```bash

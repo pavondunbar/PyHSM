@@ -634,12 +634,12 @@ describe("Sign and Verify", () => {
   describe("error cases", () => {
     it("sign throws for AES key", () => {
       hsm.generateKey("aes-key");
-      expect(() => hsm.sign("aes-key", "msg")).toThrow("RSA or EC");
+      expect(() => hsm.sign("aes-key", "msg")).toThrow("RSA, EC, or Ed25519");
     });
 
     it("verify throws for AES key", () => {
       hsm.generateKey("aes-key");
-      expect(() => hsm.verify("aes-key", "msg", "00".repeat(32))).toThrow("RSA or EC");
+      expect(() => hsm.verify("aes-key", "msg", "00".repeat(32))).toThrow("RSA, EC, or Ed25519");
     });
 
     it("getPublicKey throws for AES key", () => {
