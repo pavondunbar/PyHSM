@@ -64,7 +64,7 @@ memory exhaustion from malicious or buggy clients.
 | Variable                  | Default   | Description                                       |
 |---------------------------|-----------|---------------------------------------------------|
 | `PYHSM_CALLER_SECRET`    | *(none)*  | Shared secret for IPC caller HMAC authentication. |
-| `PYHSM_AUDIT_HMAC_KEY`   | *(auto)*  | Hex-encoded 32-byte key for audit HMAC chain. Auto-generated and stored at `<audit_log_path>.hmackey` if not set. Independent of master password — audit verification survives master password rotation. |
+| `PYHSM_AUDIT_HMAC_KEY`   | *(derived from master password)* | Hex-encoded 32-byte key for audit HMAC chain. When not set, derived automatically from the master password via HKDF (info: `pyhsm-audit-hmac-v1`). No plaintext key file is written to disk. |
 
 ### Tuning
 
@@ -78,7 +78,7 @@ memory exhaustion from malicious or buggy clients.
 
 | Variable                  | Default  | Description                               |
 |---------------------------|----------|-------------------------------------------|
-| `PYHSM_AUDIT_WEBHOOK`    | *(none)* | URL for non-blocking audit event POST (shipped in a background thread/fire-and-forget). |
+| `PYHSM_AUDIT_WEBHOOK`    | *(none)* | URL for non-blocking audit event POST. Each request includes an `X-PyHSM-Signature: sha256=<hex>` header (HMAC-SHA256 of the request body using the audit HMAC key) so receivers can verify authenticity. |
 
 ---
 
@@ -197,8 +197,9 @@ hsm.verifyBackup("/secure/backups/pyhsm-backup-2025-01-01.enc");
 
 ### Audit Log Verification
 
-The audit log uses an independently stored HMAC key (at `<log_path>.hmackey`),
-so verification works even if the master password changes or is unknown:
+The audit HMAC key is derived from the master password via HKDF, so
+verification requires the same master password that was used to write
+the entries:
 
 ```typescript
 const corrupted = hsm.getAuditLog().verify();
@@ -265,15 +266,15 @@ Available metrics:
 
 1. **Key separation**: The keystore uses HKDF-Expand to derive independent encryption and MAC keys from the master key (info strings: `pyhsm-enc-v1`, `pyhsm-mac-v1`). A weakness in one primitive cannot leak the other key.
 
-2. **Per-key wrapping**: Individual keys are wrapped with AES-KWP (RFC 5649) using a KEK derived through the full PBKDF2 → HKDF-Expand path with a dedicated salt stored inside the encrypted keystore. The KEK is cached in memory for the session lifetime (avoiding repeated PBKDF2 on every operation) and zeroized on session close. Even if the decrypted keystore JSON is exposed (e.g., core dump), individual key material remains encrypted. Legacy keystores (pre-salt KEK) are automatically migrated on first open.
+2. **Per-key wrapping**: Individual keys are wrapped with AES-KWP (RFC 5649) using a KEK derived through the full Argon2id → HKDF-Expand path with a dedicated salt stored inside the encrypted keystore. The KEK is cached in memory for the session lifetime (avoiding repeated Argon2id on every operation) and zeroized on session close. Even if the decrypted keystore JSON is exposed (e.g., core dump), individual key material remains encrypted. Legacy keystores (pre-salt KEK or PBKDF2-derived) are automatically migrated on first open.
 
 3. **Memory zeroization**: Key material is stored as mutable `bytearray` (Python) or `Buffer` (TypeScript) with deterministic byte-by-byte zeroization. In the Python layer, key_data is held as `bytearray` in memory (not immutable hex strings), so it can be reliably zeroed on destroy or session close. The master password is stored as a mutable `bytearray` and overwritten on session close. The cached KEK is also zeroized. V8/CPython string immutability means metadata (key IDs, timestamps) is not deterministically clearable.
 
-4. **File permissions**: The keystore is written mode `0o600`. The Unix socket is `chmod 0o600`. The audit HMAC key file is `0o600`.
+4. **File permissions**: The keystore is written mode `0o600`. The Unix socket is `chmod 0o600`.
 
 5. **Tamper detection**: The keystore uses encrypt-then-MAC with separated keys. Any modification to the file triggers a tamper alert, zeroizes all memory, and throws.
 
-6. **KDF**: The async `PyHSM.create()` factory uses Argon2id (64 MB / 3 passes / 4 parallelism). The synchronous constructor falls back to PBKDF2-SHA256 at 480,000 iterations. Both layers then apply HKDF-Expand to derive separate encryption and MAC subkeys.
+6. **KDF**: Both layers use Argon2id (64 MB / 3 passes / 4 parallelism) as the primary key derivation function. The TypeScript async `PyHSM.create()` factory uses Argon2id directly; the synchronous constructor falls back to PBKDF2-SHA256 at 480,000 iterations. The Python layer uses Argon2id via `argon2-cffi` with automatic PBKDF2 fallback if the native extension is unavailable. Both layers then apply HKDF-Expand to derive separate encryption and MAC subkeys. Existing PBKDF2-encrypted keystores are automatically detected and re-encrypted with Argon2id on first open.
 
 7. **Nonce safety**: Python uses a hybrid nonce (random + counter + random) that prevents birthday-bound collisions even at high operation volumes. TypeScript uses AES-256-GCM-SIV which is inherently nonce-misuse resistant.
 
@@ -283,7 +284,7 @@ Available metrics:
 
 10. **Constant-time comparisons**: HMAC verification uses `hmac.compare_digest` (Python) and length-padded `crypto.timingSafeEqual` (TypeScript). The TypeScript implementation pads both buffers to the same length before comparison to prevent length-based timing side channels.
 
-11. **Audit log independence**: The audit HMAC key is derived from the master password via HKDF-Expand (info: `pyhsm-audit-hmac-v1`) in the Python layer — no plaintext key file on disk. In the TypeScript layer, it is stored separately at `<log_path>.hmackey` (auto-generated on first use). Can be overridden via `PYHSM_AUDIT_HMAC_KEY` env var in both layers.
+11. **Audit log independence**: The audit HMAC key is derived from the master password via HKDF-Expand (info: `pyhsm-audit-hmac-v1`) in both layers — no plaintext key file is written to disk. Can be overridden via `PYHSM_AUDIT_HMAC_KEY` env var. Webhook POSTs include an `X-PyHSM-Signature: sha256=<hex>` header for receiver-side authenticity verification.
 
 12. **Concurrency (Python)**: Per-key operations (encrypt, decrypt, sign, verify) use sharded locks — operations on different keys execute in parallel. Only lifecycle operations (generate, rotate, destroy) acquire the global lock. The keystore persistence layer (`_save_store`) uses a dedicated save lock to serialize writes, preventing concurrent per-key operations from interleaving their serialize → encrypt → write sequences.
 
@@ -310,6 +311,10 @@ Export a stored key to JWK for use in another system:
 **Python:**
 
 ```python
+# Keys must have allow_export=True in their policy to permit JWK export.
+# This defaults to False — export must be an explicit policy decision.
+hsm.generate_key("my-aes-key", policy={"allow_encrypt": True, "allow_decrypt": True, "allow_export": True})
+
 jwk = hsm.export_jwk("my-aes-key")
 # {"kty": "oct", "k": "...", "alg": "A256GCM", "kid": "my-aes-key"}
 

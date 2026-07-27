@@ -57,6 +57,9 @@ _CT_FORMAT_V1 = 1
 # Maximum plaintext size (64 MB) — prevents OOM denial-of-service
 _MAX_PLAINTEXT_SIZE = 64 * 1024 * 1024
 
+# Minimum master password length (characters)
+_MIN_PASSWORD_LENGTH = 12
+
 
 def _validate_key_id(key_id: str) -> None:
     if not _KEY_ID_RE.match(key_id):
@@ -64,6 +67,27 @@ def _validate_key_id(key_id: str) -> None:
             f"Invalid key ID '{key_id}'. "
             "Must be 1-128 chars, start with alphanumeric, "
             "contain only [a-zA-Z0-9._-]."
+        )
+
+
+def _validate_master_password(password: str) -> None:
+    """Validate master password meets minimum security requirements.
+
+    Enforces:
+      - Minimum length of 12 characters (NIST SP 800-63B recommendation)
+      - Not all same character (degenerate input)
+
+    Raises ValueError if the password is too weak.
+    """
+    if len(password) < _MIN_PASSWORD_LENGTH:
+        raise ValueError(
+            f"PyHSM: master password too short ({len(password)} chars). "
+            f"Minimum length is {_MIN_PASSWORD_LENGTH} characters. "
+            "Use a strong passphrase for production deployments."
+        )
+    if len(set(password)) == 1:
+        raise ValueError(
+            "PyHSM: master password must not be a single repeated character."
         )
 
 
@@ -80,6 +104,7 @@ class PyHSM:
     master_password : str
         Master password used to derive the keystore encryption key.
         Must be explicitly provided — there is no default.
+        Must be at least 12 characters (NIST SP 800-63B).
     audit_log_path : str, optional
         Path for the HMAC-chained audit log. Defaults to
         <storage_path>.audit.jsonl.
@@ -90,6 +115,9 @@ class PyHSM:
         Maximum operations per key per rate window. Default 100.
     rate_limit_window_s : float, optional
         Rate-limit window in seconds. Default 60.
+    skip_password_validation : bool, optional
+        If True, skip password strength checks. Only use this for
+        testing or migration scenarios. Default False.
 
     Notes
     -----
@@ -108,12 +136,16 @@ class PyHSM:
         session_timeout_s: float = 300.0,
         rate_limit_max_ops: int = 100,
         rate_limit_window_s: float = 60.0,
+        skip_password_validation: bool = False,
     ) -> None:
         if not master_password:
             raise ValueError(
                 "PyHSM: master_password is required. "
                 "There is no insecure default — supply an explicit password."
             )
+
+        if not skip_password_validation:
+            _validate_master_password(master_password)
 
         self._storage_path = storage_path
         self._session_timeout_s = session_timeout_s
@@ -153,6 +185,31 @@ class PyHSM:
         self._start_timeout_thread()
         self._audit.record("sessionOpen", success=True)
         self._update_key_metrics()
+
+        # Register atexit handler to ensure key material is zeroized
+        # even if close_session() is never called explicitly.
+        import atexit
+        self._atexit_registered = True
+        atexit.register(self._atexit_cleanup)
+
+    # ------------------------------------------------------------------
+    # Context manager support
+    # ------------------------------------------------------------------
+
+    def __enter__(self) -> "PyHSM":
+        """Support use as a context manager: ``with PyHSM(...) as hsm:``"""
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        """Close the session and zeroize key material on context exit."""
+        self.close_session()
+
+    def _atexit_cleanup(self) -> None:
+        """Best-effort cleanup at interpreter exit."""
+        try:
+            self.close_session()
+        except Exception:
+            pass
 
 
     # ------------------------------------------------------------------
@@ -748,16 +805,48 @@ class PyHSM:
         Export a key as a JWK (JSON Web Key, RFC 7517).
 
         Unwraps the stored key material and converts to standard JWK format.
-        Supports AES, EC, and RSA key types.
+        Supports AES, EC, Ed25519, and RSA key types.
+
+        Requires the key's policy to have ``allow_export: True`` (defaults
+        to False for security). This ensures keys cannot be extracted
+        without an explicit policy decision at generation time.
 
         WARNING: The returned dict contains raw private key material.
         Handle with care and zeroize after use.
+
+        Raises
+        ------
+        ValueError
+            If the key's policy does not permit export.
         """
         with self._key_lock(key_id):
             self._assert_session()
             _validate_key_id(key_id)
             entry = self._store.load_key(key_id)
             key_type = entry["key_type"]
+
+            # Policy gate: export must be explicitly allowed
+            policy = entry.get("policy", {})
+            if not policy.get("allow_export", False):
+                self._audit.record(
+                    "exportKeyDenied", key_id=key_id, caller_id=caller_id,
+                    success=False, reason="policy denies export (allow_export is not True)"
+                )
+                raise ValueError(
+                    f"PyHSM: key '{key_id}' policy denies export. "
+                    "Set allow_export=True in the key policy to permit JWK export."
+                )
+
+            # Caller ACL check (if configured)
+            allowed_callers = policy.get("allowed_callers")
+            if allowed_callers and caller_id not in allowed_callers:
+                self._audit.record(
+                    "exportKeyDenied", key_id=key_id, caller_id=caller_id,
+                    success=False, reason=f"caller '{caller_id}' not in allowed_callers"
+                )
+                raise ValueError(
+                    f"PyHSM: caller '{caller_id}' is not authorized for key '{key_id}'"
+                )
 
             # Get current version's key material
             current = next(
@@ -771,19 +860,22 @@ class PyHSM:
 
             try:
                 if key_type.startswith("aes"):
-                    return export_symmetric_jwk(raw_key, key_id=key_id)
+                    result = export_symmetric_jwk(raw_key, key_id=key_id)
                 elif key_type == "ed25519":
-                    return export_ed25519_jwk(raw_key, key_id=key_id)
+                    result = export_ed25519_jwk(raw_key, key_id=key_id)
                 elif key_type.startswith("ec"):
-                    return export_ec_jwk(raw_key, key_id=key_id)
+                    result = export_ec_jwk(raw_key, key_id=key_id)
                 elif key_type.startswith("rsa"):
-                    return export_rsa_jwk(raw_key, key_id=key_id)
+                    result = export_rsa_jwk(raw_key, key_id=key_id)
                 else:
                     raise ValueError(f"Unsupported key type for JWK export: {key_type}")
             finally:
                 # Best-effort zeroize raw key bytes
                 if isinstance(raw_key, bytearray):
                     zeroize_bytearray(raw_key)
+
+            self._audit.record("exportKey", key_id=key_id, caller_id=caller_id, success=True)
+            return result
 
     def import_key_jwk(
         self,

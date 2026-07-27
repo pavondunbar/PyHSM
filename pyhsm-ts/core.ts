@@ -81,7 +81,11 @@ export class PyHSM {
   private sessionTimer: ReturnType<typeof setTimeout> | null = null;
   private sessionTimeoutMs!: number;
 
-  // Derived key cache — persists across save/load within a session
+  // Derived key cache — persists across save/load within a session.
+  // The master derived key is the expensive output of Argon2id/PBKDF2.
+  // It is computed once and reused for subkey derivation via HKDF.
+  // The salt is fixed per session; per-write uniqueness is provided by
+  // the fresh GCM nonce (12 random bytes) generated on every save.
   private _cachedDerivedKey: Buffer | null = null;
   private _cachedSalt: Buffer | null = null;
 
@@ -186,7 +190,11 @@ export class PyHSM {
 
     // Initialize sub-modules
     const auditPath = config.auditLogPath || config.storePath + ".audit.jsonl";
-    this.audit = new AuditLog(auditPath);
+    // Derive audit HMAC key from master password via HKDF (matches Python layer)
+    const auditHmacKey = Buffer.from(
+      crypto.hkdfSync("sha256", this.masterPasswordBuf, Buffer.alloc(0), "pyhsm-audit-hmac-v1", 32)
+    );
+    this.audit = new AuditLog(auditPath, undefined, auditHmacKey);
     this.rateLimiter = new RateLimiter(
       parseInt(process.env.PYHSM_RATE_LIMIT || "100", 10),
       parseInt(process.env.PYHSM_RATE_WINDOW_MS || "60000", 10),
@@ -481,11 +489,20 @@ export class PyHSM {
   }
 
   private save(): void {
-    // Reuse cached salt so the Argon2id derived key remains valid
+    // Use the session salt for the outer envelope. The salt's purpose is to
+    // ensure different keystores (different master passwords) produce different
+    // derived keys — it provides brute-force resistance, not per-write freshness.
+    // Per-write uniqueness is guaranteed by the random GCM nonce (12 bytes),
+    // which is freshly generated on every save. This means even with the same
+    // salt, every persisted envelope has unique ciphertext.
+    //
+    // The salt is fixed per session to maintain compatibility with the Argon2id
+    // async factory path (where the expensive Argon2id derivation is cached).
+    // For PBKDF2 (sync) sessions, a fresh salt was generated at init time.
     const salt = this._cachedSalt ? Buffer.from(this._cachedSalt) : crypto.randomBytes(SALT_LEN);
     const { encKey, macKey } = this.deriveSubkeys(salt);
 
-    // Update cache if we generated a new salt (PBKDF2 fallback path)
+    // Cache salt if this is the first save (sync constructor path)
     if (!this._cachedSalt) {
       this._cachedSalt = Buffer.from(salt);
     }

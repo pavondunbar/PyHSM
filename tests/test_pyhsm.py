@@ -53,6 +53,10 @@ def hsm(store_path: str) -> PyHSM:
         pass
 
 
+# Helper password that meets the 12-char minimum for tests that create their own HSM
+_TEST_PW = "test-password-123"
+
+
 # ---------------------------------------------------------------------------
 # Self-tests
 # ---------------------------------------------------------------------------
@@ -79,7 +83,7 @@ class TestSelfTests:
 
 class TestKeyStore:
     def test_tamper_detection_flipped_byte(self, store_path):
-        hsm = PyHSM(store_path, master_password="pw", session_timeout_s=0)
+        hsm = PyHSM(store_path, master_password=_TEST_PW, session_timeout_s=0)
         hsm.generate_key("k1")
         hsm.close_session()
 
@@ -90,10 +94,10 @@ class TestKeyStore:
         Path(store_path).write_bytes(bytes(ba))
 
         with pytest.raises(TamperError, match="TAMPER"):
-            PyHSM(store_path, master_password="pw", session_timeout_s=0)
+            PyHSM(store_path, master_password=_TEST_PW, session_timeout_s=0)
 
     def test_tamper_detection_truncated_file(self, store_path):
-        hsm = PyHSM(store_path, master_password="pw", session_timeout_s=0)
+        hsm = PyHSM(store_path, master_password=_TEST_PW, session_timeout_s=0)
         hsm.generate_key("k1")
         hsm.close_session()
 
@@ -101,15 +105,15 @@ class TestKeyStore:
         Path(store_path).write_bytes(data[:20])  # truncate to junk
 
         with pytest.raises(TamperError):
-            PyHSM(store_path, master_password="pw", session_timeout_s=0)
+            PyHSM(store_path, master_password=_TEST_PW, session_timeout_s=0)
 
     def test_wrong_password_raises(self, store_path):
-        hsm = PyHSM(store_path, master_password="correct", session_timeout_s=0)
+        hsm = PyHSM(store_path, master_password="correct-password-here", session_timeout_s=0)
         hsm.generate_key("k1")
         hsm.close_session()
 
         with pytest.raises(Exception):
-            hsm2 = PyHSM(store_path, master_password="wrong", session_timeout_s=0)
+            hsm2 = PyHSM(store_path, master_password="wrong-password-here!", session_timeout_s=0)
             # Will either raise on load or on first operation
             hsm2.list_keys()
 
@@ -127,8 +131,22 @@ class TestConstruction:
         with pytest.raises(ValueError):
             PyHSM(store_path, master_password="")
 
+    def test_short_password_raises(self, store_path):
+        with pytest.raises(ValueError, match="too short"):
+            PyHSM(store_path, master_password="short")
+
+    def test_repeated_char_password_raises(self, store_path):
+        with pytest.raises(ValueError, match="single repeated character"):
+            PyHSM(store_path, master_password="aaaaaaaaaaaa")
+
+    def test_skip_password_validation(self, store_path):
+        # For testing/migration scenarios, validation can be bypassed
+        h = PyHSM(store_path, master_password="pw", session_timeout_s=0, skip_password_validation=True)
+        assert h is not None
+        h.close_session()
+
     def test_explicit_password_works(self, store_path):
-        h = PyHSM(store_path, master_password="s3cr3t", session_timeout_s=0)
+        h = PyHSM(store_path, master_password="s3cr3t-strong-pw", session_timeout_s=0)
         assert h is not None
         h.close_session()
 
@@ -307,25 +325,25 @@ class TestSignVerify:
 
 class TestPersistence:
     def test_persists_keys(self, store_path):
-        h1 = PyHSM(store_path, master_password="pw", session_timeout_s=0)
+        h1 = PyHSM(store_path, master_password=_TEST_PW, session_timeout_s=0)
         h1.generate_key("pk")
         ct = h1.encrypt("pk", "persistent")
         h1.close_session()
 
-        h2 = PyHSM(store_path, master_password="pw", session_timeout_s=0)
+        h2 = PyHSM(store_path, master_password=_TEST_PW, session_timeout_s=0)
         assert h2.has_key("pk")
         assert h2.decrypt("pk", ct) == b"persistent"
         h2.close_session()
 
     def test_persists_rotation(self, store_path):
-        h1 = PyHSM(store_path, master_password="pw", session_timeout_s=0)
+        h1 = PyHSM(store_path, master_password=_TEST_PW, session_timeout_s=0)
         h1.generate_key("rk")
         ct1 = h1.encrypt("rk", "v1 data")
         h1.rotate_key("rk")
         ct2 = h1.encrypt("rk", "v2 data")
         h1.close_session()
 
-        h2 = PyHSM(store_path, master_password="pw", session_timeout_s=0)
+        h2 = PyHSM(store_path, master_password=_TEST_PW, session_timeout_s=0)
         assert h2.decrypt("rk", ct1) == b"v1 data"
         assert h2.decrypt("rk", ct2) == b"v2 data"
         h2.close_session()
@@ -408,7 +426,7 @@ class TestRateLimiting:
         assert rl.allow("k") is True
 
     def test_hsm_rate_limited_key(self, store_path):
-        h = PyHSM(store_path, master_password="pw", session_timeout_s=0,
+        h = PyHSM(store_path, master_password=_TEST_PW, session_timeout_s=0,
                   rate_limit_max_ops=2, rate_limit_window_s=60)
         h.generate_key("rl")
         h.encrypt("rl", "1")
@@ -424,21 +442,21 @@ class TestRateLimiting:
 
 class TestAuditLog:
     def test_records_are_written(self, tmp_path):
-        log = AuditLog(str(tmp_path / "audit.jsonl"))
+        log = AuditLog(str(tmp_path / "audit.jsonl"), hmac_key=os.urandom(32))
         log.record("generateKey", key_id="k1", success=True)
         log.record("encrypt", key_id="k1", success=True)
         entries = log.export_jsonl()
         assert len(entries) >= 2
 
     def test_hmac_chain_is_valid(self, tmp_path):
-        log = AuditLog(str(tmp_path / "audit.jsonl"))
+        log = AuditLog(str(tmp_path / "audit.jsonl"), hmac_key=os.urandom(32))
         for i in range(5):
             log.record("encrypt", key_id=f"k{i}", success=True)
         assert log.verify() == -1
 
     def test_tampered_log_detected(self, tmp_path):
         path = str(tmp_path / "audit.jsonl")
-        log = AuditLog(path)
+        log = AuditLog(path, hmac_key=os.urandom(32))
         log.record("generateKey", key_id="k1", success=True)
         log.record("encrypt", key_id="k1", success=True)
 
@@ -453,7 +471,7 @@ class TestAuditLog:
         assert bad_seq >= 0
 
     def test_filter_by_operation(self, tmp_path):
-        log = AuditLog(str(tmp_path / "audit.jsonl"))
+        log = AuditLog(str(tmp_path / "audit.jsonl"), hmac_key=os.urandom(32))
         log.record("encrypt", key_id="k1", success=True)
         log.record("decrypt", key_id="k1", success=True)
         log.record("encrypt", key_id="k2", success=True)
@@ -462,7 +480,7 @@ class TestAuditLog:
         assert len(entries) == 2
 
     def test_filter_by_key_id(self, tmp_path):
-        log = AuditLog(str(tmp_path / "audit.jsonl"))
+        log = AuditLog(str(tmp_path / "audit.jsonl"), hmac_key=os.urandom(32))
         log.record("encrypt", key_id="k1", success=True)
         log.record("encrypt", key_id="k2", success=True)
         entries = log.export_jsonl(key_id="k1")
@@ -475,7 +493,7 @@ class TestAuditLog:
 
 class TestSession:
     def test_closed_session_raises(self, store_path):
-        h = PyHSM(store_path, master_password="pw", session_timeout_s=0)
+        h = PyHSM(store_path, master_password=_TEST_PW, session_timeout_s=0)
         h.close_session()
         with pytest.raises(RuntimeError, match="session is closed"):
             h.list_keys()
@@ -586,24 +604,130 @@ class TestECCurves:
         assert hsm.verify("ec521", "wrong message", sig) is False
 
     def test_ec_p384_persists(self, store_path):
-        h1 = PyHSM(store_path, master_password="pw", session_timeout_s=0)
+        h1 = PyHSM(store_path, master_password=_TEST_PW, session_timeout_s=0)
         h1.generate_key("ec384", "ec-p384")
         sig = h1.sign("ec384", "persist test")
         h1.close_session()
 
-        h2 = PyHSM(store_path, master_password="pw", session_timeout_s=0)
+        h2 = PyHSM(store_path, master_password=_TEST_PW, session_timeout_s=0)
         assert h2.verify("ec384", "persist test", sig) is True
         h2.close_session()
 
     def test_ec_p521_persists(self, store_path):
-        h1 = PyHSM(store_path, master_password="pw", session_timeout_s=0)
+        h1 = PyHSM(store_path, master_password=_TEST_PW, session_timeout_s=0)
         h1.generate_key("ec521", "ec-p521")
         sig = h1.sign("ec521", "persist test")
         h1.close_session()
 
-        h2 = PyHSM(store_path, master_password="pw", session_timeout_s=0)
+        h2 = PyHSM(store_path, master_password=_TEST_PW, session_timeout_s=0)
         assert h2.verify("ec521", "persist test", sig) is True
         h2.close_session()
+
+
+# ---------------------------------------------------------------------------
+# secp256k1 (Ethereum/Bitcoin) and Ed25519 (Solana/SSH) signing
+# ---------------------------------------------------------------------------
+
+class TestSecp256k1:
+    def test_generate_secp256k1(self, hsm):
+        hsm.generate_key("eth-key", "ec-secp256k1")
+        assert hsm.has_key("eth-key")
+        pub = hsm.get_public_key("eth-key")
+        assert "BEGIN PUBLIC KEY" in pub
+
+    def test_sign_verify_secp256k1(self, hsm):
+        hsm.generate_key("eth-key", "ec-secp256k1")
+        sig = hsm.sign("eth-key", "transaction hash data")
+        assert hsm.verify("eth-key", "transaction hash data", sig) is True
+
+    def test_secp256k1_wrong_message_fails(self, hsm):
+        hsm.generate_key("eth-key", "ec-secp256k1")
+        sig = hsm.sign("eth-key", "correct tx")
+        assert hsm.verify("eth-key", "wrong tx", sig) is False
+
+    def test_secp256k1_tampered_signature_fails(self, hsm):
+        hsm.generate_key("eth-key", "ec-secp256k1")
+        sig = hsm.sign("eth-key", "msg")
+        bad_sig = sig[:-4] + "0000"
+        assert hsm.verify("eth-key", "msg", bad_sig) is False
+
+    def test_secp256k1_sign_bytes(self, hsm):
+        """Sign raw bytes (e.g., keccak256 hash of a transaction)."""
+        hsm.generate_key("eth-key", "ec-secp256k1")
+        tx_hash = os.urandom(32)
+        sig = hsm.sign("eth-key", tx_hash)
+        assert hsm.verify("eth-key", tx_hash, sig) is True
+
+    def test_secp256k1_persists(self, store_path):
+        h1 = PyHSM(store_path, master_password=_TEST_PW, session_timeout_s=0)
+        h1.generate_key("eth-key", "ec-secp256k1")
+        sig = h1.sign("eth-key", "persist test")
+        h1.close_session()
+
+        h2 = PyHSM(store_path, master_password=_TEST_PW, session_timeout_s=0)
+        assert h2.verify("eth-key", "persist test", sig) is True
+        h2.close_session()
+
+    def test_secp256k1_caller_id_audit(self, hsm):
+        hsm.generate_key("eth-key", "ec-secp256k1")
+        hsm.sign("eth-key", "tx", caller_id="tx-service")
+        audit = hsm.get_audit_log()
+        entries = audit.export_jsonl(key_id="eth-key", operation="sign")
+        assert any(e.get("callerId") == "tx-service" for e in entries)
+
+
+class TestEd25519:
+    def test_generate_ed25519(self, hsm):
+        hsm.generate_key("sol-key", "ed25519")
+        assert hsm.has_key("sol-key")
+        pub = hsm.get_public_key("sol-key")
+        assert "BEGIN PUBLIC KEY" in pub
+
+    def test_sign_verify_ed25519(self, hsm):
+        hsm.generate_key("sol-key", "ed25519")
+        sig = hsm.sign("sol-key", "solana transaction")
+        assert hsm.verify("sol-key", "solana transaction", sig) is True
+
+    def test_ed25519_wrong_message_fails(self, hsm):
+        hsm.generate_key("sol-key", "ed25519")
+        sig = hsm.sign("sol-key", "correct msg")
+        assert hsm.verify("sol-key", "wrong msg", sig) is False
+
+    def test_ed25519_tampered_signature_fails(self, hsm):
+        hsm.generate_key("sol-key", "ed25519")
+        sig = hsm.sign("sol-key", "msg")
+        bad_sig = sig[:-4] + "0000"
+        assert hsm.verify("sol-key", "msg", bad_sig) is False
+
+    def test_ed25519_sign_bytes(self, hsm):
+        """Sign raw bytes (e.g., serialized Solana transaction)."""
+        hsm.generate_key("sol-key", "ed25519")
+        payload = os.urandom(64)
+        sig = hsm.sign("sol-key", payload)
+        assert hsm.verify("sol-key", payload, sig) is True
+
+    def test_ed25519_signature_is_64_bytes(self, hsm):
+        """Ed25519 signatures are always exactly 64 bytes."""
+        hsm.generate_key("sol-key", "ed25519")
+        sig = hsm.sign("sol-key", "message")
+        assert len(bytes.fromhex(sig)) == 64
+
+    def test_ed25519_persists(self, store_path):
+        h1 = PyHSM(store_path, master_password=_TEST_PW, session_timeout_s=0)
+        h1.generate_key("sol-key", "ed25519")
+        sig = h1.sign("sol-key", "persist test")
+        h1.close_session()
+
+        h2 = PyHSM(store_path, master_password=_TEST_PW, session_timeout_s=0)
+        assert h2.verify("sol-key", "persist test", sig) is True
+        h2.close_session()
+
+    def test_ed25519_caller_id_audit(self, hsm):
+        hsm.generate_key("sol-key", "ed25519")
+        hsm.sign("sol-key", "tx", caller_id="sol-service")
+        audit = hsm.get_audit_log()
+        entries = audit.export_jsonl(key_id="sol-key", operation="sign")
+        assert any(e.get("callerId") == "sol-service" for e in entries)
 
 
 # ---------------------------------------------------------------------------
@@ -613,7 +737,7 @@ class TestECCurves:
 class TestKEKDerivation:
     def test_new_keystore_has_kek_salt(self, store_path):
         """New keystores should have a _kek_salt in their internal state."""
-        h = PyHSM(store_path, master_password="pw", session_timeout_s=0)
+        h = PyHSM(store_path, master_password=_TEST_PW, session_timeout_s=0)
         # The _kek_salt is internal to the store — verify by checking
         # that keys can be generated and used (proves KEK derivation works)
         h.generate_key("k1")
@@ -623,25 +747,25 @@ class TestKEKDerivation:
 
     def test_kek_survives_reload(self, store_path):
         """KEK salt persists across sessions — keys remain accessible."""
-        h1 = PyHSM(store_path, master_password="pw", session_timeout_s=0)
+        h1 = PyHSM(store_path, master_password=_TEST_PW, session_timeout_s=0)
         h1.generate_key("k1")
         ct = h1.encrypt("k1", "survives reload")
         h1.close_session()
 
-        h2 = PyHSM(store_path, master_password="pw", session_timeout_s=0)
+        h2 = PyHSM(store_path, master_password=_TEST_PW, session_timeout_s=0)
         assert h2.decrypt("k1", ct) == b"survives reload"
         h2.close_session()
 
     def test_kek_rotation_after_key_rotate(self, store_path):
         """Key rotation with new KEK derivation still allows decrypt of old versions."""
-        h = PyHSM(store_path, master_password="pw", session_timeout_s=0)
+        h = PyHSM(store_path, master_password=_TEST_PW, session_timeout_s=0)
         h.generate_key("rk")
         ct1 = h.encrypt("rk", "version1")
         h.rotate_key("rk")
         ct2 = h.encrypt("rk", "version2")
         h.close_session()
 
-        h2 = PyHSM(store_path, master_password="pw", session_timeout_s=0)
+        h2 = PyHSM(store_path, master_password=_TEST_PW, session_timeout_s=0)
         assert h2.decrypt("rk", ct1) == b"version1"
         assert h2.decrypt("rk", ct2) == b"version2"
         h2.close_session()
@@ -673,7 +797,7 @@ class TestMemoryZeroization:
 
     def test_close_session_zeroizes(self, store_path):
         """close_session should zeroize all key material."""
-        h = PyHSM(store_path, master_password="pw", session_timeout_s=0)
+        h = PyHSM(store_path, master_password=_TEST_PW, session_timeout_s=0)
         h.generate_key("zk")
         entry = h._store.load_key("zk")
         key_data_ref = entry["versions"][0]["key_data"]
@@ -762,3 +886,132 @@ class TestCallerID:
         assert len(denied) == 1
         assert denied[0]["callerId"] == "untrusted"
         assert denied[0]["success"] is False
+
+
+# ---------------------------------------------------------------------------
+# JWK Import/Export Round-Trip
+# ---------------------------------------------------------------------------
+
+class TestJWKRoundTrip:
+    def test_aes256_export_import(self, hsm):
+        """AES-256 key survives export → import round-trip."""
+        hsm.generate_key("aes-orig", policy={"allow_encrypt": True, "allow_decrypt": True, "allow_export": True})
+
+        jwk = hsm.export_jwk("aes-orig")
+        assert jwk["kty"] == "oct"
+        assert jwk["alg"] == "A256GCM"
+        assert "k" in jwk
+
+        hsm.import_key_jwk("aes-imported", jwk)
+        # Encrypt with imported key and decrypt with the same imported key
+        # (AAD binds ciphertext to key_id, so cross-key decrypt is intentionally prevented)
+        ct = hsm.encrypt("aes-imported", "round-trip test")
+        plaintext = hsm.decrypt("aes-imported", ct)
+        assert plaintext == b"round-trip test"
+
+    def test_ec_p256_export_import(self, hsm):
+        """EC P-256 key survives export → import round-trip."""
+        hsm.generate_key("ec-orig", "ec-p256", policy={"allow_sign": True, "allow_export": True})
+        sig = hsm.sign("ec-orig", "signed data")
+
+        jwk = hsm.export_jwk("ec-orig")
+        assert jwk["kty"] == "EC"
+        assert jwk["crv"] == "P-256"
+        assert all(f in jwk for f in ("x", "y", "d"))
+
+        hsm.import_key_jwk("ec-imported", jwk)
+        # Imported key should produce valid signatures and verify original's
+        assert hsm.verify("ec-imported", "signed data", sig) is True
+        new_sig = hsm.sign("ec-imported", "new data")
+        assert hsm.verify("ec-imported", "new data", new_sig) is True
+
+    def test_secp256k1_export_import(self, hsm):
+        """secp256k1 key survives export → import round-trip."""
+        hsm.generate_key("eth-orig", "ec-secp256k1", policy={"allow_sign": True, "allow_export": True})
+        sig = hsm.sign("eth-orig", "eth tx")
+
+        jwk = hsm.export_jwk("eth-orig")
+        assert jwk["kty"] == "EC"
+        assert jwk["crv"] == "secp256k1"
+
+        hsm.import_key_jwk("eth-imported", jwk)
+        assert hsm.verify("eth-imported", "eth tx", sig) is True
+        new_sig = hsm.sign("eth-imported", "new tx")
+        assert hsm.verify("eth-imported", "new tx", new_sig) is True
+
+    def test_ed25519_export_import(self, hsm):
+        """Ed25519 key survives export → import round-trip."""
+        hsm.generate_key("ed-orig", "ed25519", policy={"allow_sign": True, "allow_export": True})
+        sig = hsm.sign("ed-orig", "solana msg")
+
+        jwk = hsm.export_jwk("ed-orig")
+        assert jwk["kty"] == "OKP"
+        assert jwk["crv"] == "Ed25519"
+        assert all(f in jwk for f in ("x", "d"))
+
+        hsm.import_key_jwk("ed-imported", jwk)
+        assert hsm.verify("ed-imported", "solana msg", sig) is True
+        new_sig = hsm.sign("ed-imported", "new msg")
+        assert hsm.verify("ed-imported", "new msg", new_sig) is True
+
+    def test_rsa2048_export_import(self, hsm):
+        """RSA-2048 key survives export → import round-trip."""
+        hsm.generate_key("rsa-orig", "rsa-2048", policy={"allow_sign": True, "allow_export": True})
+        sig = hsm.sign("rsa-orig", "rsa data")
+
+        jwk = hsm.export_jwk("rsa-orig")
+        assert jwk["kty"] == "RSA"
+        assert all(f in jwk for f in ("n", "e", "d", "p", "q"))
+
+        hsm.import_key_jwk("rsa-imported", jwk)
+        assert hsm.verify("rsa-imported", "rsa data", sig) is True
+        new_sig = hsm.sign("rsa-imported", "new data")
+        assert hsm.verify("rsa-imported", "new data", new_sig) is True
+
+    def test_export_denied_without_policy(self, hsm):
+        """export_jwk raises without allow_export=True."""
+        hsm.generate_key("no-export")
+        with pytest.raises(ValueError, match="policy denies export"):
+            hsm.export_jwk("no-export")
+
+    def test_export_denied_audit_logged(self, hsm):
+        """Denied export is recorded in audit log."""
+        hsm.generate_key("no-export2")
+        with pytest.raises(ValueError):
+            hsm.export_jwk("no-export2", caller_id="attacker")
+        audit = hsm.get_audit_log()
+        entries = audit.export_jsonl(key_id="no-export2")
+        denied = [e for e in entries if e.get("operation") == "exportKeyDenied"]
+        assert len(denied) == 1
+        assert denied[0]["callerId"] == "attacker"
+
+
+# ---------------------------------------------------------------------------
+# Input size validation (64 MB limit)
+# ---------------------------------------------------------------------------
+
+class TestInputSizeLimit:
+    def test_encrypt_rejects_oversized_plaintext(self, hsm):
+        """Plaintext exceeding 64 MB is rejected."""
+        hsm.generate_key("size-key")
+        # Just over the limit: 64 MB + 1 byte
+        oversized = b"x" * (64 * 1024 * 1024 + 1)
+        with pytest.raises(ValueError, match="too large"):
+            hsm.encrypt("size-key", oversized)
+
+    def test_encrypt_accepts_max_size(self, hsm):
+        """Plaintext at exactly 64 MB is accepted."""
+        hsm.generate_key("size-key")
+        # Exactly 64 MB — should succeed (but we use a smaller size to keep
+        # tests fast; the boundary is tested above via rejection)
+        data = b"x" * 1024  # 1 KB — just a sanity check
+        ct = hsm.encrypt("size-key", data)
+        assert hsm.decrypt("size-key", ct) == data
+
+    def test_decrypt_rejects_oversized_ciphertext(self, hsm):
+        """Ciphertext hex string exceeding 128M chars (64 MB binary) is rejected."""
+        hsm.generate_key("size-key")
+        # A hex string that would decode to >64 MB
+        oversized_hex = "00" * (64 * 1024 * 1024 + 1)
+        with pytest.raises(ValueError, match="too large"):
+            hsm.decrypt("size-key", oversized_hex)

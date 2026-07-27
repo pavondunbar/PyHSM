@@ -3,7 +3,7 @@
  *
  * - Append-only file outside the encrypted keystore
  * - Each entry is HMAC-chained: HMAC(entry + prevHMAC) → tamper-evident
- * - Supports log shipping via optional webhook
+ * - Supports log shipping via optional webhook with HMAC signature
  */
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -18,21 +18,24 @@ export class AuditLog {
   private sequence = 0;
   private webhookUrl: string | null;
 
-  constructor(logPath: string, webhookUrl?: string) {
+  constructor(logPath: string, webhookUrl?: string, hmacKey?: Buffer) {
     this.logPath = logPath;
     this.webhookUrl = webhookUrl || process.env.PYHSM_AUDIT_WEBHOOK || null;
 
-    // HMAC key: from env, or generate a random key and persist it alongside the log
-    const envKey = process.env[HMAC_KEY_ENV];
-    if (envKey) {
-      this.hmacKey = Buffer.from(envKey, "hex");
+    // HMAC key: explicit param > env var. No file fallback — key must be provided.
+    if (hmacKey) {
+      this.hmacKey = hmacKey;
     } else {
-      const keyFile = logPath + ".hmackey";
-      if (fs.existsSync(keyFile)) {
-        this.hmacKey = Buffer.from(fs.readFileSync(keyFile, "utf8").trim(), "hex");
+      const envKey = process.env[HMAC_KEY_ENV];
+      if (envKey) {
+        this.hmacKey = Buffer.from(envKey, "hex");
       } else {
-        this.hmacKey = crypto.randomBytes(32);
-        fs.writeFileSync(keyFile, this.hmacKey.toString("hex"), { mode: 0o600 });
+        throw new Error(
+          "AuditLog: hmacKey is required. Provide it explicitly or set " +
+          "the PYHSM_AUDIT_HMAC_KEY environment variable (hex-encoded " +
+          "32 bytes). When using PyHSM, this is derived automatically " +
+          "from the master password."
+        );
       }
     }
 
@@ -170,10 +173,17 @@ export class AuditLog {
   private async shipToWebhook(entry: AuditEntry): Promise<void> {
     if (!this.webhookUrl) return;
     try {
+      const body = JSON.stringify(entry);
+      const signature = crypto.createHmac("sha256", this.hmacKey)
+        .update(body)
+        .digest("hex");
       await fetch(this.webhookUrl, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(entry),
+        headers: {
+          "Content-Type": "application/json",
+          "X-PyHSM-Signature": `sha256=${signature}`,
+        },
+        body,
         signal: AbortSignal.timeout(5000),
       });
     } catch {

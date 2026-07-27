@@ -414,11 +414,11 @@ describe("AuditLog SIEM export", () => {
 
   beforeEach(() => {
     logPath = `/tmp/pyhsm-audit-test-${crypto.randomBytes(4).toString("hex")}.jsonl`;
-    log = new AuditLog(logPath);
+    log = new AuditLog(logPath, undefined, crypto.randomBytes(32));
   });
 
   afterEach(() => {
-    for (const f of [logPath, logPath + ".hmackey"]) {
+    for (const f of [logPath]) {
       if (fs.existsSync(f)) fs.unlinkSync(f);
     }
   });
@@ -674,6 +674,100 @@ describe("Sign and Verify", () => {
 
       const hsm2 = new PyHSM(makeConfig());
       expect(hsm2.verify("rsa-persist", "persist test", sig)).toBe(true);
+      hsm2.closeSession();
+    });
+  });
+
+  describe("secp256k1 (Ethereum/Bitcoin)", () => {
+    it("generates secp256k1 key", () => {
+      hsm.generateKey("eth-key", "ec-secp256k1");
+      expect(hsm.hasKey("eth-key")).toBe(true);
+      expect(hsm.getPublicKey("eth-key")).toContain("BEGIN PUBLIC KEY");
+    });
+
+    it("signs and verifies a message", () => {
+      hsm.generateKey("eth-key", "ec-secp256k1");
+      const sig = hsm.sign("eth-key", "transaction hash");
+      expect(hsm.verify("eth-key", "transaction hash", sig)).toBe(true);
+    });
+
+    it("verify fails with wrong message", () => {
+      hsm.generateKey("eth-key", "ec-secp256k1");
+      const sig = hsm.sign("eth-key", "correct tx");
+      expect(hsm.verify("eth-key", "wrong tx", sig)).toBe(false);
+    });
+
+    it("verify fails with tampered signature", () => {
+      hsm.generateKey("eth-key", "ec-secp256k1");
+      const sig = hsm.sign("eth-key", "msg");
+      const tampered = sig.slice(0, -4) + "0000";
+      expect(hsm.verify("eth-key", "msg", tampered)).toBe(false);
+    });
+
+    it("signs raw Buffer data", () => {
+      hsm.generateKey("eth-key", "ec-secp256k1");
+      const txHash = crypto.randomBytes(32);
+      const sig = hsm.sign("eth-key", txHash);
+      expect(hsm.verify("eth-key", txHash, sig)).toBe(true);
+    });
+
+    it("persists across sessions", () => {
+      hsm.generateKey("eth-persist", "ec-secp256k1");
+      const sig = hsm.sign("eth-persist", "persist test");
+      hsm.closeSession();
+
+      const hsm2 = new PyHSM(makeConfig());
+      expect(hsm2.verify("eth-persist", "persist test", sig)).toBe(true);
+      hsm2.closeSession();
+    });
+  });
+
+  describe("Ed25519 (Solana/SSH)", () => {
+    it("generates Ed25519 key", () => {
+      hsm.generateKey("sol-key", "ed25519");
+      expect(hsm.hasKey("sol-key")).toBe(true);
+      expect(hsm.getPublicKey("sol-key")).toContain("BEGIN PUBLIC KEY");
+    });
+
+    it("signs and verifies a message", () => {
+      hsm.generateKey("sol-key", "ed25519");
+      const sig = hsm.sign("sol-key", "solana transaction");
+      expect(hsm.verify("sol-key", "solana transaction", sig)).toBe(true);
+    });
+
+    it("verify fails with wrong message", () => {
+      hsm.generateKey("sol-key", "ed25519");
+      const sig = hsm.sign("sol-key", "correct msg");
+      expect(hsm.verify("sol-key", "wrong msg", sig)).toBe(false);
+    });
+
+    it("verify fails with tampered signature", () => {
+      hsm.generateKey("sol-key", "ed25519");
+      const sig = hsm.sign("sol-key", "msg");
+      const tampered = sig.slice(0, -4) + "0000";
+      expect(hsm.verify("sol-key", "msg", tampered)).toBe(false);
+    });
+
+    it("signs raw Buffer data", () => {
+      hsm.generateKey("sol-key", "ed25519");
+      const payload = crypto.randomBytes(64);
+      const sig = hsm.sign("sol-key", payload);
+      expect(hsm.verify("sol-key", payload, sig)).toBe(true);
+    });
+
+    it("signature is 64 bytes", () => {
+      hsm.generateKey("sol-key", "ed25519");
+      const sig = hsm.sign("sol-key", "message");
+      expect(Buffer.from(sig, "hex").length).toBe(64);
+    });
+
+    it("persists across sessions", () => {
+      hsm.generateKey("sol-persist", "ed25519");
+      const sig = hsm.sign("sol-persist", "persist test");
+      hsm.closeSession();
+
+      const hsm2 = new PyHSM(makeConfig());
+      expect(hsm2.verify("sol-persist", "persist test", sig)).toBe(true);
       hsm2.closeSession();
     });
   });

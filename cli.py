@@ -18,6 +18,14 @@ from hsm.shamir import split_secret, reconstruct_secret, zeroize
 
 def get_hsm(args) -> PyHSM:
     password = args.password or getpass.getpass("Master password: ")
+    if args.password:
+        print(
+            "Warning: Using -p/--password exposes the master password in the "
+            "process list (visible via 'ps'). For production use, omit -p and "
+            "enter the password interactively, or use PYHSM_MASTER_PASSWORD "
+            "environment variable.",
+            file=sys.stderr,
+        )
     import os
     is_new = not os.path.exists(args.store)
     hsm = PyHSM(
@@ -74,6 +82,11 @@ def cmd_rotate(args) -> None:
 
 
 def cmd_delete(args) -> None:
+    if not args.yes:
+        confirm = input(f"Destroy key '{args.key_id}'? This cannot be undone. [y/N] ")
+        if confirm.lower() not in ("y", "yes"):
+            print("Aborted.", file=sys.stderr)
+            sys.exit(1)
     hsm = get_hsm(args)
     hsm.destroy_key(args.key_id)
     print(f"Destroyed key: {args.key_id}")
@@ -211,6 +224,7 @@ def main() -> None:
     # delete
     rm = sub.add_parser("delete", parents=[common], help="Destroy a key")
     rm.add_argument("key_id")
+    rm.add_argument("--yes", "-y", action="store_true", help="Skip confirmation prompt")
     rm.set_defaults(func=cmd_delete)
 
     # encrypt

@@ -7,8 +7,10 @@ Encrypted envelope format (binary):
   [48:60]  nonce        (GCM, 12 bytes)
   [60:  ]  AES-256-GCM ciphertext+tag  (plaintext is UTF-8 JSON)
 
-Key separation: the master password is derived via PBKDF2-SHA256 (480k
-iterations), then HKDF-Expand produces two independent 32-byte subkeys:
+Key derivation: the master password is derived via Argon2id (64 MB
+memory-hard, OWASP recommended) with PBKDF2-SHA256 (480k iterations)
+as a fallback when argon2-cffi is unavailable. HKDF-Expand then
+produces independent 32-byte subkeys:
   - Encryption key (info="pyhsm-enc-v1") — used for AES-256-GCM
   - MAC key (info="pyhsm-mac-v1") — used for HMAC-SHA256
   - KEK (info="pyhsm-kek-v1") — used for per-key AES-KWP wrapping
@@ -23,6 +25,9 @@ weakness in one primitive cannot leak information about the other key.
 Persistence is delegated to a StorageBackend implementation. The default
 FileBackend uses atomic writes (temp file + rename), so a crash mid-write
 can never corrupt the live keystore.
+
+Migration: Keystores created with PBKDF2 are automatically detected and
+re-encrypted with Argon2id on first open (when argon2-cffi is available).
 """
 
 from __future__ import annotations
@@ -32,12 +37,19 @@ import hmac as _hmac
 import json
 import os
 import threading
+import warnings
 from typing import Optional
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
 from cryptography.hazmat.primitives import hashes
+
+try:
+    from argon2.low_level import hash_secret_raw, Type
+    _ARGON2_AVAILABLE = True
+except ImportError:
+    _ARGON2_AVAILABLE = False
 
 from .backends import StorageBackend, FileBackend
 from .secure_memory import zeroize_bytearray, zeroize_dict_keys
@@ -47,6 +59,12 @@ _SALT_LEN = 16
 _HMAC_LEN = 32
 _NONCE_LEN = 12
 _KDF_ITERATIONS = 480_000
+
+# Argon2id parameters (OWASP recommended)
+_ARGON2_MEMORY_COST = 65536  # 64 MB
+_ARGON2_TIME_COST = 3
+_ARGON2_PARALLELISM = 4
+_ARGON2_HASH_LEN = 32
 
 
 def _internalize_key_data(keys: dict) -> None:
@@ -147,14 +165,20 @@ class KeyStore:
         self._master_password: bytearray = bytearray(master_password.encode("utf-8"))
         self._save_lock = threading.Lock()  # serializes _save_store calls from concurrent per-key ops
         self._needs_kek_migration = False
+        self._needs_kdf_migration = False
         self._keys: dict = self._load_store()
 
         # Migrate existing keys to new KEK derivation if needed
         if self._needs_kek_migration:
             self._migrate_kek()
 
-        # Cache the KEK for the session lifetime to avoid repeated PBKDF2
-        # derivation (~0.5-1s) on every encrypt/decrypt/sign operation.
+        # Migrate KDF from PBKDF2 to Argon2id if needed (re-save with new KDF)
+        if self._needs_kdf_migration:
+            self._save_store()
+            self._needs_kdf_migration = False
+
+        # Cache the KEK for the session lifetime to avoid repeated key
+        # derivation on every encrypt/decrypt/sign operation.
         # Zeroized in zeroize_memory() when the session closes.
         self._cached_kek: bytearray = self._compute_kek()
 
@@ -221,15 +245,40 @@ class KeyStore:
     # ------------------------------------------------------------------
 
     def _derive_master(self, salt: bytes) -> bytearray:
-        """Derive the intermediate master key from password + salt."""
-        kdf = PBKDF2HMAC(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=salt,
-            iterations=_KDF_ITERATIONS,
-        )
-        derived = kdf.derive(bytes(self._master_password))
-        return bytearray(derived)
+        """Derive the intermediate master key from password + salt.
+
+        Uses Argon2id (64 MB memory-hard, OWASP recommended) as the primary
+        KDF. Falls back to PBKDF2-SHA256 at 480k iterations if argon2-cffi
+        is not installed (e.g., environments where native extensions are
+        unavailable).
+        """
+        if _ARGON2_AVAILABLE:
+            derived = hash_secret_raw(
+                secret=bytes(self._master_password),
+                salt=salt,
+                time_cost=_ARGON2_TIME_COST,
+                memory_cost=_ARGON2_MEMORY_COST,
+                parallelism=_ARGON2_PARALLELISM,
+                hash_len=_ARGON2_HASH_LEN,
+                type=Type.ID,
+            )
+            return bytearray(derived)
+        else:
+            warnings.warn(
+                "PyHSM: argon2-cffi not available, falling back to PBKDF2-SHA256. "
+                "Install argon2-cffi for OWASP-recommended Argon2id key derivation: "
+                "pip install argon2-cffi",
+                UserWarning,
+                stacklevel=2,
+            )
+            kdf = PBKDF2HMAC(
+                algorithm=hashes.SHA256(),
+                length=32,
+                salt=salt,
+                iterations=_KDF_ITERATIONS,
+            )
+            derived = kdf.derive(bytes(self._master_password))
+            return bytearray(derived)
 
     def _derive_subkeys(self, salt: bytes) -> tuple[bytearray, bytearray]:
         """
@@ -239,6 +288,36 @@ class KeyStore:
         Caller is responsible for zeroizing both after use.
         """
         master = self._derive_master(salt)
+
+        enc_key = bytearray(HKDFExpand(
+            algorithm=hashes.SHA256(),
+            length=32,
+            info=b"pyhsm-enc-v1",
+        ).derive(bytes(master)))
+
+        mac_key = bytearray(HKDFExpand(
+            algorithm=hashes.SHA256(),
+            length=32,
+            info=b"pyhsm-mac-v1",
+        ).derive(bytes(master)))
+
+        zeroize_bytearray(master)
+        return enc_key, mac_key
+
+    def _derive_master_pbkdf2(self, salt: bytes) -> bytearray:
+        """Derive master key using PBKDF2 only (for backward-compatible loading)."""
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=_KDF_ITERATIONS,
+        )
+        derived = kdf.derive(bytes(self._master_password))
+        return bytearray(derived)
+
+    def _derive_subkeys_pbkdf2(self, salt: bytes) -> tuple[bytearray, bytearray]:
+        """Derive subkeys using PBKDF2 only (for migrating old keystores)."""
+        master = self._derive_master_pbkdf2(salt)
 
         enc_key = bytearray(HKDFExpand(
             algorithm=hashes.SHA256(),
@@ -308,8 +387,11 @@ class KeyStore:
 
     def _load_store(self) -> dict:
         if not self._backend.exists():
-            # New keystore: generate a dedicated KEK salt
-            return {"_kek_salt": os.urandom(_SALT_LEN).hex()}
+            # New keystore: generate a dedicated KEK salt and mark KDF version
+            return {
+                "_kek_salt": os.urandom(_SALT_LEN).hex(),
+                "_kdf": "argon2id" if _ARGON2_AVAILABLE else "pbkdf2",
+            }
 
         data = self._backend.read()
 
@@ -328,10 +410,28 @@ class KeyStore:
         if not _hmac.compare_digest(stored_hmac, expected_hmac):
             zeroize_bytearray(enc_key)
             zeroize_bytearray(mac_key)
-            raise TamperError(
-                "PyHSM TAMPER DETECTED: HMAC verification failed. "
-                "Keystore may have been modified outside of PyHSM."
-            )
+
+            # Migration path: if Argon2id is available and verification failed,
+            # the keystore may have been created with PBKDF2. Try PBKDF2 derivation.
+            if _ARGON2_AVAILABLE:
+                enc_key, mac_key = self._derive_subkeys_pbkdf2(salt)
+                expected_hmac = _hmac.new(bytes(mac_key), payload, hashlib.sha256).digest()
+                if not _hmac.compare_digest(stored_hmac, expected_hmac):
+                    zeroize_bytearray(enc_key)
+                    zeroize_bytearray(mac_key)
+                    raise TamperError(
+                        "PyHSM TAMPER DETECTED: HMAC verification failed. "
+                        "Keystore may have been modified outside of PyHSM."
+                    )
+                # PBKDF2 load succeeded — mark for KDF migration to Argon2id
+                self._needs_kdf_migration = True
+            else:
+                raise TamperError(
+                    "PyHSM TAMPER DETECTED: HMAC verification failed. "
+                    "Keystore may have been modified outside of PyHSM."
+                )
+        else:
+            self._needs_kdf_migration = False
 
         nonce = payload[:_NONCE_LEN]
         ct_plus_tag = payload[_NONCE_LEN:]
@@ -351,6 +451,12 @@ class KeyStore:
             self._needs_kek_migration = True
         else:
             self._needs_kek_migration = False
+
+        # Update KDF marker
+        if _ARGON2_AVAILABLE:
+            keys["_kdf"] = "argon2id"
+        elif "_kdf" not in keys:
+            keys["_kdf"] = "pbkdf2"
 
         # Convert key_data from hex strings to bytearrays for secure zeroization
         _internalize_key_data(keys)

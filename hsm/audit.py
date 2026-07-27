@@ -28,6 +28,8 @@ _VALID_OPERATIONS = frozenset(
         "destroyKey",
         "rotateKey",
         "archiveKey",
+        "exportKey",
+        "exportKeyDenied",
         "sessionOpen",
         "sessionClose",
         "tamperDetected",
@@ -50,10 +52,14 @@ class AuditLog:
         HMAC-SHA256(key, json(entry_without_hmac) + prev_hmac_hex)
 
     The HMAC key is resolved with the following priority:
-      1. Explicit ``hmac_key`` parameter (recommended: derived from master password)
+      1. Explicit ``hmac_key`` parameter (required for production use)
       2. PYHSM_AUDIT_HMAC_KEY environment variable (hex-encoded 32 bytes)
-      3. Persisted key file at <log_path>.hmackey (mode 0o600)
-      4. Auto-generated random key (written to key file)
+
+    When used through the PyHSM class, the HMAC key is automatically
+    derived from the master password via HKDF — no manual configuration
+    is needed.
+
+    Raises ValueError if no HMAC key is provided via either method.
     """
 
     def __init__(self, log_path: str, webhook_url: Optional[str] = None, *, hmac_key: Optional[bytes] = None) -> None:
@@ -62,7 +68,7 @@ class AuditLog:
         self._last_hmac = "0" * 64
         self._sequence = 0
 
-        # Resolve HMAC key (priority: explicit param > env var > key file > generate)
+        # Resolve HMAC key (priority: explicit param > env var)
         if hmac_key:
             self._hmac_key = hmac_key
         else:
@@ -70,16 +76,12 @@ class AuditLog:
             if env_key:
                 self._hmac_key = bytes.fromhex(env_key)
             else:
-                key_file = log_path + ".hmackey"
-                if os.path.exists(key_file):
-                    with open(key_file, "r") as f:
-                        self._hmac_key = bytes.fromhex(f.read().strip())
-                else:
-                    self._hmac_key = os.urandom(32)
-                    # Write with restricted permissions
-                    fd = os.open(key_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-                    with os.fdopen(fd, "w") as f:
-                        f.write(self._hmac_key.hex())
+                raise ValueError(
+                    "AuditLog: hmac_key is required. Provide it explicitly or set "
+                    "the PYHSM_AUDIT_HMAC_KEY environment variable (hex-encoded "
+                    "32 bytes). When using PyHSM, this is derived automatically "
+                    "from the master password."
+                )
 
         self._load_last_state()
 
@@ -215,6 +217,9 @@ class AuditLog:
         Dispatched in a daemon thread so that webhook latency or failures
         never block HSM operations. If the webhook is unreachable, the
         entry is silently dropped (it's already persisted to the local log).
+
+        Each request includes an X-PyHSM-Signature header containing
+        HMAC-SHA256(hmac_key, body) so the receiver can verify authenticity.
         """
         threading.Thread(
             target=self._do_ship_to_webhook,
@@ -226,10 +231,14 @@ class AuditLog:
         """Actual HTTP POST — runs in a background thread."""
         try:
             data = json.dumps(entry).encode()
+            signature = _hmac.new(self._hmac_key, data, hashlib.sha256).hexdigest()
             req = urllib.request.Request(
                 self.webhook_url,
                 data=data,
-                headers={"Content-Type": "application/json"},
+                headers={
+                    "Content-Type": "application/json",
+                    "X-PyHSM-Signature": f"sha256={signature}",
+                },
                 method="POST",
             )
             urllib.request.urlopen(req, timeout=5)
