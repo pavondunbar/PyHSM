@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import glob
 import json
+import os
 import sys
 
 from hsm import PyHSM
@@ -17,16 +19,8 @@ from hsm.shamir import split_secret, reconstruct_secret, zeroize
 # ---------------------------------------------------------------------------
 
 def get_hsm(args) -> PyHSM:
-    password = args.password or getpass.getpass("Master password: ")
-    if args.password:
-        print(
-            "Warning: Using -p/--password exposes the master password in the "
-            "process list (visible via 'ps'). For production use, omit -p and "
-            "enter the password interactively, or use PYHSM_MASTER_PASSWORD "
-            "environment variable.",
-            file=sys.stderr,
-        )
-    import os
+    """Obtain a PyHSM instance. Password is always entered interactively via getpass."""
+    password = os.environ.get("PYHSM_MASTER_PASSWORD") or getpass.getpass("Master password: ")
     is_new = not os.path.exists(args.store)
     hsm = PyHSM(
         storage_path=args.store,
@@ -151,6 +145,35 @@ def cmd_reconstruct(args) -> None:
         zeroize(secret)
 
 
+def cmd_stores(args) -> None:
+    """List keystore (.enc) files in the current directory or a specified path."""
+    search_dir = args.directory or "."
+    search_dir = os.path.abspath(search_dir)
+
+    if not os.path.isdir(search_dir):
+        print(f"Error: '{search_dir}' is not a directory.", file=sys.stderr)
+        sys.exit(1)
+
+    pattern = os.path.join(search_dir, "*.enc")
+    keystores = sorted(glob.glob(pattern))
+
+    if not keystores:
+        print(f"No keystores (*.enc) found in: {search_dir}")
+        return
+
+    print(f"Keystores in {search_dir}:\n")
+    for ks in keystores:
+        filename = os.path.basename(ks)
+        size = os.path.getsize(ks)
+        if size < 1024:
+            size_str = f"{size} B"
+        elif size < 1024 * 1024:
+            size_str = f"{size / 1024:.1f} KB"
+        else:
+            size_str = f"{size / (1024 * 1024):.1f} MB"
+        print(f"  {filename:40s}  {size_str}")
+
+
 def cmd_metrics(args) -> None:
     hsm = get_hsm(args)
     if args.prometheus:
@@ -191,14 +214,12 @@ def cmd_audit(args) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(prog="vectorguard-pyhsm", description="PyHSM CLI")
     parser.add_argument("--store", default="keystore.enc", help="Keystore file path")
-    parser.add_argument("--password", "-p", help="Master password (or use prompt)")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    # Shared parent parser for global options — allows --store and -p
+    # Shared parent parser for global options — allows --store
     # to appear before OR after the subcommand.
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--store", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
-    common.add_argument("--password", "-p", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
 
     # generate
     gen = sub.add_parser("generate", parents=[common], help="Generate a new key")
@@ -215,6 +236,12 @@ def main() -> None:
     # list
     ls = sub.add_parser("list", parents=[common], help="List stored keys")
     ls.set_defaults(func=cmd_list)
+
+    # stores
+    stores = sub.add_parser("stores", help="List keystore files (*.enc) in a directory")
+    stores.add_argument("directory", nargs="?", default=None,
+                        help="Directory to search (default: current directory)")
+    stores.set_defaults(func=cmd_stores)
 
     # rotate
     rot = sub.add_parser("rotate", parents=[common], help="Rotate an AES key to a new version")

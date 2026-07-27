@@ -180,78 +180,85 @@ pip install -e .
 
 ### CLI Usage
 
-All commands require `--store` (keystore path) and a master password (minimum 12 characters). The password can be passed via `-p`/`--password` or entered interactively at a prompt (recommended for production — `-p` exposes the password in the process list).
+All commands require `--store` (keystore path) and a master password (minimum 12 characters). The password is always entered interactively via a hidden prompt (never visible in the terminal or process list). For scripting and CI, you can set the `PYHSM_MASTER_PASSWORD` environment variable.
 
-Global flags (`--store`, `-p`) can appear **before or after** the subcommand — put them wherever feels natural:
+The `--store` flag can appear **before or after** the subcommand — put it wherever feels natural:
 
 ```bash
-# These are all equivalent:
-vectorguard-pyhsm --store keystore.enc -p "pw" generate my-key
-vectorguard-pyhsm --store keystore.enc generate my-key -p "pw"
-vectorguard-pyhsm generate my-key --store keystore.enc --password "pw"
+# These are equivalent:
+vectorguard-pyhsm --store keystore.enc generate my-key
+vectorguard-pyhsm generate my-key --store keystore.enc
 ```
 
 If the keystore file does not yet exist, the CLI prints a notice to stderr so you can tell when you're accidentally pointing at the wrong path:
 
 ```
-$ vectorguard-pyhsm --store /wrong/path.enc list -p "pw"
+$ vectorguard-pyhsm --store /wrong/path.enc list
+Master password:
 Created new keystore: /wrong/path.enc
 No keys stored.
 ```
 
 ```bash
-# Generate keys
-vectorguard-pyhsm --store keystore.enc generate my-aes-key --type aes-256 -p "pw"
-vectorguard-pyhsm --store keystore.enc generate my-rsa-key --type rsa-2048 -p "pw"
-vectorguard-pyhsm --store keystore.enc generate my-ec-key  --type ec-p256 -p "pw"
-vectorguard-pyhsm --store keystore.enc generate my-ec384   --type ec-p384 -p "pw"
-vectorguard-pyhsm --store keystore.enc generate my-ec521   --type ec-p521 -p "pw"
-vectorguard-pyhsm --store keystore.enc generate my-secp256k1 --type ec-secp256k1 -p "pw"
-vectorguard-pyhsm --store keystore.enc generate my-ed25519   --type ed25519 -p "pw"
+# List keystore files in the current directory (no password required)
+vectorguard-pyhsm stores
+vectorguard-pyhsm stores /path/to/keystores
+
+# Generate keys (password prompted interactively)
+vectorguard-pyhsm --store keystore.enc generate my-aes-key --type aes-256
+vectorguard-pyhsm --store keystore.enc generate my-rsa-key --type rsa-2048
+vectorguard-pyhsm --store keystore.enc generate my-ec-key  --type ec-p256
+vectorguard-pyhsm --store keystore.enc generate my-ec384   --type ec-p384
+vectorguard-pyhsm --store keystore.enc generate my-ec521   --type ec-p521
+vectorguard-pyhsm --store keystore.enc generate my-secp256k1 --type ec-secp256k1
+vectorguard-pyhsm --store keystore.enc generate my-ed25519   --type ed25519
 
 # Generate a key with a policy
 vectorguard-pyhsm --store keystore.enc generate limited-key \
   --type aes-256 \
   --max-operations 500 \
   --expires-at 2027-01-01T00:00:00Z \
-  --no-decrypt \
-  -p "pw"
+  --no-decrypt
 
-# List keys (shows type, current version, creation date)
-vectorguard-pyhsm --store keystore.enc list -p "pw"
+# List keys in a keystore (shows type, current version, creation date)
+vectorguard-pyhsm --store keystore.enc list
 
 # Encrypt / Decrypt
-vectorguard-pyhsm --store keystore.enc encrypt my-aes-key -d "secret message" -p "pw"
-vectorguard-pyhsm --store keystore.enc decrypt my-aes-key -d <ciphertext-hex> -p "pw"
+vectorguard-pyhsm --store keystore.enc encrypt my-aes-key -d "secret message"
+vectorguard-pyhsm --store keystore.enc decrypt my-aes-key -d <ciphertext-hex>
 
 # Pipe via stdin
-echo "secret message" | vectorguard-pyhsm --store keystore.enc encrypt my-aes-key -p "pw"
+echo "secret message" | vectorguard-pyhsm --store keystore.enc encrypt my-aes-key
 
 # Sign / Verify (uses stored public key for verify — private key never exposed)
-vectorguard-pyhsm --store keystore.enc sign   my-ec-key -d "message to sign" -p "pw"
-vectorguard-pyhsm --store keystore.enc verify my-ec-key "message to sign" <sig-hex> -p "pw"
+vectorguard-pyhsm --store keystore.enc sign   my-ec-key -d "message to sign"
+vectorguard-pyhsm --store keystore.enc verify my-ec-key "message to sign" <sig-hex>
 
 # Export public key (PEM)
-vectorguard-pyhsm --store keystore.enc pubkey my-rsa-key -p "pw"
+vectorguard-pyhsm --store keystore.enc pubkey my-rsa-key
 
 # Rotate an AES key (archives current version, generates new one)
-vectorguard-pyhsm --store keystore.enc rotate my-aes-key -p "pw"
+vectorguard-pyhsm --store keystore.enc rotate my-aes-key
 
 # Destroy a key (zeroizes all versions, removes from store)
 # Requires confirmation; use --yes/-y to skip the prompt
-vectorguard-pyhsm --store keystore.enc delete my-aes-key -p "pw"
-vectorguard-pyhsm --store keystore.enc delete my-aes-key --yes -p "pw"  # skip prompt
+vectorguard-pyhsm --store keystore.enc delete my-aes-key
+vectorguard-pyhsm --store keystore.enc delete my-aes-key --yes  # skip prompt
 
 # Metrics
-vectorguard-pyhsm --store keystore.enc metrics -p "pw"
-vectorguard-pyhsm --store keystore.enc metrics --prometheus -p "pw"
+vectorguard-pyhsm --store keystore.enc metrics
+vectorguard-pyhsm --store keystore.enc metrics --prometheus
 
 # Audit log
-vectorguard-pyhsm --store keystore.enc audit -p "pw"                       # dump all entries
-vectorguard-pyhsm --store keystore.enc audit --verify -p "pw"              # verify HMAC chain
-vectorguard-pyhsm --store keystore.enc audit --operation encrypt -p "pw"   # filter by operation
-vectorguard-pyhsm --store keystore.enc audit --key-id my-aes-key -p "pw"   # filter by key
-vectorguard-pyhsm --store keystore.enc audit --since 2025-01-01T00:00:00Z -p "pw"
+vectorguard-pyhsm --store keystore.enc audit                       # dump all entries
+vectorguard-pyhsm --store keystore.enc audit --verify              # verify HMAC chain
+vectorguard-pyhsm --store keystore.enc audit --operation encrypt   # filter by operation
+vectorguard-pyhsm --store keystore.enc audit --key-id my-aes-key   # filter by key
+vectorguard-pyhsm --store keystore.enc audit --since 2025-01-01T00:00:00Z
+
+# For scripting/CI, set password via environment variable:
+export PYHSM_MASTER_PASSWORD="your-master-password"
+vectorguard-pyhsm --store keystore.enc list
 ```
 
 ### Python Library Usage
@@ -402,6 +409,7 @@ The `StorageBackend` interface deals only with raw encrypted bytes — all encry
 
 | Variable | Default | Description |
 |---|---|---|
+| `PYHSM_MASTER_PASSWORD` | *(none)* | Master password for the CLI. When set, the CLI uses this instead of prompting interactively. Useful for scripting and CI. |
 | `PYHSM_LOG_LEVEL` | `WARNING` | Structured log verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. Set to `INFO` in production for operational visibility. |
 | `PYHSM_ALLOW_PBKDF2_FALLBACK` | `0` (disabled) | Set to `1` to permit degraded PBKDF2 key derivation when `argon2-cffi` is unavailable. **Testing/migration only — never set in production.** |
 | `PYHSM_AUDIT_HMAC_KEY` | *(derived from master password)* | Hex-encoded 32-byte key for audit HMAC chain. When not set, derived automatically from the master password via HKDF. |

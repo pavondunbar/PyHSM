@@ -84,6 +84,7 @@ memory exhaustion from malicious or buggy clients.
 
 | Variable                        | Default     | Description                                                                                       |
 |---------------------------------|-------------|---------------------------------------------------------------------------------------------------|
+| `PYHSM_MASTER_PASSWORD`        | *(none)*    | Master password for the Python CLI. When set, the CLI uses this instead of prompting interactively. Useful for scripting and CI. The `-p`/`--password` command-line flag has been removed to prevent password exposure in the process list. |
 | `PYHSM_LOG_LEVEL`              | `WARNING`   | Structured JSON log verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. Set to `INFO` in production for operational visibility. |
 | `PYHSM_ALLOW_PBKDF2_FALLBACK`  | `0`         | Set to `1` to permit degraded PBKDF2 key derivation when `argon2-cffi` is unavailable. **Testing/migration only — never set in production.** |
 

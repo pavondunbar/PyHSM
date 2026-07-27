@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: vectorguard-pyhsm
-Version: 1.5.0
+Version: 1.6.0
 Summary: Production-grade software Key Management Service (KMS) — key lifecycle, authenticated encryption, digital signing, and tamper-evident audit logging.
 Author: Pavon Dunbar
 License-Expression: MIT
@@ -25,6 +25,7 @@ Requires-Dist: cryptography<48.0.0,>=43.0.0
 Requires-Dist: argon2-cffi<25.0.0,>=23.1.0
 Provides-Extra: dev
 Requires-Dist: pytest<9.0.0,>=8.0.0; extra == "dev"
+Requires-Dist: pytest-cov<7.0.0,>=6.0.0; extra == "dev"
 Dynamic: license-file
 
 # PyHSM
@@ -69,7 +70,11 @@ Most applications that need key management face a difficult choice: implement it
 - Ed25519 (EdDSA) signing for high-performance, compact signatures (Solana, Cosmos, SSH keys)
 - secp256k1 support for Ethereum, Bitcoin, and EVM-compatible blockchain transaction signing
 - Fully typed Python API (PEP 561 `py.typed` marker included)
-- 206 tests across both layers
+- JSON-structured logging for production observability (SIEM-ready)
+- Concurrency stress-tested (16 threads, data integrity proofs)
+- 80%+ code coverage enforced in CI
+- Reproducible builds via pinned dependency lockfile
+- 214 tests across both layers
 
 ---
 
@@ -195,8 +200,12 @@ pip install vectorguard-pyhsm
 # Or install from source (with pyproject.toml)
 pip install .
 
-# For development (includes pytest)
+# For development (includes pytest + pytest-cov)
 pip install ".[dev]"
+
+# For reproducible builds (CI and production deployments)
+pip install -r requirements.lock
+pip install -e .
 ```
 
 ### CLI Usage
@@ -419,6 +428,37 @@ store = KeyStore(master_password="pw", backend=MemoryBackend())
 
 The `StorageBackend` interface deals only with raw encrypted bytes — all encryption, HMAC verification, and key management logic stays in `KeyStore`. Backends never see plaintext key material.
 
+### Python Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `PYHSM_LOG_LEVEL` | `WARNING` | Structured log verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. Set to `INFO` in production for operational visibility. |
+| `PYHSM_ALLOW_PBKDF2_FALLBACK` | `0` (disabled) | Set to `1` to permit degraded PBKDF2 key derivation when `argon2-cffi` is unavailable. **Testing/migration only — never set in production.** |
+| `PYHSM_AUDIT_HMAC_KEY` | *(derived from master password)* | Hex-encoded 32-byte key for audit HMAC chain. When not set, derived automatically from the master password via HKDF. |
+| `PYHSM_AUDIT_WEBHOOK` | *(none)* | URL for non-blocking audit event POST. Webhook failures are logged (not silently dropped). |
+
+### Structured Logging
+
+PyHSM outputs JSON-structured logs via Python's stdlib `logging` module. Every log line is a single JSON object with consistent fields for machine parsing:
+
+```json
+{"timestamp": "2026-01-15T10:30:00.123456+00:00", "level": "INFO", "logger": "hsm.core", "message": "key generated", "event": "generate_key", "key_id": "my-key", "key_type": "aes-256"}
+```
+
+Configure from your application:
+
+```python
+import logging
+
+# See all PyHSM operational events
+logging.getLogger("hsm").setLevel(logging.INFO)
+
+# Or via environment variable before import:
+# export PYHSM_LOG_LEVEL=INFO
+```
+
+Logged events include: `session_open`, `session_close`, `self_test_pass`, `self_test_fail`, `generate_key`, `rotate_key`, `destroy_key`, `encrypt`, `decrypt`, `sign`, `access_denied`, `rate_limited`, `tamper_detected`, `kdf_migration`, `webhook_failure`.
+
 ### Python Architecture
 
 ```
@@ -426,12 +466,13 @@ hsm/
   core.py           — PyHSM class: key lifecycle, encrypt/decrypt, sign/verify,
                       per-key AES-KWP wrapping, AAD binding, hybrid nonce,
                       per-key sharded locks, caller_id ACL enforcement
-  storage.py        — KeyStore: Argon2id (primary) / PBKDF2 (fallback) key derivation,
+  storage.py        — KeyStore: Argon2id (required) key derivation,
                       HKDF key separation (enc/mac/kek subkeys),
                       AES-256-GCM + HMAC-SHA256, cached KEK, pluggable StorageBackend,
                       bytearray key_data for deterministic zeroization, auto-migration
                       from PBKDF2 to Argon2id
   backends.py       — StorageBackend ABC, FileBackend (atomic writes), MemoryBackend
+  logging.py        — JSON-structured logging via stdlib (machine-parseable, SIEM-ready)
   secure_memory.py  — SecureBytes: deterministic bytearray zeroization, context manager
   jwk.py            — JWK (RFC 7517) import/export: oct, EC (P-256/P-384/P-521/secp256k1), OKP (Ed25519), RSA
   shamir.py         — Shamir secret sharing over GF(256)
@@ -443,7 +484,8 @@ hsm/
   py.typed          — PEP 561 marker for type checker support
 cli.py              — Full-featured command-line interface
 tests/
-  test_pyhsm.py     — 112 pytest tests
+  test_pyhsm.py     — 112 pytest tests (unit + integration)
+  test_concurrency.py — 8 concurrency stress tests (16 threads, data integrity proofs)
 ```
 
 ---
@@ -452,7 +494,7 @@ tests/
 
 A production-hardened Node.js library in `./pyhsm-ts/` with additional features: Argon2id KDF, AES-256-GCM-SIV (nonce-misuse resistant), SecureBuffer zeroization, and process isolation mode.
 
-Both layers now use Argon2id as the primary key derivation function (OWASP recommended, 64 MB memory-hard). The Python layer falls back to PBKDF2-SHA256 at 480,000 iterations only if `argon2-cffi` is unavailable.
+Both layers now use Argon2id as the primary key derivation function (OWASP recommended, 64 MB memory-hard). The Python layer **requires** `argon2-cffi` and will refuse to start without it. A PBKDF2-SHA256 fallback (480,000 iterations) is available only when `PYHSM_ALLOW_PBKDF2_FALLBACK=1` is set (for testing/migration scenarios only — not for production).
 
 ### TypeScript Installation
 
@@ -842,9 +884,9 @@ const sig = await client.encrypt("eth-wallet", txHash);
 | Keys encrypted at rest | AES-256-GCM + AAD binding (Python) / AES-256-GCM-SIV (TypeScript) |
 | Per-key double encryption | AES-KWP RFC 5649 wrapping in both layers — keys encrypted inside the encrypted envelope |
 | Keystore tamper detection | Encrypt-then-MAC with separated keys (HKDF-derived enc + mac subkeys) |
-| Key derivation | PBKDF2-SHA256 480k iter → HKDF-Expand (Python) / Argon2id 64MB → HKDF-Expand (TypeScript async) |
+| Key derivation | Argon2id 64MB (required, Python + TypeScript) → HKDF-Expand. PBKDF2-SHA256 480k iter available only via explicit env var escape hatch for testing |
 | Key separation | HKDF-Expand with distinct info strings (`pyhsm-enc-v1`, `pyhsm-mac-v1`, `pyhsm-kek-v1`) — encryption, MAC, and KEK keys are cryptographically independent |
-| KEK derivation | Dedicated salt stored inside encrypted keystore → PBKDF2 → HKDF-Expand. KEK is cached in memory for session lifetime and zeroized on close |
+| KEK derivation | Dedicated salt stored inside encrypted keystore → Argon2id → HKDF-Expand. KEK is cached in memory for session lifetime and zeroized on close |
 | Memory zeroization | Key material stored as mutable `bytearray` (Python) / `Buffer` (TypeScript) with deterministic in-place zeroing. Immutable hex strings eliminated from memory path |
 | Nonce safety | Hybrid nonce: random(4) + counter(4) + random(4) eliminates birthday-bound (Python); AES-256-GCM-SIV nonce-misuse resistant (TypeScript) |
 | Ciphertext binding | AAD ties ciphertext to key_id + version — prevents cross-key confusion attacks |
@@ -865,6 +907,7 @@ const sig = await client.encrypt("eth-wallet", txHash);
 | EC curve support | P-256 (SHA-256), P-384 (SHA-384), P-521 (SHA-512), secp256k1 (SHA-256) — NIST/SEC recommended hash pairing |
 | EdDSA support | Ed25519 signing — high-performance 64-byte signatures (Solana, Cosmos, SSH keys) |
 | Type safety | PEP 561 `py.typed` marker; `str | bytes` annotations on public API |
+| Observability | JSON-structured logging via stdlib `logging`; configurable via `PYHSM_LOG_LEVEL` env var; webhook failures logged (not silently dropped) |
 
 **Honest scope statement:** PyHSM is a software KMS. It does not carry FIPS 140-2/3 validation (which requires NIST laboratory certification of the specific binary). It does not provide the physical tamper evidence of a hardware HSM. Key material is protected by OS-level process boundaries, not a secure enclave or physically separate processor. For regulated environments that mandate certified hardware, use a certified HSM; PyHSM is appropriate where software key management is acceptable.
 
@@ -901,8 +944,19 @@ See [docs/FAQ.md](docs/FAQ.md) for detailed answers to common architecture and s
 **Python (pytest):**
 
 ```bash
+# Run all tests with coverage
 python -m pytest tests/ -v
-# 112 tests
+# 120 tests (112 unit/integration + 8 concurrency stress tests)
+
+# Coverage report (80% minimum threshold enforced in CI)
+python -m pytest tests/ --cov=hsm --cov-report=term-missing --cov-fail-under=80
+```
+
+**Reproducible installs** use the pinned lockfile:
+
+```bash
+pip install -r requirements.lock
+pip install -e .
 ```
 
 **TypeScript (vitest):**
@@ -913,7 +967,7 @@ npm test
 # 94 tests
 ```
 
-**CI** runs both suites on every push and pull request, across Python 3.11/3.12/3.13 and Node.js 20. See `.github/workflows/ci.yml`.
+**CI** runs both suites on every push and pull request, across Python 3.11/3.12/3.13 and Node.js 20. Coverage is enforced at 80% minimum. See `.github/workflows/ci.yml`.
 
 ---
 

@@ -7,6 +7,7 @@ hsm/audit.py
 hsm/backends.py
 hsm/core.py
 hsm/jwk.py
+hsm/logging.py
 hsm/metrics.py
 hsm/py.typed
 hsm/rate_limiter.py
@@ -14,6 +15,7 @@ hsm/secure_memory.py
 hsm/self_test.py
 hsm/shamir.py
 hsm/storage.py
+tests/test_concurrency.py
 tests/test_pyhsm.py
 vectorguard_pyhsm.egg-info/PKG-INFO
 vectorguard_pyhsm.egg-info/SOURCES.txt
