@@ -36,6 +36,7 @@ from .rate_limiter import RateLimiter
 from .metrics import MetricsCollector
 from .self_test import run_self_tests
 from .secure_memory import SecureBytes, zeroize_bytearray
+from .logging import get_logger
 from .jwk import (
     export_symmetric_jwk,
     export_ec_jwk,
@@ -46,6 +47,8 @@ from .jwk import (
 
 # Key ID validation: 1-128 chars, start alphanumeric, body [a-zA-Z0-9._-]
 _KEY_ID_RE = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9._\-]{0,127}$')
+
+_logger = get_logger(__name__)
 
 # Ciphertext version prefix length (4 bytes big-endian uint32)
 _VERSION_PREFIX_LEN = 4
@@ -169,8 +172,10 @@ class PyHSM:
         try:
             run_self_tests()
             self._audit.record("selfTestPass", success=True)
+            _logger.info("self-tests passed", extra={"event": "self_test_pass"})
         except RuntimeError as exc:
             self._audit.record("selfTestFail", success=False, reason=str(exc))
+            _logger.critical("self-tests FAILED", extra={"event": "self_test_fail", "error": str(exc)})
             raise
 
         self._store = KeyStore(storage_path, master_password)
@@ -185,6 +190,13 @@ class PyHSM:
         self._start_timeout_thread()
         self._audit.record("sessionOpen", success=True)
         self._update_key_metrics()
+
+        _logger.info("session opened", extra={
+            "event": "session_open",
+            "storage_path": storage_path,
+            "session_timeout_s": session_timeout_s,
+            "rate_limit_max_ops": rate_limit_max_ops,
+        })
 
         # Register atexit handler to ensure key material is zeroized
         # even if close_session() is never called explicitly.
@@ -259,6 +271,7 @@ class PyHSM:
         self._audit.record("sessionClose", success=True)
         self._store.zeroize_memory()
         self._session_active = False
+        _logger.info("session closed", extra={"event": "session_close"})
 
     def _update_key_metrics(self) -> None:
         all_keys = self._store.load_all()
@@ -323,6 +336,10 @@ class PyHSM:
         if allowed_callers and caller_id not in allowed_callers:
             self._audit.record("accessDenied", key_id=key_id, caller_id=caller_id, success=False,
                                reason=f"caller '{caller_id}' not in allowed_callers")
+            _logger.warning("access denied", extra={
+                "event": "access_denied", "key_id": key_id,
+                "caller_id": caller_id, "reason": "caller not in allowed_callers",
+            })
             raise ValueError(
                 f"PyHSM: caller '{caller_id}' is not authorized for key '{key_id}'"
             )
@@ -353,6 +370,10 @@ class PyHSM:
         if not self._rate_limiter.allow(key_id):
             self._metrics.record_rate_limit()
             self._audit.record("rateLimited", key_id=key_id, caller_id=caller_id, success=False)
+            _logger.warning("rate limited", extra={
+                "event": "rate_limited", "key_id": key_id,
+                "caller_id": caller_id, "operation": operation,
+            })
             raise ValueError(f"PyHSM: key '{key_id}' is rate-limited")
 
     # ------------------------------------------------------------------
@@ -433,6 +454,10 @@ class PyHSM:
             self._store.save_key(key_id, entry)
             self._audit.record("generateKey", key_id=key_id, caller_id=caller_id, success=True)
             self._update_key_metrics()
+            _logger.info("key generated", extra={
+                "event": "generate_key", "key_id": key_id,
+                "key_type": key_type, "caller_id": caller_id,
+            })
             return key_id
 
 
@@ -474,6 +499,10 @@ class PyHSM:
             self._store.update_key(key_id, entry)
             self._audit.record("rotateKey", key_id=key_id, caller_id=caller_id, success=True)
             self._update_key_metrics()
+            _logger.info("key rotated", extra={
+                "event": "rotate_key", "key_id": key_id,
+                "new_version": new_version, "caller_id": caller_id,
+            })
             return new_version
 
     # ------------------------------------------------------------------
@@ -499,6 +528,9 @@ class PyHSM:
                 self._key_locks.pop(key_id, None)
             self._audit.record("destroyKey", key_id=key_id, caller_id=caller_id, success=True)
             self._update_key_metrics()
+            _logger.info("key destroyed", extra={
+                "event": "destroy_key", "key_id": key_id, "caller_id": caller_id,
+            })
 
     def list_keys(self) -> list[dict]:
         """List all key IDs with their types, creation dates, and policies."""
@@ -598,6 +630,10 @@ class PyHSM:
             self._store.update_key(key_id, entry)
             self._metrics.record_op("encrypt")
             self._audit.record("encrypt", key_id=key_id, caller_id=caller_id, success=True)
+            _logger.debug("encrypt operation", extra={
+                "event": "encrypt", "key_id": key_id, "caller_id": caller_id,
+                "version": current["version"],
+            })
             return result
 
     def decrypt(self, key_id: str, ciphertext_hex: str, *, caller_id: Optional[str] = None) -> bytes:
@@ -675,6 +711,10 @@ class PyHSM:
             self._store.update_key(key_id, entry)
             self._metrics.record_op("decrypt")
             self._audit.record("decrypt", key_id=key_id, caller_id=caller_id, success=True)
+            _logger.debug("decrypt operation", extra={
+                "event": "decrypt", "key_id": key_id, "caller_id": caller_id,
+                "version": version,
+            })
             return plain
 
 
@@ -729,6 +769,10 @@ class PyHSM:
             self._store.update_key(key_id, entry)
             self._metrics.record_op("sign")
             self._audit.record("sign", key_id=key_id, caller_id=caller_id, success=True)
+            _logger.debug("sign operation", extra={
+                "event": "sign", "key_id": key_id, "caller_id": caller_id,
+                "key_type": entry["key_type"],
+            })
             return sig.hex()
 
     def verify(self, key_id: str, message: str | bytes, signature_hex: str, *, caller_id: Optional[str] = None) -> bool:

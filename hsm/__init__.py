@@ -10,6 +10,7 @@ from .metrics import MetricsCollector
 from .self_test import run_self_tests
 from .shamir import split_secret, reconstruct_secret, zeroize
 from .jwk import export_symmetric_jwk, export_ec_jwk, export_rsa_jwk, export_ed25519_jwk
+from .logging import get_logger
 
 __all__ = [
     "PyHSM",
@@ -31,4 +32,5 @@ __all__ = [
     "export_ec_jwk",
     "export_rsa_jwk",
     "export_ed25519_jwk",
+    "get_logger",
 ]

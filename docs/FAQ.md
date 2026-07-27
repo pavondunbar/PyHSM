@@ -152,3 +152,80 @@ It depends on your constraints. Neither is universally better.
 **Use PyHSM if:** You need secp256k1/Ed25519 signing (blockchain), you want to avoid per-operation costs at scale, you require data sovereignty, you want zero vendor lock-in, or your latency budget can't tolerate network round-trips for every operation.
 
 **They're not mutually exclusive:** Some teams use AWS KMS for general infrastructure encryption and PyHSM specifically for blockchain transaction signing where AWS has no native support.
+
+
+---
+
+## Why does PyHSM refuse to start without argon2-cffi?
+
+Argon2id is a memory-hard key derivation function that makes brute-force attacks on the master password prohibitively expensive (64 MB per attempt). PBKDF2, while still acceptable per NIST guidelines, is orders of magnitude cheaper to attack on GPUs.
+
+Previous versions of PyHSM silently fell back to PBKDF2 when `argon2-cffi` wasn't installed. This created a dangerous situation: a production deployment could unknowingly run with weaker key derivation simply because a dependency was missing from the Docker image or requirements file.
+
+Now, PyHSM raises a `RuntimeError` at initialization if Argon2id is unavailable. This fail-hard behavior ensures you can't accidentally deploy with degraded security.
+
+**For testing or migration scenarios** where you genuinely need PBKDF2 (e.g., CI environments without native extensions, or migrating old keystores), set:
+
+```bash
+export PYHSM_ALLOW_PBKDF2_FALLBACK=1
+```
+
+This is an explicit opt-in that should never appear in production configurations.
+
+---
+
+## How do I see what PyHSM is doing in production?
+
+PyHSM emits JSON-structured logs via Python's standard `logging` module. Every log line is a single JSON object with consistent fields:
+
+```json
+{"timestamp": "2026-01-15T10:30:00+00:00", "level": "INFO", "logger": "hsm.core", "message": "key generated", "event": "generate_key", "key_id": "my-key", "key_type": "aes-256"}
+```
+
+**To enable operational logging:**
+
+```bash
+export PYHSM_LOG_LEVEL=INFO
+```
+
+Or configure programmatically:
+
+```python
+import logging
+logging.getLogger("hsm").setLevel(logging.INFO)
+```
+
+**What gets logged:**
+
+| Level | Events |
+|---|---|
+| `INFO` | Session open/close, key generated/rotated/destroyed, KDF migrations, self-test results |
+| `WARNING` | Access denied (caller ACL), rate limiting triggered |
+| `ERROR` | Webhook delivery failures |
+| `CRITICAL` | Self-test failures, tamper detection |
+
+Crypto operations (encrypt, decrypt, sign) are logged at `DEBUG` level to avoid noise in production while remaining available for troubleshooting.
+
+**Key design decisions:**
+
+- Default level is `WARNING` — PyHSM is silent unless something is wrong
+- Webhook failures are now logged (previously silently swallowed)
+- No sensitive material (keys, passwords, plaintexts) is ever included in log output
+- Output is one JSON object per line — compatible with any log aggregator (Datadog, Splunk, ELK, CloudWatch)
+
+---
+
+## How is thread safety verified?
+
+PyHSM includes 8 dedicated concurrency stress tests that exercise the sharded-lock architecture under realistic load:
+
+1. **Same-key contention** — 16 threads × 20 encrypt operations on a single key
+2. **Interleaved encrypt/decrypt** — concurrent readers and writers on the same key
+3. **Multi-key parallelism** — 16 threads each operating on their own key (no contention)
+4. **Concurrent key generation** — 16 threads creating keys simultaneously (global lock stress)
+5. **Mixed workload** — generate + encrypt + rotate + destroy running in parallel
+6. **Cross-contamination proof** — verifies ciphertexts from key A never decrypt under key B
+7. **Operation count consistency** — 4 threads × 50 ops, then verifies no lost counter updates
+8. **Concurrent signing** — 8 threads signing with the same EC key, all signatures verified
+
+These tests run as part of the standard `pytest` suite and are enforced in CI. They use real cryptographic operations (no mocking) to expose race conditions in key material handling, operation counting, and keystore persistence.

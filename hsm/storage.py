@@ -8,9 +8,11 @@ Encrypted envelope format (binary):
   [60:  ]  AES-256-GCM ciphertext+tag  (plaintext is UTF-8 JSON)
 
 Key derivation: the master password is derived via Argon2id (64 MB
-memory-hard, OWASP recommended) with PBKDF2-SHA256 (480k iterations)
-as a fallback when argon2-cffi is unavailable. HKDF-Expand then
-produces independent 32-byte subkeys:
+memory-hard, OWASP recommended). Argon2id is REQUIRED — PyHSM will
+refuse to start without it. PBKDF2-SHA256 (480k iterations) is only
+available as a degraded fallback when PYHSM_ALLOW_PBKDF2_FALLBACK=1
+is set (for testing/migration only). HKDF-Expand then produces
+independent 32-byte subkeys:
   - Encryption key (info="pyhsm-enc-v1") — used for AES-256-GCM
   - MAC key (info="pyhsm-mac-v1") — used for HMAC-SHA256
   - KEK (info="pyhsm-kek-v1") — used for per-key AES-KWP wrapping
@@ -51,9 +53,17 @@ try:
 except ImportError:
     _ARGON2_AVAILABLE = False
 
+# Environment variable escape hatch: set PYHSM_ALLOW_PBKDF2_FALLBACK=1 to
+# permit degraded PBKDF2 operation in environments where argon2-cffi cannot
+# be installed (e.g., CI without native extensions, or migration tooling).
+# In production, leave this unset — PyHSM will refuse to start without Argon2id.
+_ALLOW_PBKDF2_FALLBACK = os.environ.get("PYHSM_ALLOW_PBKDF2_FALLBACK", "0") == "1"
+
 from .backends import StorageBackend, FileBackend
 from .secure_memory import zeroize_bytearray, zeroize_dict_keys
+from .logging import get_logger
 
+_logger = get_logger(__name__)
 
 _SALT_LEN = 16
 _HMAC_LEN = 32
@@ -248,9 +258,9 @@ class KeyStore:
         """Derive the intermediate master key from password + salt.
 
         Uses Argon2id (64 MB memory-hard, OWASP recommended) as the primary
-        KDF. Falls back to PBKDF2-SHA256 at 480k iterations if argon2-cffi
-        is not installed (e.g., environments where native extensions are
-        unavailable).
+        KDF. Raises RuntimeError if argon2-cffi is not installed, unless the
+        PYHSM_ALLOW_PBKDF2_FALLBACK=1 environment variable is set (for
+        testing or migration scenarios only).
         """
         if _ARGON2_AVAILABLE:
             derived = hash_secret_raw(
@@ -263,11 +273,11 @@ class KeyStore:
                 type=Type.ID,
             )
             return bytearray(derived)
-        else:
+        elif _ALLOW_PBKDF2_FALLBACK:
             warnings.warn(
                 "PyHSM: argon2-cffi not available, falling back to PBKDF2-SHA256. "
-                "Install argon2-cffi for OWASP-recommended Argon2id key derivation: "
-                "pip install argon2-cffi",
+                "This is a SECURITY DEGRADATION — do not use in production. "
+                "Install argon2-cffi: pip install argon2-cffi",
                 UserWarning,
                 stacklevel=2,
             )
@@ -279,6 +289,14 @@ class KeyStore:
             )
             derived = kdf.derive(bytes(self._master_password))
             return bytearray(derived)
+        else:
+            raise RuntimeError(
+                "PyHSM FATAL: argon2-cffi is not installed. "
+                "Argon2id is REQUIRED for production key derivation. "
+                "Install it with: pip install argon2-cffi\n"
+                "To allow degraded PBKDF2 fallback (TESTING ONLY), set "
+                "environment variable PYHSM_ALLOW_PBKDF2_FALLBACK=1"
+            )
 
     def _derive_subkeys(self, salt: bytes) -> tuple[bytearray, bytearray]:
         """
@@ -397,6 +415,10 @@ class KeyStore:
 
         min_len = _SALT_LEN + _HMAC_LEN + _NONCE_LEN + 16  # 16 = min GCM tag
         if len(data) < min_len:
+            _logger.critical("keystore truncated or corrupted", extra={
+                "event": "tamper_detected", "reason": "file too short",
+                "file_size": len(data), "min_expected": min_len,
+            })
             raise TamperError("Keystore file too short — possible truncation or corruption")
 
         salt = data[:_SALT_LEN]
@@ -419,13 +441,22 @@ class KeyStore:
                 if not _hmac.compare_digest(stored_hmac, expected_hmac):
                     zeroize_bytearray(enc_key)
                     zeroize_bytearray(mac_key)
+                    _logger.critical("HMAC verification failed", extra={
+                        "event": "tamper_detected", "reason": "hmac_mismatch",
+                    })
                     raise TamperError(
                         "PyHSM TAMPER DETECTED: HMAC verification failed. "
                         "Keystore may have been modified outside of PyHSM."
                     )
                 # PBKDF2 load succeeded — mark for KDF migration to Argon2id
+                _logger.info("migrating keystore KDF from PBKDF2 to Argon2id", extra={
+                    "event": "kdf_migration", "from": "pbkdf2", "to": "argon2id",
+                })
                 self._needs_kdf_migration = True
             else:
+                _logger.critical("HMAC verification failed", extra={
+                    "event": "tamper_detected", "reason": "hmac_mismatch",
+                })
                 raise TamperError(
                     "PyHSM TAMPER DETECTED: HMAC verification failed. "
                     "Keystore may have been modified outside of PyHSM."

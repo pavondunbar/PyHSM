@@ -17,6 +17,10 @@ import urllib.request
 from datetime import datetime, timezone
 from typing import Optional
 
+from .logging import get_logger
+
+_logger = get_logger(__name__)
+
 
 _VALID_OPERATIONS = frozenset(
     [
@@ -242,5 +246,11 @@ class AuditLog:
                 method="POST",
             )
             urllib.request.urlopen(req, timeout=5)
-        except Exception:
-            pass
+        except Exception as exc:
+            _logger.error("webhook delivery failed", extra={
+                "event": "webhook_failure",
+                "webhook_url": self.webhook_url,
+                "operation": entry.get("operation"),
+                "sequence": entry.get("sequence"),
+                "error": str(exc),
+            })

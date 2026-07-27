@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: vectorguard-pyhsm
-Version: 1.4.0
+Version: 1.5.0
 Summary: Production-grade software Key Management Service (KMS) — key lifecycle, authenticated encryption, digital signing, and tamper-evident audit logging.
 Author: Pavon Dunbar
 License-Expression: MIT
@@ -45,7 +45,7 @@ Most applications that need key management face a difficult choice: implement it
 - Argon2id key derivation (OWASP recommended, 64 MB memory-hard)
 - HKDF key separation — independent encryption, MAC, and KEK subkeys derived from master
 - AES-KWP (RFC 5649) per-key wrapping — keys are double-encrypted at rest in both layers
-- Salt-bound KEK derivation — KEK uses a dedicated salt stored inside the encrypted envelope, derived through full PBKDF2 → HKDF path
+- Salt-bound KEK derivation — KEK uses a dedicated salt stored inside the encrypted envelope, derived through full Argon2id → HKDF path
 - Encrypt-then-MAC keystore with HMAC-SHA256 tamper detection
 - Pluggable storage backends — file, memory, or custom (database, cloud, etc.)
 - Atomic file writes — keystore never corrupts on crash
@@ -69,7 +69,7 @@ Most applications that need key management face a difficult choice: implement it
 - Ed25519 (EdDSA) signing for high-performance, compact signatures (Solana, Cosmos, SSH keys)
 - secp256k1 support for Ethereum, Bitcoin, and EVM-compatible blockchain transaction signing
 - Fully typed Python API (PEP 561 `py.typed` marker included)
-- 165 tests across both layers
+- 206 tests across both layers
 
 ---
 
@@ -201,7 +201,7 @@ pip install ".[dev]"
 
 ### CLI Usage
 
-All commands require `--store` (keystore path) and a master password. The password can be passed via `-p`/`--password` or entered interactively at a prompt (recommended for production).
+All commands require `--store` (keystore path) and a master password (minimum 12 characters). The password can be passed via `-p`/`--password` or entered interactively at a prompt (recommended for production — `-p` exposes the password in the process list).
 
 Global flags (`--store`, `-p`) can appear **before or after** the subcommand — put them wherever feels natural:
 
@@ -259,7 +259,9 @@ vectorguard-pyhsm --store keystore.enc pubkey my-rsa-key -p "pw"
 vectorguard-pyhsm --store keystore.enc rotate my-aes-key -p "pw"
 
 # Destroy a key (zeroizes all versions, removes from store)
+# Requires confirmation; use --yes/-y to skip the prompt
 vectorguard-pyhsm --store keystore.enc delete my-aes-key -p "pw"
+vectorguard-pyhsm --store keystore.enc delete my-aes-key --yes -p "pw"  # skip prompt
 
 # Metrics
 vectorguard-pyhsm --store keystore.enc metrics -p "pw"
@@ -278,7 +280,7 @@ vectorguard-pyhsm --store keystore.enc audit --since 2025-01-01T00:00:00Z -p "pw
 ```python
 from hsm import PyHSM
 
-# Master password is always required — there is no insecure default
+# Master password is always required — minimum 12 characters
 hsm = PyHSM(
     storage_path="keystore.enc",
     master_password="your-master-password",
@@ -286,6 +288,12 @@ hsm = PyHSM(
     rate_limit_max_ops=100,     # max ops per key per window
     rate_limit_window_s=60,
 )
+
+# Or use as a context manager for automatic cleanup
+with PyHSM(storage_path="keystore.enc", master_password="your-master-password") as hsm:
+    hsm.generate_key("my-key")
+    ct = hsm.encrypt("my-key", "secret")
+    # Key material is automatically zeroized on exit
 
 # Generate keys
 hsm.generate_key("aes-key")                          # AES-256 by default
@@ -348,12 +356,12 @@ audit.verify()                                          # returns -1 if clean
 entries = audit.export_jsonl(operation="encrypt")       # SIEM-ready list of dicts
 
 # JWK export (RFC 7517) — interoperate with other KMS systems
-jwk = hsm.export_jwk("aes-key")                        # {"kty": "oct", "k": "...", ...}
-ec_jwk = hsm.export_jwk("ec-key")                      # {"kty": "EC", "crv": "P-256", ...}
-ec384_jwk = hsm.export_jwk("ec384")                    # {"kty": "EC", "crv": "P-384", ...}
-ec521_jwk = hsm.export_jwk("ec521")                    # {"kty": "EC", "crv": "P-521", ...}
-secp_jwk = hsm.export_jwk("eth-key")                   # {"kty": "EC", "crv": "secp256k1", ...}
-ed_jwk = hsm.export_jwk("sol-key")                     # {"kty": "OKP", "crv": "Ed25519", ...}
+# Requires allow_export=True in the key's policy (defaults to False for security)
+hsm.generate_key("export-aes", policy={"allow_encrypt": True, "allow_decrypt": True, "allow_export": True})
+jwk = hsm.export_jwk("export-aes")                    # {"kty": "oct", "k": "...", ...}
+
+hsm.generate_key("export-ec", "ec-p256", policy={"allow_sign": True, "allow_export": True})
+ec_jwk = hsm.export_jwk("export-ec")                  # {"kty": "EC", "crv": "P-256", ...}
 
 # JWK import — bring keys from external systems
 hsm.import_key_jwk("imported-key", {
@@ -418,9 +426,11 @@ hsm/
   core.py           — PyHSM class: key lifecycle, encrypt/decrypt, sign/verify,
                       per-key AES-KWP wrapping, AAD binding, hybrid nonce,
                       per-key sharded locks, caller_id ACL enforcement
-  storage.py        — KeyStore: HKDF key separation (enc/mac/kek subkeys),
+  storage.py        — KeyStore: Argon2id (primary) / PBKDF2 (fallback) key derivation,
+                      HKDF key separation (enc/mac/kek subkeys),
                       AES-256-GCM + HMAC-SHA256, cached KEK, pluggable StorageBackend,
-                      bytearray key_data for deterministic zeroization
+                      bytearray key_data for deterministic zeroization, auto-migration
+                      from PBKDF2 to Argon2id
   backends.py       — StorageBackend ABC, FileBackend (atomic writes), MemoryBackend
   secure_memory.py  — SecureBytes: deterministic bytearray zeroization, context manager
   jwk.py            — JWK (RFC 7517) import/export: oct, EC (P-256/P-384/P-521/secp256k1), OKP (Ed25519), RSA
@@ -433,7 +443,7 @@ hsm/
   py.typed          — PEP 561 marker for type checker support
 cli.py              — Full-featured command-line interface
 tests/
-  test_pyhsm.py     — 84 pytest tests
+  test_pyhsm.py     — 112 pytest tests
 ```
 
 ---
@@ -441,6 +451,8 @@ tests/
 ## TypeScript Layer
 
 A production-hardened Node.js library in `./pyhsm-ts/` with additional features: Argon2id KDF, AES-256-GCM-SIV (nonce-misuse resistant), SecureBuffer zeroization, and process isolation mode.
+
+Both layers now use Argon2id as the primary key derivation function (OWASP recommended, 64 MB memory-hard). The Python layer falls back to PBKDF2-SHA256 at 480,000 iterations only if `argon2-cffi` is unavailable.
 
 ### TypeScript Installation
 
@@ -666,7 +678,7 @@ pyhsm-ts/
   process.ts          — IPC server (process isolation via Unix socket)
   client.ts           — IPC client with HMAC caller auth
   index.ts            — Public API exports and singleton factory
-  pyhsm.test.ts       — 81 tests (vitest)
+  pyhsm.test.ts       — 94 tests (vitest)
   OPERATIONS.md       — Full operator guide (env vars, deployment, procedures)
   package.json        — Pinned exact dependency versions
   tsconfig.json       — Strict TypeScript configuration
@@ -890,7 +902,7 @@ See [docs/FAQ.md](docs/FAQ.md) for detailed answers to common architecture and s
 
 ```bash
 python -m pytest tests/ -v
-# 84 tests
+# 112 tests
 ```
 
 **TypeScript (vitest):**
@@ -898,7 +910,7 @@ python -m pytest tests/ -v
 ```bash
 cd pyhsm-ts
 npm test
-# 81 tests
+# 94 tests
 ```
 
 **CI** runs both suites on every push and pull request, across Python 3.11/3.12/3.13 and Node.js 20. See `.github/workflows/ci.yml`.

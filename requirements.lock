@@ -1,0 +1,22 @@
+# PyHSM pinned dependencies — generated for reproducible builds.
+# Regenerate with: pip install -e ".[dev]" && pip freeze --exclude-editable | grep -E "^(cryptography|argon2|pytest|coverage|cffi|pycparser)==" > requirements.lock
+# Or install from this file: pip install -r requirements.lock
+
+# --- Production dependencies ---
+cryptography==47.0.0
+argon2-cffi==23.1.0
+argon2-cffi-bindings==25.1.0
+
+# --- Transitive (required by above) ---
+cffi==2.0.0
+pycparser==3.0
+
+# --- Dev dependencies ---
+pytest==8.3.5
+pytest-cov==7.1.0
+coverage==7.15.2
+
+# --- Transitive (required by pytest) ---
+iniconfig==2.3.0
+pluggy==1.6.0
+packaging==26.2

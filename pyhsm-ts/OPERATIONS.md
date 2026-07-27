@@ -80,6 +80,13 @@ memory exhaustion from malicious or buggy clients.
 |---------------------------|----------|-------------------------------------------|
 | `PYHSM_AUDIT_WEBHOOK`    | *(none)* | URL for non-blocking audit event POST. Each request includes an `X-PyHSM-Signature: sha256=<hex>` header (HMAC-SHA256 of the request body using the audit HMAC key) so receivers can verify authenticity. |
 
+### Python-Specific
+
+| Variable                        | Default     | Description                                                                                       |
+|---------------------------------|-------------|---------------------------------------------------------------------------------------------------|
+| `PYHSM_LOG_LEVEL`              | `WARNING`   | Structured JSON log verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. Set to `INFO` in production for operational visibility. |
+| `PYHSM_ALLOW_PBKDF2_FALLBACK`  | `0`         | Set to `1` to permit degraded PBKDF2 key derivation when `argon2-cffi` is unavailable. **Testing/migration only — never set in production.** |
+
 ---
 
 ## Deployment Modes
@@ -274,7 +281,7 @@ Available metrics:
 
 5. **Tamper detection**: The keystore uses encrypt-then-MAC with separated keys. Any modification to the file triggers a tamper alert, zeroizes all memory, and throws.
 
-6. **KDF**: Both layers use Argon2id (64 MB / 3 passes / 4 parallelism) as the primary key derivation function. The TypeScript async `PyHSM.create()` factory uses Argon2id directly; the synchronous constructor falls back to PBKDF2-SHA256 at 480,000 iterations. The Python layer uses Argon2id via `argon2-cffi` with automatic PBKDF2 fallback if the native extension is unavailable. Both layers then apply HKDF-Expand to derive separate encryption and MAC subkeys. Existing PBKDF2-encrypted keystores are automatically detected and re-encrypted with Argon2id on first open.
+6. **KDF**: Both layers use Argon2id (64 MB / 3 passes / 4 parallelism) as the primary key derivation function. The TypeScript async `PyHSM.create()` factory uses Argon2id directly; the synchronous constructor falls back to PBKDF2-SHA256 at 480,000 iterations. The Python layer **requires** `argon2-cffi` — it will refuse to start without it (`RuntimeError` at initialization). A degraded PBKDF2 fallback is available *only* when `PYHSM_ALLOW_PBKDF2_FALLBACK=1` is explicitly set (for testing/migration scenarios — never in production). Both layers then apply HKDF-Expand to derive separate encryption and MAC subkeys. Existing PBKDF2-encrypted keystores are automatically detected and re-encrypted with Argon2id on first open.
 
 7. **Nonce safety**: Python uses a hybrid nonce (random + counter + random) that prevents birthday-bound collisions even at high operation volumes. TypeScript uses AES-256-GCM-SIV which is inherently nonce-misuse resistant.
 
@@ -297,6 +304,10 @@ Available metrics:
 16. **Rate limiter ordering (Python)**: Policy enforcement checks are ordered to prevent denial-of-service: caller ACL, operation permission, max operations, and expiry are all validated before the rate limiter consumes a token. This ensures unauthorized or policy-denied requests cannot exhaust the rate-limit window for legitimate callers.
 
 17. **EC curve hash pairing (Python)**: ECDSA signing uses NIST-recommended hash algorithms per curve: P-256 → SHA-256, P-384 → SHA-384, P-521 → SHA-512, secp256k1 → SHA-256. This ensures the hash security level matches the curve security level. Ed25519 uses its own built-in hash (SHA-512 internally as part of EdDSA) and does not require a separate hash algorithm parameter.
+
+18. **Structured logging (Python)**: All security-relevant events (session open/close, key lifecycle, policy denials, rate limiting, tamper detection, webhook failures) are emitted as JSON-structured log lines via stdlib `logging`. This enables machine-parseable SIEM ingestion and operational alerting. Webhook delivery failures are now logged at ERROR level (previously silently swallowed). Log verbosity is controlled via `PYHSM_LOG_LEVEL` (default: `WARNING`).
+
+19. **Concurrency verification (Python)**: Thread safety is proven by 8 dedicated stress tests exercising 16 concurrent threads with same-key contention, multi-key parallelism, mixed workloads (generate + encrypt + rotate + destroy), cross-contamination proofs, operation count consistency checks, and concurrent signing verification. The test suite enforces that no data corruption or lost updates occur under load.
 
 ---
 

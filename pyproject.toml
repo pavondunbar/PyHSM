@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vectorguard-pyhsm"
-version = "1.5.0"
+version = "1.6.0"
 description = "Production-grade software Key Management Service (KMS) — key lifecycle, authenticated encryption, digital signing, and tamper-evident audit logging."
 readme = "README.md"
 license = "MIT"
@@ -33,6 +33,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0.0,<9.0.0",
+    "pytest-cov>=6.0.0,<7.0.0",
 ]
 
 [project.urls]
@@ -51,6 +52,20 @@ py-modules = ["cli"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "--cov=hsm --cov-report=term-missing --cov-fail-under=80"
+
+[tool.coverage.run]
+source = ["hsm"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_empty = true
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.",
+    "pass",
+]
 
 [tool.setuptools.package-data]
 hsm = ["py.typed"]
