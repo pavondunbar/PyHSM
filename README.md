@@ -250,7 +250,8 @@ vectorguard-pyhsm --store keystore.enc metrics
 vectorguard-pyhsm --store keystore.enc metrics --prometheus
 
 # Audit log
-vectorguard-pyhsm --store keystore.enc audit                       # dump all entries
+vectorguard-pyhsm --store keystore.enc audit                       # pretty-printed entries
+vectorguard-pyhsm --store keystore.enc audit --raw                 # compact JSON (one line per entry)
 vectorguard-pyhsm --store keystore.enc audit --verify              # verify HMAC chain
 vectorguard-pyhsm --store keystore.enc audit --operation encrypt   # filter by operation
 vectorguard-pyhsm --store keystore.enc audit --key-id my-aes-key   # filter by key

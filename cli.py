@@ -202,8 +202,12 @@ def cmd_audit(args) -> None:
             since=args.since,
             until=args.until,
         )
-        for e in entries:
-            print(json.dumps(e))
+        if args.raw:
+            for e in entries:
+                print(json.dumps(e))
+        else:
+            for e in entries:
+                print(json.dumps(e, indent=2))
     hsm.close_session()
 
 
@@ -304,6 +308,7 @@ def main() -> None:
     # audit
     aud = sub.add_parser("audit", parents=[common], help="Inspect or verify the audit log")
     aud.add_argument("--verify", action="store_true", help="Verify HMAC chain integrity")
+    aud.add_argument("--raw", action="store_true", help="Output compact JSON (one object per line, no indentation)")
     aud.add_argument("--operation", help="Filter by operation type")
     aud.add_argument("--key-id", help="Filter by key ID")
     aud.add_argument("--since", help="ISO-8601 start timestamp")
