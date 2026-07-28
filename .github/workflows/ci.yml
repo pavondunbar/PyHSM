@@ -41,6 +41,9 @@ jobs:
       - name: Test
         run: npm test
 
+      - name: Test with coverage (80% threshold)
+        run: npx vitest run --coverage --coverage.provider=v8 --coverage.thresholds.lines=80 --coverage.thresholds.functions=80 --coverage.thresholds.branches=80
+
       - name: Build
         run: npm run build
 
@@ -71,6 +74,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.lock
           pip install -e .
+
+      - name: Type check (mypy strict)
+        run: |
+          pip install mypy
+          python -m mypy hsm/ --strict --ignore-missing-imports
 
       - name: Run tests with coverage
         run: python -m pytest tests/ -v --tb=short --cov=hsm --cov-report=term-missing --cov-fail-under=80

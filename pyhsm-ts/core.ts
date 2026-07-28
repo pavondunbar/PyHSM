@@ -233,7 +233,9 @@ export class PyHSM {
   }
 
   private assertSession(): void {
-    if (!this.sessionActive) this.openSession();
+    if (!this.sessionActive) {
+      throw new Error("PyHSM: session is closed. Create a new instance or call PyHSM.create() to start a new session.");
+    }
     this.touch();
   }
 
@@ -553,12 +555,8 @@ export class PyHSM {
   // --- Policy Enforcement ---
 
   private enforcePolicy(entry: KeyEntry, operation: "encrypt" | "decrypt" | "sign", callerId: string): void {
-    if (!this.rateLimiter.allow(entry.keyId)) {
-      this.metrics.recordRateLimit();
-      this.audit.record("rateLimited", { keyId: entry.keyId, callerId, success: false });
-      throw new Error(`PyHSM: key '${entry.keyId}' rate limited`);
-    }
-
+    // Authentication and authorization checks FIRST — unauthorized callers
+    // must not consume rate-limit tokens (prevents DoS against legitimate callers)
     if (!this.authenticateCaller(callerId)) {
       this.metrics.recordAccessDenial();
       this.audit.record("accessDenied", { keyId: entry.keyId, callerId, success: false, reason: "auth failed" });
@@ -587,6 +585,13 @@ export class PyHSM {
 
     if (entry.policy.expiresAt && new Date(entry.policy.expiresAt) < new Date()) {
       throw new Error(`PyHSM: key '${entry.keyId}' has expired`);
+    }
+
+    // Rate limiter LAST — only authenticated, authorized callers consume tokens
+    if (!this.rateLimiter.allow(entry.keyId)) {
+      this.metrics.recordRateLimit();
+      this.audit.record("rateLimited", { keyId: entry.keyId, callerId, success: false });
+      throw new Error(`PyHSM: key '${entry.keyId}' rate limited`);
     }
   }
 
@@ -724,10 +729,15 @@ export class PyHSM {
     const entry = this.store.keys[keyId];
     if (!entry) throw new Error(`PyHSM: key '${keyId}' not found`);
 
+    if (!entry.keyType.startsWith("aes")) {
+      throw new Error(`PyHSM: key rotation is only supported for AES keys (key '${keyId}' is ${entry.keyType})`);
+    }
+
     const current = entry.versions.find((v) => v.version === entry.currentVersion);
     if (current) current.archived = true;
 
-    const rawKey = crypto.randomBytes(32);
+    const keyLen = entry.keyType === "aes-256" ? 32 : 16;
+    const rawKey = crypto.randomBytes(keyLen);
     const wrappedHex = this.wrapForStorage(rawKey);
     zeroBuffer(rawKey);
 
@@ -770,23 +780,32 @@ export class PyHSM {
   /**
    * Export a key as a JWK (JSON Web Key, RFC 7517).
    * WARNING: The returned object contains raw private key material.
+   * Requires `allowExport: true` in the key's policy (defaults to false).
    */
-  exportJwk(keyId: string): JWK {
+  exportJwk(keyId: string, callerId = "system"): JWK {
     this.assertSession();
     validateKeyId(keyId);
     const entry = this.store.keys[keyId];
     if (!entry) throw new Error(`PyHSM: key '${keyId}' not found`);
+
+    if (!entry.policy.allowExport) {
+      this.audit.record("accessDenied", { keyId, callerId, success: false, reason: "export not allowed by policy" });
+      throw new Error(`PyHSM: key '${keyId}' policy denies export (set allowExport: true to permit)`);
+    }
 
     const current = entry.versions.find((v) => v.version === entry.currentVersion);
     if (!current) throw new Error(`PyHSM: no current version for key '${keyId}'`);
 
     const rawKey = this.unwrapFromStorage(current.keyData);
     try {
+      let jwk: JWK;
       if (entry.keyType.startsWith("aes")) {
-        return exportSymmetricJwk(rawKey, keyId);
+        jwk = exportSymmetricJwk(rawKey, keyId);
       } else {
-        return exportAsymmetricJwk(rawKey, keyId);
+        jwk = exportAsymmetricJwk(rawKey, keyId);
       }
+      this.audit.record("exportKey", { keyId, callerId, success: true });
+      return jwk;
     } finally {
       zeroBuffer(rawKey);
     }
@@ -823,7 +842,7 @@ export class PyHSM {
       createdAt: new Date().toISOString(),
     };
 
-    this.audit.record("generateKey", { keyId, callerId, success: true });
+    this.audit.record("importKey", { keyId, callerId, success: true });
     this.save();
     this.updateKeyMetrics();
   }

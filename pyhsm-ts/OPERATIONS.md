@@ -182,9 +182,30 @@ Generates a new key version; old version is archived (can still decrypt
 ciphertexts encrypted with it, but new encryptions use the new version).
 New key material is wrapped with AES-KWP before storage.
 
+Only AES keys support rotation. Attempting to rotate an asymmetric key
+(EC, RSA, Ed25519) throws an error.
+
 ```typescript
 hsm.rotateKey("my-key");
 ```
+
+#### Automatic Rotation (Python)
+
+Set `rotate_every_days` in a key's policy to enable lazy auto-rotation.
+The key rotates transparently on the next `encrypt()` call when the
+current version's age exceeds the threshold:
+
+```python
+hsm.generate_key("auto-key", policy={
+    "allow_encrypt": True,
+    "allow_decrypt": True,
+    "rotate_every_days": 90,  # auto-rotates every 90 days on use
+})
+```
+
+Auto-rotation only applies to AES keys. It's lazy (triggered on use),
+so a key that's never used won't rotate. Old ciphertexts remain
+decryptable via the version prefix.
 
 ### Backup
 
@@ -192,6 +213,12 @@ Creates an encrypted copy of the keystore:
 
 ```typescript
 const path = hsm.createBackup();
+```
+
+**Python:**
+
+```python
+backup_path = hsm.create_backup("/secure/backups")
 ```
 
 ### Verify Backup
@@ -202,6 +229,36 @@ loading it into the live store:
 ```typescript
 hsm.verifyBackup("/secure/backups/pyhsm-backup-2025-01-01.enc");
 ```
+
+**Python:**
+
+```python
+hsm.verify_backup("/secure/backups/pyhsm-backup-20260101T120000Z.enc")
+```
+
+### Key Search (Python)
+
+Search keys by type, metadata, status, or policy fields:
+
+```python
+# Find all AES-256 keys
+aes_keys = hsm.search_keys(key_type="aes-256")
+
+# Find production keys by metadata
+prod_keys = hsm.search_keys(metadata={"env": "prod", "team": "infra"})
+
+# Find keys with auto-rotation configured
+auto_keys = hsm.search_keys(policy_filter={"rotate_every_days": 90})
+
+# Find expired keys
+expired = hsm.search_keys(status="expired")
+
+# Combine filters (AND logic)
+results = hsm.search_keys(key_type="aes-256", metadata={"env": "prod"}, status="active")
+```
+
+Status values: `"active"` (current version not archived), `"archived"`,
+`"expired"` (policy expiry in the past).
 
 ### Audit Log Verification
 
@@ -259,6 +316,27 @@ const text = hsm.getPrometheusMetrics();
 // Serve via HTTP or write to file for node_exporter textfile collector
 ```
 
+### OpenTelemetry (OTLP) Export (Python)
+
+For modern observability stacks (Grafana Agent, OpenTelemetry Collector, Datadog):
+
+```python
+import json, urllib.request
+
+otlp = hsm.get_otlp_metrics()  # OTLP JSON (ExportMetricsServiceRequest)
+payload = json.dumps(otlp).encode()
+req = urllib.request.Request(
+    "http://localhost:4318/v1/metrics",
+    data=payload,
+    headers={"Content-Type": "application/json"},
+)
+urllib.request.urlopen(req)
+```
+
+The OTLP output includes resource attributes (`service.name: pyhsm`),
+scope metadata, and all the same counters/gauges as Prometheus — just
+in push format for collectors that don't support scraping.
+
 Available metrics:
 
 - `pyhsm_operations_total{type="encrypt|decrypt|sign|verify"}`
@@ -267,6 +345,16 @@ Available metrics:
 - `pyhsm_access_denials_total`
 - `pyhsm_keys{state="active|archived"}`
 - `pyhsm_uptime_seconds`
+
+OTLP metric names (same data, different format):
+
+- `pyhsm.operations` (counter, with `type` attribute)
+- `pyhsm.errors` (counter)
+- `pyhsm.rate_limit_hits` (counter)
+- `pyhsm.access_denials` (counter)
+- `pyhsm.keys.active` (gauge)
+- `pyhsm.keys.archived` (gauge)
+- `pyhsm.uptime` (gauge, unit: seconds)
 
 ---
 

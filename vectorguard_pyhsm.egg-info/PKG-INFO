@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: vectorguard-pyhsm
-Version: 1.7.0
+Version: 1.8.0
 Summary: Production-grade software Key Management Service (KMS) — key lifecycle, authenticated encryption, digital signing, and tamper-evident audit logging.
 Author: Pavon Dunbar
 License-Expression: MIT
@@ -280,7 +280,8 @@ vectorguard-pyhsm --store keystore.enc metrics
 vectorguard-pyhsm --store keystore.enc metrics --prometheus
 
 # Audit log
-vectorguard-pyhsm --store keystore.enc audit                       # dump all entries
+vectorguard-pyhsm --store keystore.enc audit                       # pretty-printed entries
+vectorguard-pyhsm --store keystore.enc audit --raw                 # compact JSON (one line per entry)
 vectorguard-pyhsm --store keystore.enc audit --verify              # verify HMAC chain
 vectorguard-pyhsm --store keystore.enc audit --operation encrypt   # filter by operation
 vectorguard-pyhsm --store keystore.enc audit --key-id my-aes-key   # filter by key

@@ -486,6 +486,43 @@ class TestAuditLog:
         entries = log.export_jsonl(key_id="k1")
         assert all(e.get("keyId") == "k1" for e in entries)
 
+    def test_rotation_by_max_entries(self, tmp_path):
+        path = str(tmp_path / "audit.jsonl")
+        log = AuditLog(path, hmac_key=os.urandom(32), max_entries=5, max_bytes=0)
+        for i in range(6):
+            log.record("encrypt", key_id=f"k{i}", success=True)
+        # After 6 entries with max_entries=5, rotation should have occurred
+        # The rotated file should exist
+        assert os.path.exists(path + ".1")
+        # Current file should have the entry that triggered rotation (written before rotate)
+        # and the 6th entry is the one that triggers it
+        with open(path) as f:
+            current_lines = [l for l in f.read().strip().split("\n") if l.strip()]
+        # Current file should be empty or have the entry after rotation
+        # (rotation happens after the write that exceeds the threshold)
+        assert os.path.exists(path + ".1")
+
+    def test_rotation_by_max_bytes(self, tmp_path):
+        path = str(tmp_path / "audit.jsonl")
+        # Use a very small max_bytes to force rotation quickly
+        log = AuditLog(path, hmac_key=os.urandom(32), max_bytes=200, max_entries=0)
+        for i in range(10):
+            log.record("encrypt", key_id=f"key-{i}", success=True)
+        # Rotation should have occurred at least once
+        assert os.path.exists(path + ".1")
+
+    def test_rotation_respects_max_rotated_files(self, tmp_path):
+        path = str(tmp_path / "audit.jsonl")
+        log = AuditLog(path, hmac_key=os.urandom(32), max_entries=2, max_bytes=0, max_rotated_files=3)
+        # Generate enough entries to trigger multiple rotations
+        for i in range(10):
+            log.record("encrypt", key_id=f"k{i}", success=True)
+        # Should have at most 3 rotated files
+        assert os.path.exists(path + ".1")
+        assert os.path.exists(path + ".2")
+        assert os.path.exists(path + ".3")
+        assert not os.path.exists(path + ".4")
+
 
 # ---------------------------------------------------------------------------
 # Session management
@@ -769,6 +806,209 @@ class TestKEKDerivation:
         assert h2.decrypt("rk", ct1) == b"version1"
         assert h2.decrypt("rk", ct2) == b"version2"
         h2.close_session()
+
+
+# ---------------------------------------------------------------------------
+# Backup / Restore
+# ---------------------------------------------------------------------------
+
+class TestBackup:
+    def test_create_and_verify_backup(self, hsm, tmp_path):
+        hsm.generate_key("bk-key")
+        hsm.encrypt("bk-key", "backup test data")
+        backup_dir = str(tmp_path / "backups")
+        backup_path = hsm.create_backup(backup_dir)
+        assert os.path.exists(backup_path)
+        assert backup_path.startswith(backup_dir)
+        assert backup_path.endswith(".enc")
+        # Verify the backup
+        assert hsm.verify_backup(backup_path) is True
+
+    def test_verify_backup_detects_tamper(self, hsm, tmp_path):
+        hsm.generate_key("bk-tamper")
+        backup_dir = str(tmp_path / "backups")
+        backup_path = hsm.create_backup(backup_dir)
+        # Tamper with the backup file
+        with open(backup_path, "r+b") as f:
+            f.seek(20)
+            f.write(b"\xff\xff\xff\xff")
+        from hsm import TamperError
+        with pytest.raises((TamperError, ValueError)):
+            hsm.verify_backup(backup_path)
+
+    def test_verify_backup_nonexistent_file(self, hsm):
+        with pytest.raises(FileNotFoundError):
+            hsm.verify_backup("/nonexistent/backup.enc")
+
+    def test_create_backup_creates_directory(self, hsm, tmp_path):
+        hsm.generate_key("bk-dir")
+        backup_dir = str(tmp_path / "nested" / "backup" / "dir")
+        backup_path = hsm.create_backup(backup_dir)
+        assert os.path.exists(backup_path)
+        assert os.path.isdir(backup_dir)
+
+
+# ---------------------------------------------------------------------------
+# Import audit event
+# ---------------------------------------------------------------------------
+
+class TestImportAudit:
+    def test_import_key_records_importKey(self, hsm):
+        """import_key_jwk should record 'importKey' not 'generateKey' in audit."""
+        hsm.import_key_jwk("imported-aes", {
+            "kty": "oct",
+            "k": secrets.token_urlsafe(32),
+            "alg": "A256GCM",
+        })
+        audit = hsm.get_audit_log()
+        entries = audit.export_jsonl(operation="importKey")
+        assert len(entries) >= 1
+        assert entries[-1]["keyId"] == "imported-aes"
+        # Should NOT appear under generateKey
+        gen_entries = audit.export_jsonl(operation="generateKey")
+        imported_in_gen = [e for e in gen_entries if e.get("keyId") == "imported-aes"]
+        assert len(imported_in_gen) == 0
+
+
+# ---------------------------------------------------------------------------
+# Auto-rotation
+# ---------------------------------------------------------------------------
+
+class TestAutoRotation:
+    def test_auto_rotation_triggers_on_encrypt(self, store_path):
+        """Key with rotate_every_days=0 should auto-rotate on next encrypt."""
+        h = PyHSM(store_path, master_password="test-password-123", session_timeout_s=0)
+        h.generate_key("ar-key", policy={
+            "allow_encrypt": True,
+            "allow_decrypt": True,
+            "rotate_every_days": 0,  # 0 means always rotate
+        })
+        # First encrypt — should trigger auto-rotation (version 1 is 0+ days old)
+        ct = h.encrypt("ar-key", "hello")
+        entry = h._store.load_key("ar-key")
+        # Should have rotated to version 2
+        assert entry["current_version"] == 2
+        assert len(entry["versions"]) == 2
+        # Old ciphertext should still decrypt (uses version prefix)
+        pt = h.decrypt("ar-key", ct)
+        assert pt == b"hello"
+        h.close_session()
+
+    def test_no_rotation_when_not_due(self, store_path):
+        """Key with rotate_every_days=365 should NOT rotate immediately."""
+        h = PyHSM(store_path, master_password="test-password-123", session_timeout_s=0)
+        h.generate_key("nr-key", policy={
+            "allow_encrypt": True,
+            "allow_decrypt": True,
+            "rotate_every_days": 365,
+        })
+        h.encrypt("nr-key", "data")
+        entry = h._store.load_key("nr-key")
+        # Should NOT have rotated (key is <1 day old)
+        assert entry["current_version"] == 1
+        h.close_session()
+
+    def test_auto_rotation_only_aes(self, store_path):
+        """Asymmetric keys should NOT auto-rotate even with rotate_every_days."""
+        h = PyHSM(store_path, master_password="test-password-123", session_timeout_s=0)
+        h.generate_key("ec-ar", "ec-p256", policy={
+            "allow_sign": True,
+            "rotate_every_days": 0,
+        })
+        h.sign("ec-ar", "message")
+        entry = h._store.load_key("ec-ar")
+        # Should NOT have rotated
+        assert entry["current_version"] == 1
+        h.close_session()
+
+
+# ---------------------------------------------------------------------------
+# Key metadata search
+# ---------------------------------------------------------------------------
+
+class TestSearchKeys:
+    def test_search_by_key_type(self, hsm):
+        hsm.generate_key("s-aes", "aes-256")
+        hsm.generate_key("s-ec", "ec-p256")
+        results = hsm.search_keys(key_type="aes-256")
+        assert any(r["key_id"] == "s-aes" for r in results)
+        assert not any(r["key_id"] == "s-ec" for r in results)
+
+    def test_search_by_metadata(self, hsm):
+        hsm.generate_key("m1", metadata={"env": "prod", "team": "infra"})
+        hsm.generate_key("m2", metadata={"env": "staging", "team": "infra"})
+        hsm.generate_key("m3", metadata={"env": "prod", "team": "app"})
+        results = hsm.search_keys(metadata={"env": "prod"})
+        ids = [r["key_id"] for r in results]
+        assert "m1" in ids
+        assert "m3" in ids
+        assert "m2" not in ids
+
+    def test_search_by_metadata_multiple_fields(self, hsm):
+        hsm.generate_key("mm1", metadata={"env": "prod", "team": "infra"})
+        hsm.generate_key("mm2", metadata={"env": "prod", "team": "app"})
+        results = hsm.search_keys(metadata={"env": "prod", "team": "infra"})
+        ids = [r["key_id"] for r in results]
+        assert "mm1" in ids
+        assert "mm2" not in ids
+
+    def test_search_by_status_active(self, hsm):
+        hsm.generate_key("active-k")
+        results = hsm.search_keys(status="active")
+        assert any(r["key_id"] == "active-k" for r in results)
+
+    def test_search_returns_metadata_in_results(self, hsm):
+        hsm.generate_key("meta-r", metadata={"service": "auth"})
+        results = hsm.search_keys(metadata={"service": "auth"})
+        assert len(results) == 1
+        assert results[0]["metadata"] == {"service": "auth"}
+
+    def test_search_no_match_returns_empty(self, hsm):
+        hsm.generate_key("nomatch")
+        results = hsm.search_keys(key_type="rsa-4096")
+        assert results == []
+
+    def test_search_by_policy_filter(self, hsm):
+        hsm.generate_key("pf1", policy={"allow_encrypt": True, "allow_decrypt": False})
+        hsm.generate_key("pf2", policy={"allow_encrypt": True, "allow_decrypt": True})
+        results = hsm.search_keys(policy_filter={"allow_decrypt": False})
+        ids = [r["key_id"] for r in results]
+        assert "pf1" in ids
+        assert "pf2" not in ids
+
+
+# ---------------------------------------------------------------------------
+# OTLP Metrics
+# ---------------------------------------------------------------------------
+
+class TestOtlpMetrics:
+    def test_otlp_structure(self, hsm):
+        hsm.generate_key("otlp-k")
+        hsm.encrypt("otlp-k", "data")
+        otlp = hsm.get_otlp_metrics()
+        assert "resourceMetrics" in otlp
+        assert len(otlp["resourceMetrics"]) == 1
+        rm = otlp["resourceMetrics"][0]
+        assert "resource" in rm
+        assert "scopeMetrics" in rm
+        sm = rm["scopeMetrics"][0]
+        assert sm["scope"]["name"] == "pyhsm.metrics"
+        # Should have multiple metrics
+        assert len(sm["metrics"]) >= 8
+
+    def test_otlp_has_operations(self, hsm):
+        hsm.generate_key("otlp-ops")
+        hsm.encrypt("otlp-ops", "a")
+        hsm.encrypt("otlp-ops", "b")
+        otlp = hsm.get_otlp_metrics()
+        metrics = otlp["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]
+        # Find encrypt counter
+        encrypt_metrics = [m for m in metrics
+                          if m["name"] == "pyhsm.operations"
+                          and m["sum"]["dataPoints"][0].get("attributes")
+                          and m["sum"]["dataPoints"][0]["attributes"][0]["value"]["stringValue"] == "encrypt"]
+        assert len(encrypt_metrics) == 1
+        assert int(encrypt_metrics[0]["sum"]["dataPoints"][0]["asInt"]) == 2
 
 
 # ---------------------------------------------------------------------------

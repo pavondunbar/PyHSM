@@ -29,6 +29,7 @@ _VALID_OPERATIONS = frozenset(
         "sign",
         "verify",
         "generateKey",
+        "importKey",
         "destroyKey",
         "rotateKey",
         "archiveKey",
@@ -63,14 +64,35 @@ class AuditLog:
     derived from the master password via HKDF — no manual configuration
     is needed.
 
+    Log rotation:
+      - ``max_bytes``: rotate when the log file exceeds this size (default: 50 MB, 0 = unlimited)
+      - ``max_entries``: rotate after this many entries (default: 0 = unlimited)
+      - ``max_rotated_files``: how many rotated files to keep (default: 10)
+
+    Rotated files are named ``<log_path>.1``, ``<log_path>.2``, etc.
+    The most recent rotated file is always ``.1``.
+
     Raises ValueError if no HMAC key is provided via either method.
     """
 
-    def __init__(self, log_path: str, webhook_url: Optional[str] = None, *, hmac_key: Optional[bytes] = None) -> None:
+    def __init__(
+        self,
+        log_path: str,
+        webhook_url: Optional[str] = None,
+        *,
+        hmac_key: Optional[bytes] = None,
+        max_bytes: int = 50 * 1024 * 1024,  # 50 MB default
+        max_entries: int = 0,  # 0 = no entry-based limit
+        max_rotated_files: int = 10,
+    ) -> None:
         self.log_path = log_path
         self.webhook_url = webhook_url or os.environ.get("PYHSM_AUDIT_WEBHOOK")
         self._last_hmac = "0" * 64
         self._sequence = 0
+        self._max_bytes = max_bytes
+        self._max_entries = max_entries
+        self._max_rotated_files = max_rotated_files
+        self._entries_since_load = 0
 
         # Resolve HMAC key (priority: explicit param > env var)
         if hmac_key:
@@ -148,9 +170,60 @@ class AuditLog:
         with os.fdopen(fd, "a") as f:
             f.write(line)
 
+        self._entries_since_load += 1
+
+        # Check if rotation is needed
+        self._maybe_rotate()
+
         # Best-effort webhook shipping (non-blocking)
         if self.webhook_url:
             self._ship_to_webhook(entry)
+
+    def _maybe_rotate(self) -> None:
+        """Rotate the log file if it exceeds configured size or entry limits."""
+        needs_rotation = False
+
+        if self._max_bytes > 0:
+            try:
+                file_size = os.path.getsize(self.log_path)
+                if file_size >= self._max_bytes:
+                    needs_rotation = True
+            except OSError:
+                pass
+
+        if not needs_rotation and self._max_entries > 0:
+            if self._entries_since_load >= self._max_entries:
+                needs_rotation = True
+
+        if needs_rotation:
+            self._rotate()
+
+    def _rotate(self) -> None:
+        """
+        Rotate log files using numbered suffixes.
+
+        The current log becomes .1, previous .1 becomes .2, etc.
+        Files beyond max_rotated_files are deleted.
+        """
+        # Delete the oldest file if it would exceed max_rotated_files
+        oldest = f"{self.log_path}.{self._max_rotated_files}"
+        if os.path.exists(oldest):
+            os.unlink(oldest)
+
+        # Shift existing rotated files: .9 → .10, .8 → .9, ..., .1 → .2
+        for i in range(self._max_rotated_files - 1, 0, -1):
+            src = f"{self.log_path}.{i}"
+            dst = f"{self.log_path}.{i + 1}"
+            if os.path.exists(src):
+                os.rename(src, dst)
+
+        # Rotate current file to .1
+        if os.path.exists(self.log_path):
+            os.rename(self.log_path, f"{self.log_path}.1")
+
+        # Reset state for the new file — HMAC chain continues from where it left off
+        # (this is intentional: the chain spans rotations for tamper evidence)
+        self._entries_since_load = 0
 
     def verify(self) -> int:
         """

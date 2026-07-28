@@ -63,6 +63,20 @@ This means you can rotate keys without re-encrypting your entire database. Old d
 
 Rotation is currently supported for AES keys. Asymmetric keys (EC, RSA, Ed25519) don't rotate in-place — you generate a new key ID and transition callers.
 
+### Automatic rotation
+
+Set `rotate_every_days` in a key's policy to enable lazy auto-rotation:
+
+```python
+hsm.generate_key("app-key", policy={
+    "allow_encrypt": True,
+    "allow_decrypt": True,
+    "rotate_every_days": 90,
+})
+```
+
+When you call `encrypt()` and the current version is older than the threshold, PyHSM transparently rotates before encrypting. This is lazy — keys that are never used don't rotate, and no background scheduler is needed. The rotation is recorded in the audit log with reason `"auto-rotation (policy: 90 days)"`.
+
 ---
 
 ## How are audit logs protected from tampering?
@@ -229,3 +243,102 @@ PyHSM includes 8 dedicated concurrency stress tests that exercise the sharded-lo
 8. **Concurrent signing** — 8 threads signing with the same EC key, all signatures verified
 
 These tests run as part of the standard `pytest` suite and are enforced in CI. They use real cryptographic operations (no mocking) to expose race conditions in key material handling, operation counting, and keystore persistence.
+
+
+---
+
+## How do I search for keys by metadata or type?
+
+Use `search_keys()` to filter the keystore without iterating `list_keys()` manually:
+
+```python
+# By key type
+aes_keys = hsm.search_keys(key_type="aes-256")
+
+# By metadata tags (all specified pairs must match — AND logic)
+prod_keys = hsm.search_keys(metadata={"env": "prod", "team": "payments"})
+
+# By status: "active", "archived", or "expired"
+expired = hsm.search_keys(status="expired")
+
+# By policy fields
+auto_rotating = hsm.search_keys(policy_filter={"rotate_every_days": 90})
+
+# Combine filters
+results = hsm.search_keys(key_type="aes-256", metadata={"env": "prod"}, status="active")
+```
+
+This is useful at scale when you have dozens or hundreds of keys and need to find specific subsets for rotation, audit, or decommissioning.
+
+---
+
+## What observability options does PyHSM support?
+
+Three formats for different stacks:
+
+1. **Dict** — `hsm.get_metrics()` returns a Python dict with all counters and gauges. Good for custom dashboards or ad-hoc inspection.
+
+2. **Prometheus** — `hsm.get_prometheus_metrics()` returns text in Prometheus exposition format. Serve it via HTTP or write to a file for `node_exporter`'s textfile collector.
+
+3. **OpenTelemetry (OTLP)** — `hsm.get_otlp_metrics()` returns a dict conforming to the OTLP `ExportMetricsServiceRequest` JSON schema. POST it to any OTLP-compatible collector:
+
+```python
+import json, urllib.request
+
+payload = json.dumps(hsm.get_otlp_metrics()).encode()
+req = urllib.request.Request(
+    "http://localhost:4318/v1/metrics",
+    data=payload,
+    headers={"Content-Type": "application/json"},
+)
+urllib.request.urlopen(req)
+```
+
+This works with Grafana Agent, OpenTelemetry Collector, Datadog Agent, Honeycomb, and any other OTLP-compatible backend. No additional dependencies are needed — it's just JSON serialization.
+
+---
+
+## How does audit log rotation work?
+
+The audit log supports automatic rotation to prevent unbounded growth:
+
+```python
+from hsm.audit import AuditLog
+
+log = AuditLog(
+    "audit.jsonl",
+    hmac_key=my_key,
+    max_bytes=50 * 1024 * 1024,  # rotate at 50 MB (default)
+    max_entries=0,                # or rotate after N entries (0 = disabled)
+    max_rotated_files=10,         # keep up to 10 rotated files
+)
+```
+
+When the threshold is exceeded, the current log is renamed to `.1`, previous `.1` becomes `.2`, etc. Files beyond `max_rotated_files` are deleted. The HMAC chain continues across rotations — verification of the current file still works because the chain state is maintained in memory.
+
+Default behavior: rotate at 50 MB, keep 10 rotated files. For most deployments this means you'll retain several months of audit history without manual intervention.
+
+---
+
+## How do backups work?
+
+**Python:**
+
+```python
+# Create an encrypted backup (byte-for-byte copy of the keystore envelope)
+backup_path = hsm.create_backup("/secure/backups")
+
+# Verify a backup is intact without loading it into the live store
+hsm.verify_backup(backup_path)  # returns True or raises TamperError/ValueError
+```
+
+**TypeScript:**
+
+```typescript
+const path = hsm.createBackup();
+hsm.verifyBackup(path);
+```
+
+Backups are atomic (temp file + rename), timestamped, and written with mode `0o600`. The backup file is the raw encrypted keystore — no decryption or re-encryption occurs. Verification confirms HMAC integrity and successful decryption without loading keys into memory.
+
+Store backups on a separate volume or off-host. The backup is useless without the master password, so it's safe to store in less-trusted locations than the live keystore.

@@ -33,7 +33,11 @@ Most applications that need key management face a difficult choice: implement it
 - Process isolation via Unix domain socket IPC
 - Shamir M-of-N master password unlock ceremony
 - Startup Known-Answer Tests (KATs) before accepting any operations
-- Prometheus metrics
+- Prometheus metrics + OpenTelemetry (OTLP) JSON export
+- Automatic key rotation via `rotate_every_days` policy (lazy, triggered on use)
+- Key metadata search (filter by type, metadata tags, status, or policy fields)
+- Encrypted backup/restore with HMAC verification
+- Audit log rotation (configurable max size, max entries, retention)
 - Backward-compatible ciphertext format versioning (v1 legacy, v2 AAD-bound)
 - JWK (RFC 7517) key import/export for interoperability (supports P-256, P-384, P-521, secp256k1, Ed25519, RSA, AES)
 - EC P-256, P-384, P-521, and secp256k1 signing with ECDSA (SHA-256, SHA-384, SHA-512)
@@ -44,7 +48,7 @@ Most applications that need key management face a difficult choice: implement it
 - Concurrency stress-tested (16 threads, data integrity proofs)
 - 80%+ code coverage enforced in CI
 - Reproducible builds via pinned dependency lockfile
-- 214 tests across both layers
+- 264 tests across both layers
 
 ---
 
@@ -300,6 +304,13 @@ hsm.generate_key("restricted", policy={
     "allowed_callers": ["service-a", "service-b"],  # caller ACL
 })
 
+# Generate a key with automatic rotation (rotates on next encrypt when due)
+hsm.generate_key("auto-rotate-key", policy={
+    "allow_encrypt": True,
+    "allow_decrypt": True,
+    "rotate_every_days": 90,    # auto-rotates every 90 days on use
+})
+
 # Encrypt / Decrypt (AES-256-GCM with AAD binding and hybrid nonce)
 ciphertext = hsm.encrypt("aes-key", "secret message")  # returns hex string
 plaintext  = hsm.decrypt("aes-key", ciphertext)        # returns bytes
@@ -333,9 +344,20 @@ pub_pem = hsm.get_public_key("rsa-key")
 # Expiry enforcement (archives expired keys)
 hsm.enforce_expiry()
 
+# Key search (filter by type, metadata, status, or policy)
+all_aes = hsm.search_keys(key_type="aes-256")
+prod_keys = hsm.search_keys(metadata={"env": "prod"})
+active_keys = hsm.search_keys(status="active")
+auto_rotating = hsm.search_keys(policy_filter={"rotate_every_days": 90})
+
+# Backup and restore
+backup_path = hsm.create_backup("/secure/backups")     # encrypted copy of keystore
+hsm.verify_backup(backup_path)                         # True if intact, raises on tamper
+
 # Metrics
 metrics_dict = hsm.get_metrics()
 prometheus   = hsm.get_prometheus_metrics()
+otlp_json    = hsm.get_otlp_metrics()                  # OpenTelemetry OTLP JSON format
 
 # Audit log
 audit = hsm.get_audit_log()
@@ -444,7 +466,9 @@ Logged events include: `session_open`, `session_close`, `self_test_pass`, `self_
 hsm/
   core.py           — PyHSM class: key lifecycle, encrypt/decrypt, sign/verify,
                       per-key AES-KWP wrapping, AAD binding, hybrid nonce,
-                      per-key sharded locks, caller_id ACL enforcement
+                      per-key sharded locks, caller_id ACL enforcement,
+                      automatic key rotation (rotate_every_days policy),
+                      key metadata search, backup/restore, OTLP metrics export
   storage.py        — KeyStore: Argon2id (required) key derivation,
                       HKDF key separation (enc/mac/kek subkeys),
                       AES-256-GCM + HMAC-SHA256, cached KEK, pluggable StorageBackend,
@@ -455,16 +479,17 @@ hsm/
   secure_memory.py  — SecureBytes: deterministic bytearray zeroization, context manager
   jwk.py            — JWK (RFC 7517) import/export: oct, EC (P-256/P-384/P-521/secp256k1), OKP (Ed25519), RSA
   shamir.py         — Shamir secret sharing over GF(256)
-  audit.py          — HMAC-chained append-only audit log (HMAC key derived from master password)
+  audit.py          — HMAC-chained append-only audit log with rotation (max_bytes/max_entries)
   rate_limiter.py   — Sliding-window per-key rate limiter
-  metrics.py        — Prometheus-format metrics collector
+  metrics.py        — Prometheus and OpenTelemetry (OTLP) metrics export
   self_test.py      — Startup Known-Answer Tests (KATs)
   __init__.py       — Public API exports
   py.typed          — PEP 561 marker for type checker support
 cli.py              — Full-featured command-line interface
 tests/
-  test_pyhsm.py     — 112 pytest tests (unit + integration)
+  test_pyhsm.py     — 140 pytest tests (unit + integration + auto-rotation + search + OTLP)
   test_concurrency.py — 8 concurrency stress tests (16 threads, data integrity proofs)
+  test_cli.py       — 30 subprocess-based CLI integration tests
 ```
 
 ---
@@ -925,7 +950,11 @@ See [docs/FAQ.md](docs/FAQ.md) for detailed answers to common architecture and s
 ```bash
 # Run all tests with coverage
 python -m pytest tests/ -v
-# 120 tests (112 unit/integration + 8 concurrency stress tests)
+# 140 tests (112 unit/integration + 8 concurrency + 12 auto-rotation/search/backup/OTLP)
+
+# Run CLI integration tests separately (subprocess-based)
+python -m pytest tests/test_cli.py -v
+# 30 CLI integration tests
 
 # Coverage report (80% minimum threshold enforced in CI)
 python -m pytest tests/ --cov=hsm --cov-report=term-missing --cov-fail-under=80
@@ -946,7 +975,7 @@ npm test
 # 94 tests
 ```
 
-**CI** runs both suites on every push and pull request, across Python 3.11/3.12/3.13 and Node.js 20. Coverage is enforced at 80% minimum. See `.github/workflows/ci.yml`.
+**CI** runs both suites on every push and pull request, across Python 3.11/3.12/3.13 and Node.js 20. Coverage is enforced at 80% minimum for both layers. Python also runs `mypy --strict` type checking. See `.github/workflows/ci.yml`.
 
 ---
 
@@ -959,7 +988,7 @@ See [`pyhsm-ts/OPERATIONS.md`](pyhsm-ts/OPERATIONS.md) for the full operator gui
 - Shamir ceremony procedure
 - Key rotation, backup, and backup verification procedures
 - Audit log verification and SIEM export
-- Prometheus metrics reference
+- Prometheus metrics and OpenTelemetry (OTLP) reference
 - Security considerations
 
 ---

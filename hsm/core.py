@@ -396,69 +396,86 @@ class PyHSM:
                          ec-secp256k1, ed25519.
         Returns the key_id.
         """
+        self._assert_session()
+        _validate_key_id(key_id)
+
+        # Generate key material outside the global lock (expensive for RSA)
+        if key_type == "aes-256":
+            raw = os.urandom(32)
+            key_data = self._wrap_key_data(raw)
+            public_key_pem = None
+        elif key_type == "aes-128":
+            raw = os.urandom(16)
+            key_data = self._wrap_key_data(raw)
+            public_key_pem = None
+        elif key_type == "rsa-2048":
+            priv_pem_bytes, public_key_pem = _gen_rsa(2048)
+            priv_pem_buf = bytearray(priv_pem_bytes)
+            key_data = self._wrap_key_data(bytes(priv_pem_buf))
+            zeroize_bytearray(priv_pem_buf)
+        elif key_type == "rsa-4096":
+            priv_pem_bytes, public_key_pem = _gen_rsa(4096)
+            priv_pem_buf = bytearray(priv_pem_bytes)
+            key_data = self._wrap_key_data(bytes(priv_pem_buf))
+            zeroize_bytearray(priv_pem_buf)
+        elif key_type == "ec-p256":
+            priv_pem_bytes, public_key_pem = _gen_ec(ec.SECP256R1())
+            priv_pem_buf = bytearray(priv_pem_bytes)
+            key_data = self._wrap_key_data(bytes(priv_pem_buf))
+            zeroize_bytearray(priv_pem_buf)
+        elif key_type == "ec-p384":
+            priv_pem_bytes, public_key_pem = _gen_ec(ec.SECP384R1())
+            priv_pem_buf = bytearray(priv_pem_bytes)
+            key_data = self._wrap_key_data(bytes(priv_pem_buf))
+            zeroize_bytearray(priv_pem_buf)
+        elif key_type == "ec-p521":
+            priv_pem_bytes, public_key_pem = _gen_ec(ec.SECP521R1())
+            priv_pem_buf = bytearray(priv_pem_bytes)
+            key_data = self._wrap_key_data(bytes(priv_pem_buf))
+            zeroize_bytearray(priv_pem_buf)
+        elif key_type == "ec-secp256k1":
+            priv_pem_bytes, public_key_pem = _gen_ec(ec.SECP256K1())
+            priv_pem_buf = bytearray(priv_pem_bytes)
+            key_data = self._wrap_key_data(bytes(priv_pem_buf))
+            zeroize_bytearray(priv_pem_buf)
+        elif key_type == "ed25519":
+            priv_pem_bytes, public_key_pem = _gen_ed25519()
+            priv_pem_buf = bytearray(priv_pem_bytes)
+            key_data = self._wrap_key_data(bytes(priv_pem_buf))
+            zeroize_bytearray(priv_pem_buf)
+        else:
+            raise ValueError(f"Unsupported key type: {key_type}")
+
+        now_iso = _utcnow()
+        entry = {
+            "key_id": key_id,
+            "key_type": key_type,
+            "current_version": 1,
+            "versions": [
+                {
+                    "version": 1,
+                    "key_data": key_data,
+                    "created_at": now_iso,
+                    "archived": False,
+                }
+            ],
+            "public_key_pem": public_key_pem,
+            "policy": policy or {"allow_encrypt": True, "allow_decrypt": True, "allow_sign": True},
+            "operation_count": 0,
+            "created_at": now_iso,
+            "metadata": metadata or {},
+        }
+
+        # Hold the global lock only for the uniqueness check + store write
         with self._global_lock:
-            self._assert_session()
-            _validate_key_id(key_id)
-
-            if key_type == "aes-256":
-                raw = os.urandom(32)
-                key_data = self._wrap_key_data(raw)
-                public_key_pem = None
-            elif key_type == "aes-128":
-                raw = os.urandom(16)
-                key_data = self._wrap_key_data(raw)
-                public_key_pem = None
-            elif key_type == "rsa-2048":
-                priv_pem, public_key_pem = _gen_rsa(2048)
-                key_data = self._wrap_key_data(priv_pem.encode())
-            elif key_type == "rsa-4096":
-                priv_pem, public_key_pem = _gen_rsa(4096)
-                key_data = self._wrap_key_data(priv_pem.encode())
-            elif key_type == "ec-p256":
-                priv_pem, public_key_pem = _gen_ec(ec.SECP256R1())
-                key_data = self._wrap_key_data(priv_pem.encode())
-            elif key_type == "ec-p384":
-                priv_pem, public_key_pem = _gen_ec(ec.SECP384R1())
-                key_data = self._wrap_key_data(priv_pem.encode())
-            elif key_type == "ec-p521":
-                priv_pem, public_key_pem = _gen_ec(ec.SECP521R1())
-                key_data = self._wrap_key_data(priv_pem.encode())
-            elif key_type == "ec-secp256k1":
-                priv_pem, public_key_pem = _gen_ec(ec.SECP256K1())
-                key_data = self._wrap_key_data(priv_pem.encode())
-            elif key_type == "ed25519":
-                priv_pem, public_key_pem = _gen_ed25519()
-                key_data = self._wrap_key_data(priv_pem.encode())
-            else:
-                raise ValueError(f"Unsupported key type: {key_type}")
-
-            now_iso = _utcnow()
-            entry = {
-                "key_id": key_id,
-                "key_type": key_type,
-                "current_version": 1,
-                "versions": [
-                    {
-                        "version": 1,
-                        "key_data": key_data,
-                        "created_at": now_iso,
-                        "archived": False,
-                    }
-                ],
-                "public_key_pem": public_key_pem,
-                "policy": policy or {"allow_encrypt": True, "allow_decrypt": True, "allow_sign": True},
-                "operation_count": 0,
-                "created_at": now_iso,
-                "metadata": metadata or {},
-            }
             self._store.save_key(key_id, entry)
-            self._audit.record("generateKey", key_id=key_id, caller_id=caller_id, success=True)
-            self._update_key_metrics()
-            _logger.info("key generated", extra={
-                "event": "generate_key", "key_id": key_id,
-                "key_type": key_type, "caller_id": caller_id,
-            })
-            return key_id
+        self._audit.record("generateKey", key_id=key_id, caller_id=caller_id, success=True)
+        self._update_key_metrics()
+        _logger.info("key generated", extra={
+            "event": "generate_key", "key_id": key_id,
+            "key_type": key_type, "caller_id": caller_id,
+        })
+        return key_id
 
 
     # ------------------------------------------------------------------
@@ -471,9 +488,10 @@ class PyHSM:
         Returns the new version number.
         Only works for AES keys.
         """
-        with self._global_lock:
-            self._assert_session()
-            _validate_key_id(key_id)
+        self._assert_session()
+        _validate_key_id(key_id)
+
+        with self._key_lock(key_id):
             entry = self._store.load_key(key_id)
 
             if not entry["key_type"].startswith("aes"):
@@ -497,13 +515,14 @@ class PyHSM:
             })
             entry["current_version"] = new_version
             self._store.update_key(key_id, entry)
-            self._audit.record("rotateKey", key_id=key_id, caller_id=caller_id, success=True)
-            self._update_key_metrics()
-            _logger.info("key rotated", extra={
-                "event": "rotate_key", "key_id": key_id,
-                "new_version": new_version, "caller_id": caller_id,
-            })
-            return new_version
+
+        self._audit.record("rotateKey", key_id=key_id, caller_id=caller_id, success=True)
+        self._update_key_metrics()
+        _logger.info("key rotated", extra={
+            "event": "rotate_key", "key_id": key_id,
+            "new_version": new_version, "caller_id": caller_id,
+        })
+        return new_version
 
     # ------------------------------------------------------------------
     # Key destruction / listing
@@ -511,9 +530,10 @@ class PyHSM:
 
     def destroy_key(self, key_id: str, *, caller_id: Optional[str] = None) -> None:
         """Destroy a key — all versions are zeroized and removed."""
-        with self._global_lock:
-            self._assert_session()
-            _validate_key_id(key_id)
+        self._assert_session()
+        _validate_key_id(key_id)
+
+        with self._key_lock(key_id):
             entry = self._store.load_key(key_id)
             # Overwrite all key material in memory byte-by-byte
             for v in entry["versions"]:
@@ -522,42 +542,192 @@ class PyHSM:
                     zeroize_bytearray(kd)
                 v["key_data"] = bytearray()
             self._store.delete_key(key_id)
-            self._rate_limiter.reset(key_id)
-            # Clean up per-key lock to prevent unbounded growth
-            with self._key_locks_lock:
-                self._key_locks.pop(key_id, None)
-            self._audit.record("destroyKey", key_id=key_id, caller_id=caller_id, success=True)
-            self._update_key_metrics()
-            _logger.info("key destroyed", extra={
-                "event": "destroy_key", "key_id": key_id, "caller_id": caller_id,
-            })
+
+        self._rate_limiter.reset(key_id)
+        # Clean up per-key lock to prevent unbounded growth
+        with self._key_locks_lock:
+            self._key_locks.pop(key_id, None)
+        self._audit.record("destroyKey", key_id=key_id, caller_id=caller_id, success=True)
+        self._update_key_metrics()
+        _logger.info("key destroyed", extra={
+            "event": "destroy_key", "key_id": key_id, "caller_id": caller_id,
+        })
 
     def list_keys(self) -> list[dict]:
         """List all key IDs with their types, creation dates, and policies."""
-        with self._global_lock:
-            self._assert_session()
-            keys = self._store.load_all()
-            return [
-                {
-                    "key_id": kid,
-                    "key_type": v["key_type"],
-                    "current_version": v.get("current_version", 1),
-                    "created_at": v.get("created_at", ""),
-                    "policy": v.get("policy", {}),
-                }
-                for kid, v in keys.items()
-            ]
+        self._assert_session()
+        keys = self._store.load_all()
+        return [
+            {
+                "key_id": kid,
+                "key_type": v["key_type"],
+                "current_version": v.get("current_version", 1),
+                "created_at": v.get("created_at", ""),
+                "policy": v.get("policy", {}),
+            }
+            for kid, v in keys.items()
+        ]
 
     def has_key(self, key_id: str) -> bool:
         """Check whether a key_id exists in the store."""
-        with self._global_lock:
-            self._assert_session()
-            try:
-                self._store.load_key(key_id)
-                return True
-            except KeyError:
-                return False
+        self._assert_session()
+        try:
+            self._store.load_key(key_id)
+            return True
+        except KeyError:
+            return False
 
+    def search_keys(
+        self,
+        *,
+        key_type: Optional[str] = None,
+        metadata: Optional[dict] = None,
+        status: Optional[str] = None,
+        policy_filter: Optional[dict] = None,
+    ) -> list[dict]:
+        """
+        Search keys by type, metadata, status, or policy fields.
+
+        Parameters
+        ----------
+        key_type : str, optional
+            Filter by key type (e.g. "aes-256", "ec-p256", "ed25519").
+        metadata : dict, optional
+            Filter by metadata key-value pairs. All specified pairs must
+            match (AND logic). Values are compared with equality.
+        status : str, optional
+            Filter by key status: "active" (current version not archived),
+            "archived" (current version archived), or "expired" (policy
+            expiry in the past).
+        policy_filter : dict, optional
+            Filter by policy fields. Keys with matching policy values are
+            returned. Example: {"allow_encrypt": True, "rotate_every_days": 90}
+
+        Returns
+        -------
+        list[dict]
+            List of matching key summaries (same format as list_keys()).
+        """
+        self._assert_session()
+        keys = self._store.load_all()
+        results = []
+
+        now = datetime.now(timezone.utc)
+
+        for kid, entry in keys.items():
+            # Filter by key_type
+            if key_type and entry.get("key_type") != key_type:
+                continue
+
+            # Filter by metadata (all specified pairs must match)
+            if metadata:
+                entry_meta = entry.get("metadata", {})
+                if not all(entry_meta.get(k) == v for k, v in metadata.items()):
+                    continue
+
+            # Filter by status
+            if status:
+                current_v = entry.get("current_version", 1)
+                current = next(
+                    (v for v in entry.get("versions", []) if v["version"] == current_v),
+                    None,
+                )
+                is_archived = current and current.get("archived", False)
+
+                # Check expiry
+                expires_at = entry.get("policy", {}).get("expires_at")
+                is_expired = False
+                if expires_at:
+                    try:
+                        is_expired = datetime.fromisoformat(expires_at) < now
+                    except (ValueError, TypeError):
+                        pass
+
+                if status == "active" and (is_archived or is_expired):
+                    continue
+                elif status == "archived" and not is_archived:
+                    continue
+                elif status == "expired" and not is_expired:
+                    continue
+
+            # Filter by policy fields
+            if policy_filter:
+                entry_policy = entry.get("policy", {})
+                if not all(entry_policy.get(k) == v for k, v in policy_filter.items()):
+                    continue
+
+            results.append({
+                "key_id": kid,
+                "key_type": entry["key_type"],
+                "current_version": entry.get("current_version", 1),
+                "created_at": entry.get("created_at", ""),
+                "policy": entry.get("policy", {}),
+                "metadata": entry.get("metadata", {}),
+            })
+
+        return results
+
+
+    # ------------------------------------------------------------------
+    # Automatic key rotation
+    # ------------------------------------------------------------------
+
+    def _check_auto_rotation(self, key_id: str, entry: dict, caller_id: Optional[str] = None) -> dict:
+        """
+        Check if the current key version needs automatic rotation based on
+        the ``rotate_every_days`` policy field.
+
+        If rotation is due, performs the rotation and returns the updated entry.
+        Only applies to AES keys (asymmetric key rotation is not supported).
+
+        This is called on encrypt/sign operations (write-path) so that stale
+        keys are rotated transparently without requiring manual intervention.
+        """
+        policy = entry.get("policy", {})
+        rotate_days = policy.get("rotate_every_days")
+        if rotate_days is None or not entry["key_type"].startswith("aes"):
+            return entry
+
+        # Find the current version's creation date
+        current = next(
+            (v for v in entry["versions"] if v["version"] == entry["current_version"]),
+            None,
+        )
+        if not current:
+            return entry
+
+        created_at = current.get("created_at", "")
+        if not created_at:
+            return entry
+
+        try:
+            version_age = datetime.now(timezone.utc) - datetime.fromisoformat(created_at)
+        except (ValueError, TypeError):
+            return entry
+
+        if version_age.days >= rotate_days:
+            # Auto-rotate: archive current, generate new version
+            current["archived"] = True
+            key_len = 32 if entry["key_type"] == "aes-256" else 16
+            new_version = entry["current_version"] + 1
+            raw = os.urandom(key_len)
+            entry["versions"].append({
+                "version": new_version,
+                "key_data": self._wrap_key_data(raw),
+                "created_at": _utcnow(),
+                "archived": False,
+            })
+            entry["current_version"] = new_version
+            self._store.update_key(key_id, entry)
+            self._audit.record("rotateKey", key_id=key_id, caller_id=caller_id, success=True,
+                               reason=f"auto-rotation (policy: {rotate_days} days)")
+            _logger.info("auto-rotated key", extra={
+                "event": "rotate_key", "key_id": key_id,
+                "new_version": new_version, "reason": "rotate_every_days",
+                "policy_days": rotate_days, "age_days": version_age.days,
+            })
+
+        return entry
 
     # ------------------------------------------------------------------
     # Encrypt / Decrypt (AES-256-GCM with version prefix)
@@ -587,6 +757,9 @@ class PyHSM:
                 raise ValueError("Encryption requires an AES key")
 
             self._enforce_policy(entry, "encrypt", caller_id)
+
+            # Auto-rotate if policy requires it
+            entry = self._check_auto_rotation(key_id, entry, caller_id)
 
             # Get current version
             current = next(
@@ -967,9 +1140,169 @@ class PyHSM:
                 "metadata": metadata or {},
             }
             self._store.save_key(key_id, entry)
-            self._audit.record("generateKey", key_id=key_id, caller_id=caller_id, success=True)
+            self._audit.record("importKey", key_id=key_id, caller_id=caller_id, success=True)
             self._update_key_metrics()
             return key_id
+
+    # ------------------------------------------------------------------
+    # Backup / Restore
+    # ------------------------------------------------------------------
+
+    def create_backup(self, backup_dir: str, *, caller_id: Optional[str] = None) -> str:
+        """
+        Create an encrypted backup of the keystore.
+
+        Copies the current encrypted keystore file to the specified backup
+        directory with a timestamped filename. The backup is a byte-for-byte
+        copy of the encrypted envelope — no decryption or re-encryption occurs.
+
+        Parameters
+        ----------
+        backup_dir : str
+            Directory to write the backup file. Created if it doesn't exist.
+        caller_id : str, optional
+            Identity of the caller for audit logging.
+
+        Returns
+        -------
+        str
+            Full path to the created backup file.
+
+        Raises
+        ------
+        RuntimeError
+            If the session is closed or the keystore doesn't exist.
+        """
+        self._assert_session()
+
+        if not self._store.backend.exists():
+            raise RuntimeError("PyHSM: cannot backup — keystore does not exist yet")
+
+        os.makedirs(backup_dir, mode=0o700, exist_ok=True)
+
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        backup_filename = f"pyhsm-backup-{timestamp}.enc"
+        backup_path = os.path.join(backup_dir, backup_filename)
+
+        # Read raw encrypted data from the backend
+        data = self._store.backend.read()
+
+        # Write atomically to backup location
+        tmp_path = backup_path + ".tmp"
+        with open(tmp_path, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, backup_path)
+        os.chmod(backup_path, 0o600)
+
+        self._audit.record("backup", caller_id=caller_id, success=True)
+        _logger.info("backup created", extra={
+            "event": "backup", "backup_path": backup_path, "caller_id": caller_id,
+        })
+        return backup_path
+
+    def verify_backup(self, backup_path: str, *, caller_id: Optional[str] = None) -> bool:
+        """
+        Verify a backup file can be decrypted and has a valid HMAC.
+
+        Does NOT load the backup into the live store. Only confirms that:
+          1. The HMAC-SHA256 tamper seal is valid
+          2. The AES-256-GCM decryption succeeds
+          3. The decrypted JSON is parseable
+
+        Parameters
+        ----------
+        backup_path : str
+            Path to the backup file to verify.
+        caller_id : str, optional
+            Identity of the caller for audit logging.
+
+        Returns
+        -------
+        bool
+            True if the backup is intact and decryptable.
+
+        Raises
+        ------
+        RuntimeError
+            If the session is closed.
+        FileNotFoundError
+            If the backup file doesn't exist.
+        TamperError
+            If HMAC verification fails (backup was modified).
+        ValueError
+            If decryption fails (wrong password or corruption).
+        """
+        import hmac as _hmac_mod
+        import hashlib as _hashlib_mod
+
+        self._assert_session()
+
+        if not os.path.exists(backup_path):
+            raise FileNotFoundError(f"PyHSM: backup file not found: {backup_path}")
+
+        with open(backup_path, "rb") as f:
+            data = f.read()
+
+        _SALT_LEN = 16
+        _HMAC_LEN = 32
+        _NONCE_LEN = 12
+        _MIN_LEN = _SALT_LEN + _HMAC_LEN + _NONCE_LEN + 16
+
+        if len(data) < _MIN_LEN:
+            self._audit.record("verifyBackup", caller_id=caller_id, success=False,
+                               reason="file too short")
+            raise ValueError(
+                f"PyHSM: backup file too short — likely corrupted: {backup_path}"
+            )
+
+        salt = data[:_SALT_LEN]
+        stored_hmac = data[_SALT_LEN:_SALT_LEN + _HMAC_LEN]
+        payload = data[_SALT_LEN + _HMAC_LEN:]
+
+        # Derive subkeys using the same KDF as the store
+        enc_key, mac_key = self._store._derive_subkeys(salt)
+
+        try:
+            # Verify HMAC
+            expected_hmac = _hmac_mod.new(bytes(mac_key), payload, _hashlib_mod.sha256).digest()
+            if not _hmac_mod.compare_digest(stored_hmac, expected_hmac):
+                self._audit.record("verifyBackup", caller_id=caller_id, success=False,
+                                   reason="HMAC verification failed")
+                raise TamperError(
+                    f"PyHSM: backup HMAC verification FAILED — "
+                    f"file may be corrupted or tampered: {backup_path}"
+                )
+
+            # Attempt decryption
+            nonce = payload[:_NONCE_LEN]
+            ct_plus_tag = payload[_NONCE_LEN:]
+            plain = AESGCM(bytes(enc_key)).decrypt(nonce, ct_plus_tag, None)
+
+            # Verify JSON is parseable
+            import json as _json_mod
+            _json_mod.loads(plain.decode("utf-8"))
+
+        except TamperError:
+            raise
+        except Exception as e:
+            self._audit.record("verifyBackup", caller_id=caller_id, success=False,
+                               reason=str(e))
+            raise ValueError(
+                f"PyHSM: backup decryption FAILED — "
+                f"file may be corrupted: {backup_path}"
+            ) from e
+        finally:
+            zeroize_bytearray(enc_key)
+            zeroize_bytearray(mac_key)
+
+        self._audit.record("verifyBackup", caller_id=caller_id, success=True)
+        _logger.info("backup verified", extra={
+            "event": "verify_backup", "backup_path": backup_path,
+            "caller_id": caller_id, "result": "OK",
+        })
+        return True
 
     # ------------------------------------------------------------------
     # Expiry enforcement
@@ -1003,6 +1336,26 @@ class PyHSM:
         """Return metrics in Prometheus text exposition format."""
         return self._metrics.to_prometheus()
 
+    def get_otlp_metrics(self) -> dict:
+        """
+        Return metrics in OpenTelemetry Protocol (OTLP) JSON format.
+
+        The returned dict can be serialized to JSON and POSTed to any
+        OTLP-compatible collector endpoint (e.g., http://collector:4318/v1/metrics).
+
+        Example::
+
+            import json, urllib.request
+            payload = json.dumps(hsm.get_otlp_metrics()).encode()
+            req = urllib.request.Request(
+                "http://localhost:4318/v1/metrics",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            urllib.request.urlopen(req)
+        """
+        return self._metrics.to_otlp()
+
     def get_audit_log(self) -> AuditLog:
         """Return the AuditLog instance for direct inspection or verification."""
         return self._audit
@@ -1021,13 +1374,18 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _gen_rsa(key_size: int) -> tuple[str, str]:
+def _gen_rsa(key_size: int) -> tuple[bytes, str]:
+    """Generate an RSA keypair. Returns (private_pem_bytes, public_pem_str).
+
+    The private PEM is returned as bytes (not str) so the caller can
+    convert to a mutable bytearray and zeroize after wrapping.
+    """
     private_key = rsa.generate_private_key(public_exponent=65537, key_size=key_size)
     priv_pem = private_key.private_bytes(
         serialization.Encoding.PEM,
         serialization.PrivateFormat.PKCS8,
         serialization.NoEncryption(),
-    ).decode()
+    )
     pub_pem = private_key.public_key().public_bytes(
         serialization.Encoding.PEM,
         serialization.PublicFormat.SubjectPublicKeyInfo,
@@ -1035,13 +1393,18 @@ def _gen_rsa(key_size: int) -> tuple[str, str]:
     return priv_pem, pub_pem
 
 
-def _gen_ec(curve) -> tuple[str, str]:
+def _gen_ec(curve) -> tuple[bytes, str]:
+    """Generate an EC keypair. Returns (private_pem_bytes, public_pem_str).
+
+    The private PEM is returned as bytes so the caller can convert to
+    a mutable bytearray and zeroize after wrapping.
+    """
     private_key = ec.generate_private_key(curve)
     priv_pem = private_key.private_bytes(
         serialization.Encoding.PEM,
         serialization.PrivateFormat.PKCS8,
         serialization.NoEncryption(),
-    ).decode()
+    )
     pub_pem = private_key.public_key().public_bytes(
         serialization.Encoding.PEM,
         serialization.PublicFormat.SubjectPublicKeyInfo,
@@ -1049,14 +1412,18 @@ def _gen_ec(curve) -> tuple[str, str]:
     return priv_pem, pub_pem
 
 
-def _gen_ed25519() -> tuple[str, str]:
-    """Generate an Ed25519 keypair. Returns (private_pem, public_pem)."""
+def _gen_ed25519() -> tuple[bytes, str]:
+    """Generate an Ed25519 keypair. Returns (private_pem_bytes, public_pem_str).
+
+    The private PEM is returned as bytes so the caller can convert to
+    a mutable bytearray and zeroize after wrapping.
+    """
     private_key = ed25519.Ed25519PrivateKey.generate()
     priv_pem = private_key.private_bytes(
         serialization.Encoding.PEM,
         serialization.PrivateFormat.PKCS8,
         serialization.NoEncryption(),
-    ).decode()
+    )
     pub_pem = private_key.public_key().public_bytes(
         serialization.Encoding.PEM,
         serialization.PublicFormat.SubjectPublicKeyInfo,

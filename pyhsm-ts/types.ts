@@ -19,6 +19,7 @@ export interface KeyPolicy {
   allowEncrypt: boolean;
   allowDecrypt: boolean;
   allowSign?: boolean;
+  allowExport?: boolean; // must be true to permit JWK export (defaults to false)
   maxOperations?: number;
   expiresAt?: string; // ISO timestamp
   allowedCallers?: string[]; // caller IDs that can use this key
@@ -58,9 +59,11 @@ export type AuditOperation =
   | "sign"
   | "verify"
   | "generateKey"
+  | "importKey"
   | "destroyKey"
   | "rotateKey"
   | "archiveKey"
+  | "exportKey"
   | "sessionOpen"
   | "sessionClose"
   | "tamperDetected"

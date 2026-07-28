@@ -105,3 +105,91 @@ class MetricsCollector:
             f'pyhsm_uptime_seconds {m["uptimeSeconds"]:.1f}',
         ]
         return "\n".join(lines)
+
+    def to_otlp(self) -> dict:
+        """
+        Render metrics in OpenTelemetry Protocol (OTLP) JSON format.
+
+        Returns a dict conforming to the OTLP metrics JSON schema
+        (ExportMetricsServiceRequest). This can be serialized to JSON
+        and POSTed to any OTLP-compatible collector endpoint
+        (e.g., /v1/metrics).
+
+        Example usage:
+            import json, urllib.request
+            payload = json.dumps(metrics.to_otlp()).encode()
+            req = urllib.request.Request(
+                "http://localhost:4318/v1/metrics",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            urllib.request.urlopen(req)
+        """
+        import time as _time
+
+        m = self.get_metrics()
+        now_ns = int(_time.time() * 1_000_000_000)
+
+        def _counter(name: str, description: str, value: int, attributes: Optional[list] = None) -> dict:
+            data_point: dict = {
+                "asInt": str(value),
+                "startTimeUnixNano": str(int((self._start + _time.time() - _time.monotonic()) * 1_000_000_000)),
+                "timeUnixNano": str(now_ns),
+            }
+            if attributes:
+                data_point["attributes"] = attributes
+            return {
+                "name": name,
+                "description": description,
+                "unit": "1",
+                "sum": {
+                    "dataPoints": [data_point],
+                    "aggregationTemporality": 2,  # CUMULATIVE
+                    "isMonotonic": True,
+                },
+            }
+
+        def _gauge(name: str, description: str, value, unit: str = "1") -> dict:
+            return {
+                "name": name,
+                "description": description,
+                "unit": unit,
+                "gauge": {
+                    "dataPoints": [{
+                        "asDouble": float(value),
+                        "timeUnixNano": str(now_ns),
+                    }],
+                },
+            }
+
+        metrics_list = [
+            _counter("pyhsm.operations", "Total HSM operations by type", m["encryptOps"],
+                     [{"key": "type", "value": {"stringValue": "encrypt"}}]),
+            _counter("pyhsm.operations", "Total HSM operations by type", m["decryptOps"],
+                     [{"key": "type", "value": {"stringValue": "decrypt"}}]),
+            _counter("pyhsm.operations", "Total HSM operations by type", m["signOps"],
+                     [{"key": "type", "value": {"stringValue": "sign"}}]),
+            _counter("pyhsm.operations", "Total HSM operations by type", m["verifyOps"],
+                     [{"key": "type", "value": {"stringValue": "verify"}}]),
+            _counter("pyhsm.errors", "Total HSM errors", m["errors"]),
+            _counter("pyhsm.rate_limit_hits", "Rate limit rejections", m["rateLimitHits"]),
+            _counter("pyhsm.access_denials", "Access control rejections", m["accessDenials"]),
+            _gauge("pyhsm.keys.active", "Active keys in the HSM", m["activeKeys"]),
+            _gauge("pyhsm.keys.archived", "Archived keys in the HSM", m["archivedKeys"]),
+            _gauge("pyhsm.uptime", "HSM uptime", m["uptimeSeconds"], "s"),
+        ]
+
+        return {
+            "resourceMetrics": [{
+                "resource": {
+                    "attributes": [
+                        {"key": "service.name", "value": {"stringValue": "pyhsm"}},
+                        {"key": "service.version", "value": {"stringValue": "1.8.0"}},
+                    ]
+                },
+                "scopeMetrics": [{
+                    "scope": {"name": "pyhsm.metrics", "version": "1.0.0"},
+                    "metrics": metrics_list,
+                }],
+            }],
+        }
