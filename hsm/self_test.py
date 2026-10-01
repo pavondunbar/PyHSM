@@ -18,23 +18,48 @@ from cryptography.hazmat.primitives import hashes
 
 
 def _test_aes_gcm() -> dict:
-    """AES-256-GCM round-trip and tag sanity check."""
-    key = bytes(32)
-    nonce = bytes(12)
-    pt = bytes(16)
+    """AES-256-GCM Known-Answer Test against NIST SP 800-38D published vector.
+
+    Source: NIST SP 800-38D, Appendix B, Test Case 14
+    (256-bit key, 96-bit IV, 128-bit plaintext, no AAD).
+      Key  = 0000000000000000000000000000000000000000000000000000000000000000
+      IV   = 000000000000000000000000
+      PT   = 00000000000000000000000000000000
+      CT   = cea7403d4d606b6e074ec5d3baf39d18
+      Tag  = d0d1c8a799996bf0265b98b5d48ab919
+
+    Using a published vector (rather than an all-zero round-trip) ensures
+    the library produces the correct GCM output, not merely that encrypt
+    and decrypt are consistent with each other.
+    """
+    key   = bytes(32)                        # 256-bit all-zero key
+    nonce = bytes(12)                        # 96-bit all-zero IV
+    pt    = bytes(16)                        # 128-bit all-zero plaintext
+    # cryptography appends the 16-byte tag directly after the ciphertext
+    expected_ct_tag = bytes.fromhex(
+        "cea7403d4d606b6e074ec5d3baf39d18"   # ciphertext
+        "d0d1c8a799996bf0265b98b5d48ab919"   # GCM authentication tag
+    )
+
     aesgcm = AESGCM(key)
-    ct = aesgcm.encrypt(nonce, pt, None)
-    # ct includes the 16-byte GCM tag appended by cryptography
+    ct_tag = aesgcm.encrypt(nonce, pt, None)
+
+    if ct_tag != expected_ct_tag:
+        return {
+            "test": "AES-256-GCM",
+            "passed": False,
+            "error": f"KAT mismatch: got {ct_tag.hex()}, expected {expected_ct_tag.hex()}",
+        }
+
+    # Verify decryption round-trip
     try:
-        recovered = aesgcm.decrypt(nonce, ct, None)
+        recovered = aesgcm.decrypt(nonce, ct_tag, None)
     except Exception as e:
-        return {"test": "AES-256-GCM", "passed": False, "error": str(e)}
+        return {"test": "AES-256-GCM", "passed": False, "error": f"Decrypt failed: {e}"}
+
     if recovered != pt:
         return {"test": "AES-256-GCM", "passed": False, "error": "Round-trip mismatch"}
-    # Tag must be non-zero (the last 16 bytes)
-    tag = ct[-16:]
-    if tag == bytes(16):
-        return {"test": "AES-256-GCM", "passed": False, "error": "Auth tag is all zeros"}
+
     return {"test": "AES-256-GCM", "passed": True}
 
 

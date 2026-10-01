@@ -62,6 +62,16 @@ class MetricsCollector:
     # ------------------------------------------------------------------
 
     def get_metrics(self) -> dict:
+        """Return a dict of current operational metrics.
+
+        SECURITY NOTE: The returned data reveals operational intelligence
+        about this HSM instance — key counts, operation volumes, rate-limit
+        hits, and access-denial counts. This information could assist an
+        attacker in identifying high-value keys, inferring usage patterns,
+        or timing attacks. Do NOT expose this output to untrusted callers,
+        log it to world-readable files, or return it over unauthenticated
+        network endpoints.
+        """
         uptime = time.monotonic() - self._start
         return {
             "totalOperations": self._total_ops,
@@ -78,7 +88,13 @@ class MetricsCollector:
         }
 
     def to_prometheus(self) -> str:
-        """Render metrics in Prometheus text exposition format."""
+        """Render metrics in Prometheus text exposition format.
+
+        SECURITY NOTE: This output exposes the same operational intelligence
+        as ``get_metrics()``. Only serve this endpoint to authenticated,
+        internal scrape targets (e.g., a Prometheus server on a private
+        network). Never expose it on a public interface without authentication.
+        """
         m = self.get_metrics()
         lines = [
             "# HELP pyhsm_operations_total Total HSM operations",
@@ -110,12 +126,18 @@ class MetricsCollector:
         """
         Render metrics in OpenTelemetry Protocol (OTLP) JSON format.
 
+        SECURITY NOTE: This output exposes the same operational intelligence
+        as ``get_metrics()``. Only ship this payload to authenticated,
+        trusted OTLP collectors. Never send it to untrusted endpoints or
+        log it to world-readable storage.
+
         Returns a dict conforming to the OTLP metrics JSON schema
         (ExportMetricsServiceRequest). This can be serialized to JSON
         and POSTed to any OTLP-compatible collector endpoint
         (e.g., /v1/metrics).
 
-        Example usage:
+        Example usage::
+
             import json, urllib.request
             payload = json.dumps(metrics.to_otlp()).encode()
             req = urllib.request.Request(

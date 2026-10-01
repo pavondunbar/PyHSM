@@ -35,11 +35,21 @@ function gfDiv(a: number, b: number): number {
 export interface ShamirShare {
   index: number; // 1-based
   data: string;  // hex-encoded
+  checksum?: string; // first 4 bytes of SHA-256(secret) as hex — for integrity verification
 }
 
-/** Split a secret (Buffer) into n shares with threshold k. */
+/** Split a secret (Buffer) into n shares with threshold k.
+ *
+ * Each share includes a `checksum` field — the first 4 bytes of
+ * SHA-256(secret) as hex. `reconstructSecret()` uses this to detect
+ * corrupted or mismatched shares after reconstruction, preventing a
+ * wrong secret from being silently used.
+ */
 export function splitSecret(secret: Buffer, k: number, n: number): ShamirShare[] {
   if (k < 2 || k > n || n > 255) throw new Error("Invalid k/n parameters");
+
+  // Compute the integrity checksum from the original secret before splitting.
+  const checksum = crypto.createHash("sha256").update(secret).digest().subarray(0, 4).toString("hex");
 
   const shares: Buffer[] = Array.from({ length: n }, () => Buffer.alloc(secret.length));
 
@@ -61,10 +71,19 @@ export function splitSecret(secret: Buffer, k: number, n: number): ShamirShare[]
     }
   }
 
-  return shares.map((data, i) => ({ index: i + 1, data: data.toString("hex") }));
+  return shares.map((data, i) => ({ index: i + 1, data: data.toString("hex"), checksum }));
 }
 
-/** Reconstruct a secret from k or more shares via Lagrange interpolation. */
+/** Reconstruct a secret from k or more shares via Lagrange interpolation.
+ *
+ * Integrity check
+ * ---------------
+ * If shares carry a `checksum` field (first 4 bytes of SHA-256 of the
+ * original secret as hex), the reconstructed value is verified against it.
+ * A mismatch raises an Error before the wrong value can be used. Shares
+ * without a `checksum` field (produced by older versions) are still
+ * accepted — the check is skipped so existing shares remain usable.
+ */
 export function reconstructSecret(shares: ShamirShare[]): Buffer {
   if (shares.length < 2) throw new Error("Need at least 2 shares");
   const len = Buffer.from(shares[0].data, "hex").length;
@@ -84,6 +103,22 @@ export function reconstructSecret(shares: ShamirShare[]): Buffer {
     }
     result[b] = secret;
   }
+
+  // Verify integrity checksum if present in shares.
+  // All shares from the same split carry the same checksum — use the first.
+  const storedChecksum = shares[0].checksum;
+  if (storedChecksum !== undefined) {
+    const actualChecksum = crypto.createHash("sha256").update(result).digest().subarray(0, 4).toString("hex");
+    if (actualChecksum !== storedChecksum) {
+      result.fill(0);
+      throw new Error(
+        "PyHSM Shamir: reconstructed secret failed checksum verification. " +
+        "One or more shares may be corrupted or belong to a different split. " +
+        "Result has been zeroized to prevent use of a wrong secret."
+      );
+    }
+  }
+
   return result;
 }
 
@@ -92,7 +127,17 @@ export function splitMasterPassword(password: string, k: number, n: number): Sha
   return splitSecret(Buffer.from(password, "utf8"), k, n);
 }
 
-/** Reconstruct master password from shares. */
-export function reconstructMasterPassword(shares: ShamirShare[]): string {
-  return reconstructSecret(shares).toString("utf8");
+/**
+ * Reconstruct master password from shares, returning a Buffer.
+ *
+ * Returning a Buffer (rather than a string) allows the caller to call
+ * buf.fill(0) after copying the password into the HSM, deterministically
+ * removing the sensitive value from memory. JavaScript strings are
+ * immutable and cannot be zeroed — passing through a string would leave
+ * the password in the V8 heap until GC.
+ *
+ * The caller is responsible for calling buf.fill(0) after use.
+ */
+export function reconstructMasterPassword(shares: ShamirShare[]): Buffer {
+  return reconstructSecret(shares);
 }

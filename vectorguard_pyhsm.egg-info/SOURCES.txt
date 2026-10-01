@@ -15,6 +15,7 @@ hsm/secure_memory.py
 hsm/self_test.py
 hsm/shamir.py
 hsm/storage.py
+tests/test_cli.py
 tests/test_concurrency.py
 tests/test_pyhsm.py
 vectorguard_pyhsm.egg-info/PKG-INFO

@@ -79,9 +79,31 @@ def _validate_master_password(password: str) -> None:
     Enforces:
       - Minimum length of 12 characters (NIST SP 800-63B recommendation)
       - Not all same character (degenerate input)
+      - At least 3 distinct characters (catches "aaaaaaaaaaab" style)
+      - Not a member of a short list of well-known weak passwords that
+        pass the length check but provide near-zero entropy
 
     Raises ValueError if the password is too weak.
     """
+    # fmt: off
+    _KNOWN_WEAK = frozenset({
+        "password123456", "password1234", "password123",
+        "123456789012", "1234567890123", "12345678901234",
+        "qwertyuiopas", "qwertyuiop12",
+        "abcdefghijkl", "abcdefghijklm",
+        "aaaaaaaaaaaa", "bbbbbbbbbbbb",
+        "iloveyou1234", "iloveyou12345",
+        "admin1234567", "administrator",
+        "letmein12345", "welcome12345",
+        "monkey123456", "dragon123456",
+        "master123456", "passw0rd1234",
+        "changeme1234", "changeme123",
+        "test12345678", "testpassword",
+        "111111111111", "000000000000",
+        "passwordpassword", "pass1234word",
+    })
+    # fmt: on
+
     if len(password) < _MIN_PASSWORD_LENGTH:
         raise ValueError(
             f"PyHSM: master password too short ({len(password)} chars). "
@@ -91,6 +113,15 @@ def _validate_master_password(password: str) -> None:
     if len(set(password)) == 1:
         raise ValueError(
             "PyHSM: master password must not be a single repeated character."
+        )
+    if len(set(password)) < 3:
+        raise ValueError(
+            "PyHSM: master password must contain at least 3 distinct characters."
+        )
+    if password.lower() in _KNOWN_WEAK:
+        raise ValueError(
+            "PyHSM: master password is a known-weak value. "
+            "Use a strong, unique passphrase for production deployments."
         )
 
 
@@ -118,8 +149,9 @@ class PyHSM:
         Maximum operations per key per rate window. Default 100.
     rate_limit_window_s : float, optional
         Rate-limit window in seconds. Default 60.
-    skip_password_validation : bool, optional
-        If True, skip password strength checks. Only use this for
+    _unsafe_skip_password_validation : bool, optional
+        If True, skip password strength checks. The leading underscore
+        signals this is not a stable public API. Only use this for
         testing or migration scenarios. Default False.
 
     Notes
@@ -139,7 +171,7 @@ class PyHSM:
         session_timeout_s: float = 300.0,
         rate_limit_max_ops: int = 100,
         rate_limit_window_s: float = 60.0,
-        skip_password_validation: bool = False,
+        _unsafe_skip_password_validation: bool = False,
     ) -> None:
         if not master_password:
             raise ValueError(
@@ -147,7 +179,7 @@ class PyHSM:
                 "There is no insecure default — supply an explicit password."
             )
 
-        if not skip_password_validation:
+        if not _unsafe_skip_password_validation:
             _validate_master_password(master_password)
 
         self._storage_path = storage_path
@@ -743,9 +775,9 @@ class PyHSM:
         Security features:
           - Per-key AES-KWP wrapping (keys double-encrypted at rest)
           - AAD binds ciphertext to the key_id (prevents cross-key confusion)
-          - Hybrid nonce: 4-byte random prefix + 4-byte counter + 4-byte random
-            suffix. The counter prevents birthday-bound collisions even at
-            high encryption volumes (safe well beyond 2^32 operations per key).
+          - Fully random 96-bit nonce (12 bytes of os.urandom). Safe up to
+            ~4 billion encryptions per key before the birthday bound is
+            approached. Beyond that threshold, rotate the key.
           - Input size validation (max 64 MB)
         """
         with self._key_lock(key_id):
@@ -778,10 +810,22 @@ class PyHSM:
                     f"Maximum is {_MAX_PLAINTEXT_SIZE} bytes (64 MB)."
                 )
 
-            # Hybrid nonce: random(4) + counter(4) + random(4) = 12 bytes
-            op_count = entry.get("operation_count", 0)
-            counter_bytes = (op_count & 0xFFFFFFFF).to_bytes(4, "big")
-            nonce = os.urandom(4) + counter_bytes + os.urandom(4)
+            # Fully random 96-bit nonce (12 bytes).
+            #
+            # The previous hybrid nonce (random(4) + op_count(4) + random(4))
+            # used operation_count as a counter component to guard against
+            # birthday-bound collisions. However, restoring from a backup
+            # resets operation_count to the backed-up value, meaning nonces
+            # generated after a restore could repeat values used before the
+            # backup — violating AES-GCM's nonce-uniqueness requirement.
+            #
+            # A fully random 96-bit nonce has a collision probability of
+            # ~1/2^32 after 2^32 (~4 billion) encryptions under the same key
+            # (birthday bound), regardless of backup/restore cycles. At the
+            # throughput this software HSM supports (~10 ops/sec), reaching
+            # 2^32 operations takes ~13 years. Key rotation is expected long
+            # before that threshold is reached.
+            nonce = os.urandom(12)
 
             # AAD: bind ciphertext to key_id + version
             aad = f"pyhsm:v1:{key_id}:{current['version']}".encode("utf-8")
@@ -799,8 +843,10 @@ class PyHSM:
             version_bytes = current["version"].to_bytes(_VERSION_PREFIX_LEN, "big")
             result = (format_byte + version_bytes + nonce + ct).hex()
 
-            entry["operation_count"] = op_count + 1
-            self._store.update_key(key_id, entry)
+            # Atomically increment operation_count under _save_lock so no
+            # concurrent operation on any key can interleave a stale read,
+            # bypassing the max_operations policy limit.
+            self._store.increment_operation_count(key_id)
             self._metrics.record_op("encrypt")
             self._audit.record("encrypt", key_id=key_id, caller_id=caller_id, success=True)
             _logger.debug("encrypt operation", extra={
@@ -880,8 +926,8 @@ class PyHSM:
             finally:
                 key.zeroize()
 
-            entry["operation_count"] = entry.get("operation_count", 0) + 1
-            self._store.update_key(key_id, entry)
+            # Atomically increment operation_count under _save_lock.
+            self._store.increment_operation_count(key_id)
             self._metrics.record_op("decrypt")
             self._audit.record("decrypt", key_id=key_id, caller_id=caller_id, success=True)
             _logger.debug("decrypt operation", extra={
@@ -938,8 +984,8 @@ class PyHSM:
             else:
                 raise ValueError("Signing requires an RSA, EC, or Ed25519 key")
 
-            entry["operation_count"] = entry.get("operation_count", 0) + 1
-            self._store.update_key(key_id, entry)
+            # Atomically increment operation_count under _save_lock.
+            self._store.increment_operation_count(key_id)
             self._metrics.record_op("sign")
             self._audit.record("sign", key_id=key_id, caller_id=caller_id, success=True)
             _logger.debug("sign operation", extra={
@@ -986,12 +1032,17 @@ class PyHSM:
                     public_key.verify(sig, data, ec.ECDSA(hash_alg))
                 else:
                     return False
-                entry["operation_count"] = entry.get("operation_count", 0) + 1
-                self._store.update_key(key_id, entry)
+                # Atomically increment operation_count under _save_lock.
+                self._store.increment_operation_count(key_id)
                 self._metrics.record_op("verify")
                 self._audit.record("verify", key_id=key_id, caller_id=caller_id, success=True)
                 return True
             except Exception:
+                # Increment on failure too: an attacker making unlimited failed
+                # verify() calls against a max_operations key would never
+                # consume the counter on the old success-only path, effectively
+                # bypassing the operation limit. Counting failures closes that gap.
+                self._store.increment_operation_count(key_id)
                 self._audit.record("verify", key_id=key_id, caller_id=caller_id, success=False)
                 return False
 

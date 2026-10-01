@@ -13,6 +13,12 @@ import sys
 from hsm import PyHSM
 from hsm.shamir import split_secret, reconstruct_secret, zeroize
 
+# Maximum bytes read from stdin in a single CLI operation.
+# Set to 64 MB + 1 so that payloads exceeding the limit are detected
+# here at the CLI boundary before being passed to core.py's guard,
+# preventing unbounded memory allocation from a large stdin pipe.
+_MAX_STDIN_BYTES = 64 * 1024 * 1024 + 1
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -20,7 +26,23 @@ from hsm.shamir import split_secret, reconstruct_secret, zeroize
 
 def get_hsm(args) -> PyHSM:
     """Obtain a PyHSM instance. Password is always entered interactively via getpass."""
-    password = os.environ.get("PYHSM_MASTER_PASSWORD") or getpass.getpass("Master password: ")
+    env_password = os.environ.get("PYHSM_MASTER_PASSWORD")
+    if env_password:
+        # Clear the variable from the process environment immediately so it
+        # cannot be read from /proc/<pid>/environ or inspected by other
+        # processes running as the same user.
+        os.environ.pop("PYHSM_MASTER_PASSWORD", None)
+        print(
+            "WARNING: PYHSM_MASTER_PASSWORD is set in the environment. "
+            "The variable has been cleared from the process environment, but it "
+            "may still be visible in shell history or parent process environments. "
+            "Use interactive password entry for production deployments.",
+            file=sys.stderr,
+        )
+        password = env_password
+    else:
+        password = getpass.getpass("Master password: ")
+
     is_new = not os.path.exists(args.store)
     hsm = PyHSM(
         storage_path=args.store,
@@ -89,7 +111,7 @@ def cmd_delete(args) -> None:
 
 def cmd_encrypt(args) -> None:
     hsm = get_hsm(args)
-    data = args.data or sys.stdin.read()
+    data = args.data or sys.stdin.buffer.read(_MAX_STDIN_BYTES).decode("utf-8", errors="surrogateescape")
     ct = hsm.encrypt(args.key_id, data)
     print(ct)
     hsm.close_session()
@@ -97,7 +119,7 @@ def cmd_encrypt(args) -> None:
 
 def cmd_decrypt(args) -> None:
     hsm = get_hsm(args)
-    data = args.data or sys.stdin.read().strip()
+    data = args.data or sys.stdin.buffer.read(_MAX_STDIN_BYTES).decode("utf-8", errors="surrogateescape").strip()
     pt = hsm.decrypt(args.key_id, data)
     sys.stdout.buffer.write(pt)
     hsm.close_session()
@@ -105,7 +127,7 @@ def cmd_decrypt(args) -> None:
 
 def cmd_sign(args) -> None:
     hsm = get_hsm(args)
-    data = args.data or sys.stdin.read()
+    data = args.data or sys.stdin.buffer.read(_MAX_STDIN_BYTES).decode("utf-8", errors="surrogateescape")
     sig = hsm.sign(args.key_id, data)
     print(sig)
     hsm.close_session()

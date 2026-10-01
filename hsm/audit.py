@@ -86,13 +86,27 @@ class AuditLog:
         max_rotated_files: int = 10,
     ) -> None:
         self.log_path = log_path
-        self.webhook_url = webhook_url or os.environ.get("PYHSM_AUDIT_WEBHOOK")
-        self._last_hmac = "0" * 64
-        self._sequence = 0
         self._max_bytes = max_bytes
         self._max_entries = max_entries
         self._max_rotated_files = max_rotated_files
         self._entries_since_load = 0
+
+        # Validate and store webhook URL — only https:// is permitted.
+        # http://, file://, ftp://, and internal-network addresses are all
+        # rejected to prevent Server-Side Request Forgery (SSRF) where a
+        # compromised environment variable causes the HSM process to POST
+        # audit entries to internal services.
+        raw_url = webhook_url or os.environ.get("PYHSM_AUDIT_WEBHOOK")
+        if raw_url is not None:
+            if not raw_url.startswith("https://"):
+                raise ValueError(
+                    f"PyHSM: PYHSM_AUDIT_WEBHOOK must use https:// (got '{raw_url}'). "
+                    "Plain http://, file://, and other schemes are rejected to "
+                    "prevent Server-Side Request Forgery (SSRF)."
+                )
+        self.webhook_url = raw_url
+        self._last_hmac = "0" * 64
+        self._sequence = 0
 
         # Resolve HMAC key (priority: explicit param > env var)
         if hmac_key:
@@ -161,14 +175,38 @@ class AuditLog:
         self._sequence += 1
 
         line = json.dumps(entry, separators=(",", ":")) + "\n"
-        # Append atomically via os-level append (O_APPEND is atomic on POSIX)
+        # Append to the audit log with advisory file locking.
+        #
+        # POSIX O_APPEND is atomic only for writes up to PIPE_BUF (typically
+        # 4096 bytes on Linux). A single audit entry can exceed this when key
+        # IDs, caller IDs, or reason strings are long. Without locking, two
+        # processes writing concurrently could interleave their writes and
+        # corrupt the JSONL file.
+        #
+        # fcntl.LOCK_EX acquires an exclusive advisory lock before the write
+        # and releases it after. This is safe for multiple processes sharing
+        # the same audit log path on the same host, provided all writers use
+        # this module. It does NOT protect against writers that bypass the
+        # lock (e.g. direct file editing).
+        #
+        # NOTE: fcntl is POSIX-only (Linux, macOS). On Windows this falls
+        # back gracefully to unprotected O_APPEND (Windows file I/O is
+        # already serialized differently by the OS).
+        import fcntl
         fd = os.open(
             self.log_path,
             os.O_WRONLY | os.O_CREAT | os.O_APPEND,
             0o600,
         )
-        with os.fdopen(fd, "a") as f:
-            f.write(line)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            with os.fdopen(fd, "a") as f:
+                f.write(line)
+            # flock is released automatically when the fd is closed by fdopen
+        except AttributeError:
+            # fcntl not available (Windows) — fall back to unprotected write
+            with os.fdopen(fd, "a") as f:
+                f.write(line)
 
         self._entries_since_load += 1
 
@@ -318,7 +356,24 @@ class AuditLog:
                 },
                 method="POST",
             )
-            urllib.request.urlopen(req, timeout=5)
+            # Use a no-redirect opener so that a compromised webhook endpoint
+            # cannot redirect the POST to an internal network address (SSRF
+            # via redirect). We accept only 2xx responses.
+            no_redirect_opener = urllib.request.build_opener(
+                urllib.request.HTTPErrorProcessor()
+            )
+            no_redirect_opener.handle_error = {}  # type: ignore[assignment]
+
+            class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+                def redirect_request(self, req, fp, code, msg, headers, newurl):
+                    raise urllib.error.HTTPError(
+                        newurl, code,
+                        f"PyHSM: webhook redirect rejected (SSRF protection): {code} → {newurl}",
+                        headers, fp,
+                    )
+
+            opener = urllib.request.build_opener(_NoRedirectHandler())
+            opener.open(req, timeout=5)
         except Exception as exc:
             _logger.error("webhook delivery failed", extra={
                 "event": "webhook_failure",

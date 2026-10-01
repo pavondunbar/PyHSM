@@ -80,12 +80,28 @@ def zeroize_bytearray(buf: bytearray) -> None:
 
 def zeroize_dict_keys(keys_dict: dict) -> None:
     """
-    Overwrite all key_data fields in a keys dictionary with zeros.
+    Overwrite all ``key_data`` bytearrays in a keys dictionary with zeros.
 
     This handles the in-memory keystore structure where each key entry
-    has a 'versions' list, each containing a 'key_data' bytearray.
-    The bytearray is overwritten in-place with zeros for deterministic
-    memory erasure. Any residual string references are also cleared.
+    has a ``versions`` list, each containing a ``key_data`` field. When
+    that field is a ``bytearray`` (the normal in-memory representation
+    after ``_internalize_key_data()`` has run), it is overwritten in-place
+    with zeros for deterministic memory erasure.
+
+    LIMITATION — Python string immutability
+    ----------------------------------------
+    If ``key_data`` is a ``str`` (e.g. on a code path that skips
+    internalization, or in a very old keystore format), this function
+    **cannot** zeroize it. Python ``str`` objects are immutable — there
+    is no way to overwrite their underlying bytes in place. In that case
+    the field is set to an empty string ``""``, which removes the key
+    material from the dict object itself, but the original string value
+    may linger in the CPython heap until garbage collected.
+
+    All production code paths in PyHSM call ``_internalize_key_data()``
+    immediately after JSON deserialisation, converting ``str`` values to
+    ``bytearray`` before any cryptographic use. This function therefore
+    operates on ``bytearray`` values in all normal usage.
     """
     for key_id, entry in keys_dict.items():
         if isinstance(entry, str):
@@ -94,5 +110,9 @@ def zeroize_dict_keys(keys_dict: dict) -> None:
         for v in versions:
             key_data = v.get("key_data", "")
             if isinstance(key_data, bytearray):
+                # Mutable — overwrite in place deterministically.
                 zeroize_bytearray(key_data)
+            # Whether bytearray or str, clear the dict reference.
+            # For str values this only removes the reference from the dict;
+            # the original immutable string object cannot be zeroed.
             v["key_data"] = ""

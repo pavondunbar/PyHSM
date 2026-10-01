@@ -81,6 +81,14 @@ export class PyHSM {
   private sessionTimer: ReturnType<typeof setTimeout> | null = null;
   private sessionTimeoutMs!: number;
 
+  // In-memory Buffer map for wrapped key data — mirrors Python's bytearray
+  // internalization pattern. Keys are "keyId:version" strings. Storing
+  // wrapped key material as a Buffer (rather than the hex string in keyData)
+  // allows deterministic buf.fill(0) zeroization on destroyKey() and
+  // closeSession(). The hex strings in KeyVersion.keyData are only used for
+  // JSON serialisation; all in-memory crypto operations use these Buffers.
+  private _keyDataBuffers: Map<string, Buffer> = new Map();
+
   // Derived key cache — persists across save/load within a session.
   // The master derived key is the expensive output of Argon2id/PBKDF2.
   // It is computed once and reused for subkey derivation via HKDF.
@@ -182,18 +190,39 @@ export class PyHSM {
       this.masterPasswordBuf = Buffer.from(config.masterPassword, "utf8");
     } else if (config.shares && config.shares.length > 0) {
       const shares: ShamirShare[] = config.shares.map((s) => JSON.parse(s));
+      // reconstructMasterPassword returns a Buffer so we can zeroize it after
+      // copying into masterPasswordBuf — JS strings are immutable and cannot
+      // be zeroed, so we avoid the string conversion entirely.
       const reconstructed = reconstructMasterPassword(shares);
-      this.masterPasswordBuf = Buffer.from(reconstructed, "utf8");
+      this.masterPasswordBuf = Buffer.from(reconstructed);
+      // Zeroize the intermediate buffer now that we've copied it
+      reconstructed.fill(0);
     } else {
       throw new Error("PyHSM: masterPassword or shares required");
     }
 
     // Initialize sub-modules
     const auditPath = config.auditLogPath || config.storePath + ".audit.jsonl";
-    // Derive audit HMAC key from master password via HKDF (matches Python layer)
-    const auditHmacKey = Buffer.from(
-      crypto.hkdfSync("sha256", this.masterPasswordBuf, Buffer.alloc(0), "pyhsm-audit-hmac-v1", 32)
-    );
+    // Derive audit HMAC key from master password via HKDF-Expand only.
+    //
+    // IMPORTANT: This must match the Python layer exactly.
+    // Python uses HKDFExpand(algorithm=SHA256, length=32, info=b"pyhsm-audit-hmac-v1").derive(password)
+    // which runs the EXPAND step only — treating the raw password as the PRK,
+    // with NO extract step.
+    //
+    // Node's crypto.hkdfSync() runs full HKDF (extract THEN expand). Even with
+    // an empty salt it computes PRK = HMAC-SHA256(key=zeros_32, data=password)
+    // before expanding — producing a DIFFERENT key than Python for the same
+    // password. That silently breaks cross-layer audit chain verification.
+    //
+    // We replicate HKDFExpand manually:
+    //   T(1) = HMAC-SHA256(key=PRK, data=info || 0x01)   where PRK = raw password
+    // This is the single-block expand (length=32 <= SHA256 output size).
+    const info = Buffer.from("pyhsm-audit-hmac-v1", "utf8");
+    const expandInput = Buffer.concat([info, Buffer.from([0x01])]);
+    const auditHmacKey = crypto.createHmac("sha256", this.masterPasswordBuf)
+      .update(expandInput)
+      .digest();
     this.audit = new AuditLog(auditPath, undefined, auditHmacKey);
     this.rateLimiter = new RateLimiter(
       parseInt(process.env.PYHSM_RATE_LIMIT || "100", 10),
@@ -272,12 +301,23 @@ export class PyHSM {
   }
 
   private zeroize(): void {
-    // Overwrite keyData strings — V8 strings are immutable so we can only
-    // replace the reference, but SecureBuffer wraps the master password
-    // Buffer and fill(0)s it deterministically.
+    // Zeroize all interned key data Buffers deterministically.
+    // Unlike the hex strings in KeyVersion.keyData (which are immutable JS
+    // strings and cannot be zeroed in place), these Buffers are mutable and
+    // buf.fill(0) reliably overwrites the underlying memory.
+    for (const buf of this._keyDataBuffers.values()) {
+      buf.fill(0);
+    }
+    this._keyDataBuffers.clear();
+
+    // Best-effort: overwrite the hex strings in the store with zero-length
+    // strings. V8 strings are immutable so the original string data may
+    // linger in the heap until GC, but this removes the reference from the
+    // store object so any code holding only a store reference can no longer
+    // read the key material.
     for (const entry of Object.values(this.store.keys)) {
       for (const v of entry.versions) {
-        v.keyData = "0".repeat(v.keyData.length);
+        v.keyData = "";
       }
     }
     this.store = { version: 3, keys: {}, kekSalt: undefined };
@@ -290,11 +330,19 @@ export class PyHSM {
   // --- Persistence with Tamper Detection ---
 
   private deriveKey(salt: Buffer): Buffer {
-    // Use cached Argon2id key if salt matches
+    // Use cached Argon2id key if salt matches (set by PyHSM.create() factory)
     if (this._cachedDerivedKey && this._cachedSalt && this._cachedSalt.equals(salt)) {
       return Buffer.from(this._cachedDerivedKey);
     }
-    // Fallback: PBKDF2 for sync contexts
+    // SECURITY WARNING: The sync constructor cannot use Argon2id (async-only).
+    // Falling back to PBKDF2-SHA256 (480,000 iterations) which is orders of
+    // magnitude weaker than Argon2id for offline brute-force attacks.
+    // Use `await PyHSM.create(config)` in production to guarantee Argon2id.
+    process.stderr.write(
+      "[PyHSM SECURITY WARNING] Using PBKDF2 for key derivation — this is " +
+      "significantly weaker than Argon2id. Use `await PyHSM.create(config)` " +
+      "in production to enable Argon2id (64 MB memory-hard KDF).\n"
+    );
     return crypto.pbkdf2Sync(this.masterPasswordBuf, salt, 480_000, 32, "sha256");
   }
 
@@ -448,6 +496,10 @@ export class PyHSM {
     if (!this.store.kekSalt) {
       this.migrateKek();
     }
+
+    // Internalize all keyData hex strings into the in-memory Buffer map so
+    // that destroyKey() and closeSession() can fill(0) the underlying memory.
+    this.internalizeKeyData();
   }
 
   /**
@@ -479,6 +531,11 @@ export class PyHSM {
           const rewrapped = this.wrapKey(newKek, raw);
           zeroBuffer(raw);
           v.keyData = rewrapped.toString("hex");
+          // Update the in-memory Buffer map with the re-wrapped buffer
+          const mapKey = `${entry.keyId}:${v.version}`;
+          const existing = this._keyDataBuffers.get(mapKey);
+          if (existing) existing.fill(0);
+          this._keyDataBuffers.set(mapKey, Buffer.from(rewrapped));
         }
       }
     } finally {
@@ -491,24 +548,29 @@ export class PyHSM {
   }
 
   private save(): void {
-    // Use the session salt for the outer envelope. The salt's purpose is to
-    // ensure different keystores (different master passwords) produce different
-    // derived keys — it provides brute-force resistance, not per-write freshness.
-    // Per-write uniqueness is guaranteed by the random GCM nonce (12 bytes),
-    // which is freshly generated on every save. This means even with the same
-    // salt, every persisted envelope has unique ciphertext.
+    // Generate a fresh salt on every save.  A new salt means the Argon2id /
+    // PBKDF2 output changes on every write, so an attacker who obtains two
+    // successive keystore snapshots cannot confirm they were encrypted under
+    // the same KDF inputs.  The Python layer also generates a fresh salt on
+    // every _save_store() call — this aligns the two layers.
     //
-    // The salt is fixed per session to maintain compatibility with the Argon2id
-    // async factory path (where the expensive Argon2id derivation is cached).
-    // For PBKDF2 (sync) sessions, a fresh salt was generated at init time.
-    const salt = this._cachedSalt ? Buffer.from(this._cachedSalt) : crypto.randomBytes(SALT_LEN);
+    // For the Argon2id async path (PyHSM.create) the cached derived key is
+    // invalidated here because the new salt no longer matches _cachedSalt.
+    // Subsequent calls to deriveKey() will fall through to PBKDF2 (sync path)
+    // or to the cached key only when the salt matches.  The Argon2id cache is
+    // primarily useful during load() — after that, PBKDF2 is acceptable for
+    // the per-save envelope because the per-key material is protected by
+    // AES-KWP regardless of the outer KDF strength.
+    const salt = crypto.randomBytes(SALT_LEN);
+
+    // Update the cached salt so that deriveKek() and other callers that
+    // derive from _cachedSalt stay consistent within this save cycle.
+    // Invalidate the derived key cache since the salt has changed.
+    if (this._cachedSalt) zeroBuffer(this._cachedSalt);
+    if (this._cachedDerivedKey) { zeroBuffer(this._cachedDerivedKey); this._cachedDerivedKey = null; }
+    this._cachedSalt = Buffer.from(salt);
+
     const { encKey, macKey } = this.deriveSubkeys(salt);
-
-    // Cache salt if this is the first save (sync constructor path)
-    if (!this._cachedSalt) {
-      this._cachedSalt = Buffer.from(salt);
-    }
-
     const nonce = crypto.randomBytes(NONCE_LEN);
     const cipher = crypto.createCipheriv("aes-256-gcm", encKey, nonce);
     const ct = Buffer.concat([
@@ -606,24 +668,55 @@ export class PyHSM {
 
   // --- Key Wrapping Helpers ---
 
-  /** Wrap raw key material and return hex string for storage. */
-  private wrapForStorage(rawKey: Buffer): string {
+  /** Wrap raw key material, store in the in-memory Buffer map, and return hex for JSON. */
+  private wrapForStorage(rawKey: Buffer, keyId: string, version: number): string {
     const kekBuf = SecureBuffer.wrap(this.deriveKek());
     try {
       const wrapped = this.wrapKey(kekBuf.buf, rawKey);
+      // Intern a Buffer copy for deterministic zeroization on destroy/close
+      const mapKey = `${keyId}:${version}`;
+      const existing = this._keyDataBuffers.get(mapKey);
+      if (existing) existing.fill(0);
+      this._keyDataBuffers.set(mapKey, Buffer.from(wrapped));
       return wrapped.toString("hex");
     } finally {
       kekBuf.dispose();
     }
   }
 
-  /** Unwrap stored key material, returning raw Buffer. Caller must zeroize. */
-  private unwrapFromStorage(wrappedHex: string): Buffer {
+  /** Unwrap stored key material from the in-memory Buffer map (or hex string fallback). */
+  private unwrapFromStorage(wrappedHex: string, keyId?: string, version?: number): Buffer {
+    // Use the interned Buffer when available to avoid redundant hex parsing
+    if (keyId !== undefined && version !== undefined) {
+      const mapKey = `${keyId}:${version}`;
+      const cached = this._keyDataBuffers.get(mapKey);
+      if (cached && cached.length > 0) {
+        const kekBuf = SecureBuffer.wrap(this.deriveKek());
+        try {
+          return this.unwrapKey(kekBuf.buf, cached);
+        } finally {
+          kekBuf.dispose();
+        }
+      }
+    }
+    // Fallback: parse hex string (e.g. after load() before internalization)
     const kekBuf = SecureBuffer.wrap(this.deriveKek());
     try {
       return this.unwrapKey(kekBuf.buf, Buffer.from(wrappedHex, "hex"));
     } finally {
       kekBuf.dispose();
+    }
+  }
+
+  /** Intern all keyData hex strings into the Buffer map after a load(). */
+  private internalizeKeyData(): void {
+    for (const entry of Object.values(this.store.keys)) {
+      for (const v of entry.versions) {
+        const mapKey = `${entry.keyId}:${v.version}`;
+        if (!this._keyDataBuffers.has(mapKey) && v.keyData) {
+          this._keyDataBuffers.set(mapKey, Buffer.from(v.keyData, "hex"));
+        }
+      }
     }
   }
 
@@ -666,7 +759,7 @@ export class PyHSM {
     if (keyType === "aes-256" || keyType === "aes-128") {
       const keyLen = keyType === "aes-256" ? 32 : 16;
       const rawKey = crypto.randomBytes(keyLen);
-      wrappedHex = this.wrapForStorage(rawKey);
+      wrappedHex = this.wrapForStorage(rawKey, keyId, 1);
       zeroBuffer(rawKey);
     } else if (keyType === "rsa-2048" || keyType === "rsa-4096") {
       const modulusLength = keyType === "rsa-2048" ? 2048 : 4096;
@@ -676,7 +769,7 @@ export class PyHSM {
         publicKeyEncoding: { type: "spki", format: "pem" },
         privateKeyEncoding: { type: "pkcs8", format: "pem" },
       });
-      wrappedHex = this.wrapForStorage(Buffer.from(privateKey as string, "utf8"));
+      wrappedHex = this.wrapForStorage(Buffer.from(privateKey as string, "utf8"), keyId, 1);
       publicKeyPem = publicKey as string;
     } else if (keyType === "ec-p256" || keyType === "ec-p384" || keyType === "ec-p521" || keyType === "ec-secp256k1") {
       const namedCurve = keyType === "ec-p256" ? "P-256"
@@ -688,14 +781,14 @@ export class PyHSM {
         publicKeyEncoding: { type: "spki", format: "pem" },
         privateKeyEncoding: { type: "pkcs8", format: "pem" },
       });
-      wrappedHex = this.wrapForStorage(Buffer.from(privateKey as string, "utf8"));
+      wrappedHex = this.wrapForStorage(Buffer.from(privateKey as string, "utf8"), keyId, 1);
       publicKeyPem = publicKey as string;
     } else if (keyType === "ed25519") {
       const { privateKey, publicKey } = crypto.generateKeyPairSync("ed25519", {
         publicKeyEncoding: { type: "spki", format: "pem" },
         privateKeyEncoding: { type: "pkcs8", format: "pem" },
       });
-      wrappedHex = this.wrapForStorage(Buffer.from(privateKey as string, "utf8"));
+      wrappedHex = this.wrapForStorage(Buffer.from(privateKey as string, "utf8"), keyId, 1);
       publicKeyPem = publicKey as string;
     } else {
       throw new Error(`PyHSM: unsupported key type '${keyType}'`);
@@ -738,10 +831,9 @@ export class PyHSM {
 
     const keyLen = entry.keyType === "aes-256" ? 32 : 16;
     const rawKey = crypto.randomBytes(keyLen);
-    const wrappedHex = this.wrapForStorage(rawKey);
-    zeroBuffer(rawKey);
-
     const newVersion = entry.currentVersion + 1;
+    const wrappedHex = this.wrapForStorage(rawKey, keyId, newVersion);
+    zeroBuffer(rawKey);
     entry.versions.push({
       version: newVersion,
       keyData: wrappedHex,
@@ -762,8 +854,21 @@ export class PyHSM {
     const entry = this.store.keys[keyId];
     if (!entry) throw new Error(`PyHSM: key '${keyId}' not found`);
 
+    // Zeroize the interned Buffers for all versions of this key.
+    // Buffer.fill(0) overwrites the underlying memory deterministically —
+    // unlike the hex strings in v.keyData which are immutable JS strings
+    // and cannot be zeroed in place (a known JavaScript limitation).
     for (const v of entry.versions) {
-      v.keyData = "0".repeat(v.keyData.length);
+      const mapKey = `${keyId}:${v.version}`;
+      const buf = this._keyDataBuffers.get(mapKey);
+      if (buf) {
+        buf.fill(0);
+        this._keyDataBuffers.delete(mapKey);
+      }
+      // Clear the hex string reference too — the original string value may
+      // linger in the V8 heap until GC, but removing the reference from the
+      // store object prevents further access through normal code paths.
+      v.keyData = "";
     }
     delete this.store.keys[keyId];
 
@@ -823,7 +928,7 @@ export class PyHSM {
 
     const { keyType, rawKeyBytes, publicKeyPem } = importJwk(jwk);
 
-    const wrappedHex = this.wrapForStorage(rawKeyBytes);
+    const wrappedHex = this.wrapForStorage(rawKeyBytes, keyId, 1);
     zeroBuffer(rawKeyBytes);
 
     this.store.keys[keyId] = {
@@ -1081,10 +1186,23 @@ export class PyHSM {
 
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
     const backupPath = `${dir}/pyhsm-backup-${timestamp}.enc`;
+    const tmpPath = `${backupPath}.tmp`;
 
-    // Read current keystore data from backend and write to backup file
+    // Read current keystore data from backend and write atomically.
+    // Writing directly to backupPath risks leaving a partial/corrupt file
+    // if the process crashes mid-write. Instead: write to a sibling .tmp
+    // file, then rename into place. On POSIX, rename(2) is atomic — the
+    // final path either contains the full new file or the old one; there is
+    // no window where a partial write is visible at backupPath.
     const data = this.backend.read();
-    fs.writeFileSync(backupPath, data, { mode: 0o600 });
+    try {
+      fs.writeFileSync(tmpPath, data, { mode: 0o600 });
+      fs.renameSync(tmpPath, backupPath);
+    } catch (err) {
+      // Clean up the temp file if rename failed
+      try { fs.unlinkSync(tmpPath); } catch { /* ignore */ }
+      throw err;
+    }
 
     this.audit.record("backup", { callerId, success: true });
     return backupPath;

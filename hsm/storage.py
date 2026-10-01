@@ -501,14 +501,25 @@ class KeyStore:
         holding only their per-key lock). This lock ensures the serialize →
         encrypt → write sequence is atomic, preventing one write from
         clobbering another's in-memory state changes.
+
+        Critically, the snapshot of self._keys is taken *inside* _save_lock
+        before the slow Argon2id KDF runs. This prevents a concurrent per-key
+        operation (holding a different key's lock) from mutating self._keys
+        mid-serialization and producing a keystore with a partially-applied
+        or inconsistent state.
         """
         with self._save_lock:
+            # Snapshot the in-memory dict *before* the slow KDF.  Any
+            # concurrent per-key operation that mutates self._keys after this
+            # point will trigger its own subsequent _save_store call and will
+            # correctly serialize the updated state at that time.
+            serializable = _externalize_key_data(self._keys)
+
             salt = os.urandom(_SALT_LEN)
             enc_key, mac_key = self._derive_subkeys(salt)
             nonce = os.urandom(_NONCE_LEN)
 
             # Serialize: convert bytearray key_data to hex strings for JSON
-            serializable = _externalize_key_data(self._keys)
             ct = AESGCM(bytes(enc_key)).encrypt(nonce, json.dumps(serializable).encode("utf-8"), None)
             payload = nonce + ct
             mac = _hmac.new(bytes(mac_key), payload, hashlib.sha256).digest()
@@ -534,6 +545,53 @@ class KeyStore:
             raise KeyError(f"Key '{key_id}' not found")
         self._keys[key_id] = entry
         self._save_store()
+
+    def increment_operation_count(self, key_id: str) -> int:
+        """Atomically increment operation_count for a key and persist.
+
+        The read → increment → snapshot → KDF → write sequence executes
+        entirely under ``_save_lock``, making it safe against concurrent
+        callers even when different per-key locks are held simultaneously.
+        This prevents the lost-update race where two threads both read the
+        same stale count, each add one, and one silently overwrites the
+        other's increment — which could allow a key to serve more operations
+        than its ``max_operations`` policy permits.
+
+        The entire operation (including the slow Argon2id KDF and disk write)
+        stays inside ``_save_lock`` so no two increments can interleave.
+        This is intentional: correctness of the operation counter takes
+        priority over throughput for the persist step.
+
+        Returns the *new* (post-increment) count so callers can include it
+        in audit records without a second load.
+
+        Raises
+        ------
+        KeyError
+            If ``key_id`` does not exist in the store.
+        """
+        with self._save_lock:
+            if key_id not in self._keys:
+                raise KeyError(f"Key '{key_id}' not found")
+            entry = self._keys[key_id]
+            new_count = entry.get("operation_count", 0) + 1
+            entry["operation_count"] = new_count
+
+            # Snapshot after mutation, still inside _save_lock, so the
+            # serialized state is consistent with the increment above.
+            serializable = _externalize_key_data(self._keys)
+            salt = os.urandom(_SALT_LEN)
+            enc_key, mac_key = self._derive_subkeys(salt)
+            nonce = os.urandom(_NONCE_LEN)
+            ct = AESGCM(bytes(enc_key)).encrypt(
+                nonce, json.dumps(serializable).encode("utf-8"), None
+            )
+            payload = nonce + ct
+            mac = _hmac.new(bytes(mac_key), payload, hashlib.sha256).digest()
+            zeroize_bytearray(enc_key)
+            zeroize_bytearray(mac_key)
+            self._backend.write(salt + mac + payload)
+            return new_count
 
     def load_key(self, key_id: str) -> dict:
         if key_id not in self._keys:

@@ -3,3 +3,10 @@ dist/
 *.enc
 *.audit.jsonl
 FETCH_HEAD
+
+# Explicitly ignore any keystore or audit log at the repo root.
+# These files may be created by running the CLI in the repo directory
+# during development. They must never be committed — they could contain
+# real key material or sensitive audit entries.
+pyhsm-keystore.enc
+pyhsm-keystore.enc.audit.jsonl

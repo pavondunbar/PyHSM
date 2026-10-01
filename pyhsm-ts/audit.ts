@@ -20,7 +20,17 @@ export class AuditLog {
 
   constructor(logPath: string, webhookUrl?: string, hmacKey?: Buffer) {
     this.logPath = logPath;
-    this.webhookUrl = webhookUrl || process.env.PYHSM_AUDIT_WEBHOOK || null;
+
+    // Validate webhook URL — only https:// is permitted to prevent SSRF.
+    const rawUrl = webhookUrl || process.env.PYHSM_AUDIT_WEBHOOK || null;
+    if (rawUrl !== null && !rawUrl.startsWith("https://")) {
+      throw new Error(
+        `PyHSM: PYHSM_AUDIT_WEBHOOK must use https:// (got '${rawUrl}'). ` +
+        "Plain http://, file://, and other schemes are rejected to prevent " +
+        "Server-Side Request Forgery (SSRF)."
+      );
+    }
+    this.webhookUrl = rawUrl;
 
     // HMAC key: explicit param > env var. No file fallback — key must be provided.
     if (hmacKey) {
@@ -172,6 +182,9 @@ export class AuditLog {
 
   private async shipToWebhook(entry: AuditEntry): Promise<void> {
     if (!this.webhookUrl) return;
+    // Defence-in-depth: re-check the scheme before every POST in case
+    // webhookUrl was somehow mutated after construction.
+    if (!this.webhookUrl.startsWith("https://")) return;
     try {
       const body = JSON.stringify(entry);
       const signature = crypto.createHmac("sha256", this.hmacKey)

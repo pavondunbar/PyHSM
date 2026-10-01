@@ -141,7 +141,7 @@ class TestConstruction:
 
     def test_skip_password_validation(self, store_path):
         # For testing/migration scenarios, validation can be bypassed
-        h = PyHSM(store_path, master_password="pw", session_timeout_s=0, skip_password_validation=True)
+        h = PyHSM(store_path, master_password="pw", session_timeout_s=0, _unsafe_skip_password_validation=True)
         assert h is not None
         h.close_session()
 
@@ -560,11 +560,14 @@ class TestShamir:
             assert bytes(recovered) == secret
 
     def test_insufficient_shares_wrong(self):
+        import pytest
         secret = secrets.token_bytes(16)
         shares = split_secret(secret, 3, 5)
-        # Only 2 shares — will reconstruct wrong value
-        recovered = reconstruct_secret(shares[:2])
-        assert bytes(recovered) != secret
+        # Only 2 of 3 required shares — reconstruction produces a wrong value.
+        # The checksum detects this and raises ValueError rather than
+        # silently returning an incorrect secret.
+        with pytest.raises(ValueError, match="checksum verification"):
+            reconstruct_secret(shares[:2])
 
     def test_zeroize_clears_buffer(self):
         buf = bytearray(b"\xff" * 16)

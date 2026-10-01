@@ -15,6 +15,39 @@ Supported key types for import:
   - {"kty": "EC"}     → ECDSA key (P-256, P-384, P-521, secp256k1)
   - {"kty": "OKP"}    → Ed25519 key
   - {"kty": "RSA"}    → RSA key
+
+MEMORY SAFETY WARNING
+---------------------
+All export functions in this module return Python ``dict`` objects whose
+values are ``str`` instances containing base64url-encoded key material.
+Python strings are **immutable** — they cannot be overwritten in place,
+so there is no way to deterministically zeroize the key material inside a
+returned JWK dict once it has been created.
+
+This is an unavoidable limitation of the Python data model for string
+types. To limit exposure:
+
+  1. Treat the returned dict as a short-lived secret.
+  2. Delete all references to it as soon as possible (``del jwk``).
+  3. Call ``zeroize_jwk(jwk)`` before deleting — this overwrites the dict
+     values with empty strings, removing the key material from the dict
+     object itself (though the original string objects may linger in the
+     CPython heap until GC collects them).
+  4. Never log, serialize to disk, or pass the dict to untrusted code.
+  5. For RSA keys, the full CRT private key (d, p, q, dp, dq, qi) is
+     included in the exported dict — treat it with the same care as the
+     raw private key bytes.
+
+Example safe usage::
+
+    from hsm.jwk import zeroize_jwk
+
+    jwk = hsm.export_jwk("my-ec-key")
+    try:
+        send_to_peer(jwk)   # use the JWK
+    finally:
+        zeroize_jwk(jwk)    # clear dict values before discarding
+        del jwk             # drop the reference
 """
 
 from __future__ import annotations
@@ -55,6 +88,12 @@ def export_symmetric_jwk(raw_key: bytes, key_id: Optional[str] = None) -> dict:
     Export a symmetric key as a JWK.
 
     Returns a dict with kty="oct", k=<base64url-encoded key material>.
+
+    .. warning::
+        The returned dict contains the raw symmetric key as an immutable
+        Python ``str`` (base64url-encoded). It **cannot be zeroized** in
+        place. Call ``zeroize_jwk(jwk)`` and ``del jwk`` as soon as the
+        dict is no longer needed. See module docstring for details.
     """
     jwk: dict = {
         "kty": "oct",
@@ -73,6 +112,13 @@ def export_ec_jwk(private_key_pem: bytes, key_id: Optional[str] = None) -> dict:
 
     Returns a dict with kty="EC", crv, x, y, d fields.
     Supports P-256, P-384, P-521, and secp256k1.
+
+    .. warning::
+        The returned dict contains the private scalar ``d`` (and public
+        coordinates ``x``, ``y``) as immutable Python ``str`` values
+        (base64url-encoded). They **cannot be zeroized** in place. Call
+        ``zeroize_jwk(jwk)`` and ``del jwk`` as soon as the dict is no
+        longer needed. See module docstring for details.
     """
     private_key = serialization.load_pem_private_key(private_key_pem, password=None)
     if not isinstance(private_key, ec.EllipticCurvePrivateKey):
@@ -117,6 +163,13 @@ def export_ed25519_jwk(private_key_pem: bytes, key_id: Optional[str] = None) -> 
 
     Returns a dict with kty="OKP", crv="Ed25519", x (public), d (private).
     Uses RFC 8037 (CFRG Elliptic Curves) format.
+
+    .. warning::
+        The returned dict contains the 32-byte private key seed ``d`` and
+        public key ``x`` as immutable Python ``str`` values (base64url-
+        encoded). They **cannot be zeroized** in place. Call
+        ``zeroize_jwk(jwk)`` and ``del jwk`` as soon as the dict is no
+        longer needed. See module docstring for details.
     """
     private_key = serialization.load_pem_private_key(private_key_pem, password=None)
     if not isinstance(private_key, ed25519.Ed25519PrivateKey):
@@ -150,6 +203,16 @@ def export_rsa_jwk(private_key_pem: bytes, key_id: Optional[str] = None) -> dict
     Export an RSA private key (PEM) as a JWK.
 
     Returns a dict with kty="RSA", n, e, d, p, q, dp, dq, qi fields.
+
+    .. warning::
+        The returned dict contains the **full CRT private key** — modulus
+        ``n``, private exponent ``d``, primes ``p`` and ``q``, and CRT
+        coefficients ``dp``, ``dq``, ``qi`` — all as immutable Python
+        ``str`` values (base64url-encoded). This is the most sensitive
+        possible export: all components needed to reconstruct the private
+        key are present. They **cannot be zeroized** in place. Call
+        ``zeroize_jwk(jwk)`` and ``del jwk`` immediately after use. See
+        module docstring for details.
     """
     private_key = serialization.load_pem_private_key(private_key_pem, password=None)
     if not isinstance(private_key, rsa.RSAPrivateKey):
@@ -175,6 +238,47 @@ def export_rsa_jwk(private_key_pem: bytes, key_id: Optional[str] = None) -> dict
     if key_id:
         jwk["kid"] = key_id
     return jwk
+
+
+def zeroize_jwk(jwk: dict) -> None:
+    """
+    Best-effort zeroization of a JWK dict returned by any export function.
+
+    Overwrites every string value in the dict with an empty string, removing
+    the key material from the dict object itself. This does **not** guarantee
+    that the original string objects are erased from the CPython heap —
+    Python ``str`` is immutable and the interpreter may hold references in
+    the string intern table or elsewhere. However, it is strictly better
+    than doing nothing: it removes the key material from the dict so that
+    any code still holding a reference to the dict cannot read it.
+
+    Always follow this call with ``del jwk`` to drop the last reference.
+
+    Parameters
+    ----------
+    jwk : dict
+        A JWK dict previously returned by one of the export functions in
+        this module. Modified in place.
+
+    Example
+    -------
+    ::
+
+        jwk = hsm.export_jwk("my-key")
+        try:
+            use(jwk)
+        finally:
+            zeroize_jwk(jwk)
+            del jwk
+    """
+    # Overwrite sensitive string fields with empty strings.
+    # Non-string values (lists, ints) are left unchanged — they carry no
+    # key material. Unknown keys are also cleared defensively.
+    _SENSITIVE_FIELDS = frozenset({"k", "d", "x", "y", "n", "e", "p", "q", "dp", "dq", "qi"})
+    for key in list(jwk.keys()):
+        val = jwk[key]
+        if isinstance(val, str) and key in _SENSITIVE_FIELDS:
+            jwk[key] = ""
 
 
 def import_jwk(jwk: dict) -> tuple[str, bytes, Optional[str]]:

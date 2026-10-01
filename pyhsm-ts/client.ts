@@ -15,9 +15,29 @@ export class PyHSMClient {
   constructor(socketPath?: string, callerService?: string) {
     this.socketPath = socketPath || process.env.PYHSM_SOCKET_PATH || "/tmp/pyhsm.sock";
 
+    // Warn when the socket lives in a world-readable directory.
+    // /tmp is accessible to every local user — any process on the same host
+    // can connect and issue arbitrary HSM operations without authentication
+    // unless PYHSM_CALLER_SECRET is set.
+    const socketDir = this.socketPath.split("/").slice(0, -1).join("/") || "/";
+    const worldReadableDirs = ["/tmp", "/var/tmp", "/dev/shm"];
+    const isWorldReadable = worldReadableDirs.some(
+      (d) => socketDir === d || socketDir.startsWith(d + "/")
+    );
+
+    const secret = process.env.PYHSM_CALLER_SECRET;
+
+    if (isWorldReadable && !secret) {
+      process.stderr.write(
+        `[PyHSM SECURITY WARNING] IPC socket '${this.socketPath}' is in a ` +
+        `world-readable directory. Any local user can connect and issue HSM ` +
+        `operations. Set PYHSM_CALLER_SECRET to require HMAC authentication, ` +
+        `or move the socket to a restricted path (e.g. /run/pyhsm/<uid>/pyhsm.sock).\n`
+      );
+    }
+
     // Generate caller ID with HMAC auth if secret is configured
     const service = callerService || "default";
-    const secret = process.env.PYHSM_CALLER_SECRET;
     if (secret) {
       const hmac = crypto.createHmac("sha256", secret).update(service).digest("hex");
       this.callerId = `${service}:${hmac}`;
