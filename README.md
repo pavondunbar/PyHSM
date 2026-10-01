@@ -1,5 +1,64 @@
 # PyHSM
 
+## Changelog
+
+### v2.0.0 (2026-10-01)
+
+This is a major release. The version bump reflects breaking changes to the public API, cryptographic storage format improvements, and the promotion of several previously-experimental features to stable.
+
+**Breaking Changes**
+
+- `PyHSM` constructor no longer accepts positional arguments — all parameters must be passed as keyword arguments.
+- `decrypt()` now returns `bytes` in all cases; callers that expected `str` must decode explicitly (e.g. `.decode("utf-8")`).
+- `get_audit_log()` now returns an `AuditLog` object instead of a raw list; use `.export_jsonl()` to get the list of entries.
+- The `allow_export` policy key is now `False` by default and must be explicitly set to `True` to enable JWK export; previously unset keys defaulted to `True` in some code paths.
+- CLI: `--type` flag on `generate` now requires an explicit value; the implicit `aes-256` default has been removed to prevent accidental key type mismatches.
+- TypeScript: `PyHSM.create()` is now the only supported factory for production use; the synchronous constructor is retained for testing only and emits a deprecation warning.
+
+**New Features**
+
+- Argon2id KDF is now strictly required in both layers — no silent PBKDF2 fallback at runtime (use `PYHSM_ALLOW_PBKDF2_FALLBACK=1` only for migration).
+- Salt-bound KEK derivation: the KEK now uses a dedicated salt stored inside the encrypted envelope, fully derived through the Argon2id → HKDF path.
+- AES-256-GCM-SIV (nonce-misuse resistant) in the TypeScript layer replaces AES-256-GCM-CTR.
+- Per-key `allowed_callers` ACL enforcement with audit trail on denial (both layers).
+- Automatic key rotation via `rotate_every_days` policy (lazy, triggered on use).
+- Key metadata search: filter by type, metadata tags, status, or policy fields.
+- Encrypted backup/restore with HMAC verification (`create_backup` / `verify_backup`).
+- Audit log rotation with configurable `max_bytes`, `max_entries`, and retention.
+- OpenTelemetry (OTLP) JSON metrics export (`get_otlp_metrics()`).
+- JWK import/export for RSA keys (in addition to EC and AES).
+- EC P-384 (SHA-384) and P-521 (SHA-512) signing support.
+- Pluggable `StorageBackend` interface with `FileBackend` and `MemoryBackend` built in.
+- Process isolation mode (TypeScript): Unix domain socket IPC with HMAC caller authentication.
+- `stores` CLI subcommand to list keystore files without a password.
+- `--yes` / `-y` flag on `delete` to skip confirmation in scripted environments.
+- Prometheus metrics export (`--prometheus` flag on CLI; `get_prometheus_metrics()` in library).
+
+**Security Fixes**
+
+- Eliminated immutable `str` key material from the Python memory path; all key bytes now live in `bytearray` (`SecureBytes`) and are deterministically zeroized on `close_session()`.
+- Constant-time HMAC comparison enforced on all keystore verification paths (`hmac.compare_digest` / `timingSafeEqual`).
+- Input size validation (64 MB cap) enforced on both encrypt and decrypt paths to prevent memory exhaustion.
+- Ciphertext now carries a format version byte distinguishing v2 (AAD-bound) from v1 (legacy) for safe backward-compatible migration.
+- Hybrid nonce strategy (random + counter) eliminates birthday-bound nonce collisions on the Python AES-256-GCM path.
+
+**Dependency Updates**
+
+- `cryptography` pinned to `>=43.0.0,<44.0.0`
+- `argon2-cffi` pinned to `>=23.1.0,<25.0.0`
+- TypeScript: all `node_modules` dependencies pinned to exact versions
+
+**Migration from v1.x**
+
+Existing keystores created with v1.x are readable by v2.0.0 via the backward-compatible v1 ciphertext format. To migrate:
+
+1. Upgrade the package: `pip install --upgrade vectorguard-pyhsm`
+2. Open your keystore once with the existing master password — PyHSM will automatically migrate the KDF from PBKDF2 to Argon2id on the next write.
+3. Update any code that passes positional arguments to `PyHSM(...)` or expects `decrypt()` to return `str`.
+4. Review any JWK export calls — add `"allow_export": True` to the relevant key policies if you rely on this feature.
+
+---
+
 A production-grade software Key Management Service (KMS) providing cryptographic key lifecycle management, authenticated encryption, digital signing, and tamper-evident audit logging.
 
 Available as a **Python CLI and library** and a **production-hardened TypeScript/Node.js library**.
