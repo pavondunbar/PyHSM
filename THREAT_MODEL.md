@@ -11,7 +11,7 @@ that PyHSM is designed to defend against — and explicitly states what is out o
 |---|---|
 | Cryptographic key material | AES-256, AES-128, RSA-2048/4096, EC P-256/P-384/P-521/secp256k1, Ed25519 private keys |
 | Master password | The credential used to derive keystore encryption keys |
-| KEK (Key Encryption Key) | Derived from master password via PBKDF2 → HKDF; used for per-key AES-KWP wrapping |
+| KEK (Key Encryption Key) | Derived from master password via Argon2id → HKDF; used for per-key AES-KWP wrapping |
 | Keystore integrity | The encrypted keystore file must not be silently modified |
 | Audit log integrity | The HMAC-chained log must be tamper-evident |
 | Operational metadata | Key policies, operation counts, caller ACLs |

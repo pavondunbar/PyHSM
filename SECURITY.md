@@ -50,7 +50,8 @@ Enterprise support customers receive **private pre-notification** before public 
 PyHSM's cryptographic security depends on these upstream libraries:
 
 ### Python
-- [`cryptography`](https://github.com/pyca/cryptography) — AES-256-GCM, PBKDF2, HKDF, RSA, ECDSA, AES-KWP
+- [`cryptography`](https://github.com/pyca/cryptography) — AES-256-GCM, HKDF, RSA, ECDSA, AES-KWP (PBKDF2 retained as fallback only; Argon2id is required for production)
+- [`argon2-cffi`](https://github.com/hynek/argon2-cffi) — Argon2id primary key derivation (64 MB memory-hard, OWASP recommended)
 
 ### TypeScript
 - [`@noble/ciphers`](https://github.com/paulmillr/noble-ciphers) — AES-256-GCM-SIV

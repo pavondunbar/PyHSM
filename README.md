@@ -48,7 +48,7 @@ Most applications that need key management face a difficult choice: implement it
 - Concurrency stress-tested (16 threads, data integrity proofs)
 - 80%+ code coverage enforced in CI
 - Reproducible builds via pinned dependency lockfile
-- 264 tests across both layers
+- 264 tests across both layers (170 Python + 94 TypeScript)
 
 ---
 
@@ -950,11 +950,10 @@ See [docs/FAQ.md](docs/FAQ.md) for detailed answers to common architecture and s
 ```bash
 # Run all tests with coverage
 python -m pytest tests/ -v
-# 140 tests (112 unit/integration + 8 concurrency + 12 auto-rotation/search/backup/OTLP)
+# 170 tests (unit + integration + concurrency + CLI)
 
 # Run CLI integration tests separately (subprocess-based)
 python -m pytest tests/test_cli.py -v
-# 30 CLI integration tests
 
 # Coverage report (80% minimum threshold enforced in CI)
 python -m pytest tests/ --cov=hsm --cov-report=term-missing --cov-fail-under=80
@@ -972,7 +971,7 @@ pip install -e .
 ```bash
 cd pyhsm-ts
 npm test
-# 94 tests
+# 94 tests (vitest)
 ```
 
 **CI** runs both suites on every push and pull request, across Python 3.11/3.12/3.13 and Node.js 20. Coverage is enforced at 80% minimum for both layers. Python also runs `mypy --strict` type checking. See `.github/workflows/ci.yml`.
