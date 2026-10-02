@@ -1,22 +1,101 @@
-# PyHSM pinned dependencies — generated for reproducible builds.
-# Regenerate with: pip install -e ".[dev]" && pip freeze --exclude-editable | grep -E "^(cryptography|argon2|pytest|coverage|cffi|pycparser)==" > requirements.lock
-# Or install from this file: pip install -r requirements.lock
+# PyHSM hash-pinned dependency lockfile.
+#
+# All packages are pinned to exact versions AND verified by SHA-256 hash.
+# pip will refuse to install any package whose hash does not match, defending
+# against:
+#   - Compromised PyPI mirrors serving modified packages
+#   - Supply-chain attacks where a package is altered after publication
+#   - Network MITM during installation
+#
+# Usage:
+#   pip install --require-hashes -r requirements.lock
+#
+# IMPORTANT: --require-hashes is only enforced when this flag is passed
+# explicitly. Add it to your Dockerfile, CI pipeline, and deployment scripts.
+#
+# Regenerating this file:
+#   pip-compile --generate-hashes pyproject.toml -o requirements.lock
+# or manually:
+#   pip download --no-deps --dest /tmp/wheels <package>==<version>
+#   python3 -c "import hashlib; print('sha256:' + hashlib.sha256(open('/tmp/wheels/<file>','rb').read()).hexdigest())"
+#
+# Cross-platform notes:
+#   Multiple hashes are listed per package to cover Linux x86_64, Linux aarch64,
+#   macOS (arm64 + x86_64), and Windows amd64. pip selects the correct wheel for
+#   the target platform automatically; only the matching hash is checked.
+#
+# Last updated: 2026-10-01
 
-# --- Production dependencies ---
-cryptography==47.0.0
-argon2-cffi==23.1.0
-argon2-cffi-bindings==25.1.0
+# ---------------------------------------------------------------------------
+# Production dependencies
+# ---------------------------------------------------------------------------
 
-# --- Transitive (required by above) ---
-cffi==2.0.0
-pycparser==3.0
+cryptography==47.0.0 \
+    --hash=sha256:9f8e55fe4e63613a5e1cc5819030f27b97742d720203a087802ce4ce9ceb52bb \
+    --hash=sha256:f5c15764f261394b22aef6b00252f5195f46f2ca300bec57149474e2538b31f8 \
+    --hash=sha256:b9a8943e359b7615db1a3ba587994618e094ff3d6fa5a390c73d079ce18b3973 \
+    --hash=sha256:160ad728f128972d362e714054f6ba0067cab7fb350c5202a9ae8ae4ce3ef1a0 \
+    --hash=sha256:f5c3296dab66202f1b18a91fa266be93d6aa0c2806ea3d67762c69f60adc71aa
 
-# --- Dev dependencies ---
-pytest==8.3.5
-pytest-cov==7.1.0
-coverage==7.15.2
+argon2-cffi==23.1.0 \
+    --hash=sha256:c670642b78ba29641818ab2e68bd4e6a78ba53b7eff7b4c3815ae16abf91c7ea \
+    --hash=sha256:879c3e79a2729ce768ebb7d36d4609e3a78a4ca2ec3a9f12286ca057e3d0db08
 
-# --- Transitive (required by pytest) ---
-iniconfig==2.3.0
-pluggy==1.6.0
-packaging==26.2
+argon2-cffi-bindings==25.1.0 \
+    --hash=sha256:b957f3e6ea4d55d820e40ff76f450952807013d361a65d7f28acc0acbf29229d \
+    --hash=sha256:d3e924cfc503018a714f94a49a149fdc0b644eaead5d1f089330399134fa028a \
+    --hash=sha256:1e021e87faa76ae0d413b619fe2b65ab9a037f24c60a1e6cc43457ae20de6dc6 \
+    --hash=sha256:aecba1723ae35330a008418a91ea6cfcedf6d31e5fbaa056a166462ff066d500 \
+    --hash=sha256:2630b6240b495dfab90aebe159ff784d08ea999aa4b0d17efa734055a07d2f44 \
+    --hash=sha256:7aef0c91e2c0fbca6fc68e7555aa60ef7008a739cbe045541e438373bc54d2b0 \
+    --hash=sha256:a98cd7d17e9f7ce244c0803cad3c23a7d379c301ba618a5fa76a67d116618b98
+
+# ---------------------------------------------------------------------------
+# Transitive (required by cryptography / argon2-cffi-bindings)
+# ---------------------------------------------------------------------------
+
+cffi==2.0.0 \
+    --hash=sha256:44d1b5909021139fe36001ae048dbdde8214afa20200eda0f64c068cac5d5529 \
+    --hash=sha256:c8d3b5532fc71b7a77c09192b4a5a200ea992702734a2e9279a37f2478236f26 \
+    --hash=sha256:d48a880098c96020b02d5a1f7d9251308510ce8858940e6fa99ece33f610838b \
+    --hash=sha256:45d5e886156860dc35862657e1494b9bae8dfa63bf56796f2fb56e1679fc0bca \
+    --hash=sha256:19f705ada2530c1167abacb171925dd886168931e0a7b78f5bffcae5c6b5be75
+
+pycparser==3.0 \
+    --hash=sha256:600f49d217304a5902ac3c37e1281c9fe94e4d0489de643a9504c5cdfdfc6b29 \
+    --hash=sha256:b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992
+
+# ---------------------------------------------------------------------------
+# Dev dependencies
+# ---------------------------------------------------------------------------
+
+pytest==8.3.5 \
+    --hash=sha256:f4efe70cc14e511565ac476b57c279e12a855b11f48f212af1080ef2263d3845 \
+    --hash=sha256:c69214aa47deac29fad6c2a4f590b9c4a9fdb16a403176fe154b79c0b4d4d820
+
+pytest-cov==7.1.0 \
+    --hash=sha256:30674f2b5f6351aa09702a9c8c364f6a01c27aae0c1366ae8016160d1efc56b2 \
+    --hash=sha256:a0461110b7865f9a271aa1b51e516c9a95de9d696734a2f71e3e78f46e1d4678
+
+coverage==7.15.2 \
+    --hash=sha256:3df60dc267f0a2ca23cb7a9ab1109c62b9335ffbf519fcfe167157c28c09b81d \
+    --hash=sha256:7dc2950a2992cd676d35c20ae63522836deeb034f08874699d14068710af3dc1 \
+    --hash=sha256:26c3b04a6377fd7c09800921fa934e3a17c0020439cd59df73e73ae1d4b6a78c \
+    --hash=sha256:a300c6934e0989c327b9e8a1e110329da4641149f872bbe9f70168be66da76c1 \
+    --hash=sha256:1121caa19159a38b5463eaae4b1e1fde81e525b15ecc5e000cd5b1a108f743a8
+
+# ---------------------------------------------------------------------------
+# Transitive (required by pytest)
+# ---------------------------------------------------------------------------
+
+iniconfig==2.3.0 \
+    --hash=sha256:c76315c77db068650d49c5b56314774a7804df16fee4402c1f19d6d15d8c4730 \
+    --hash=sha256:f631c04d2c48c52b84d0d0549c99ff3859c98df65b3101406327ecc7d53fbf12
+
+pluggy==1.6.0 \
+    --hash=sha256:7dcc130b76258d33b90f61b658791dede3486c3e6bfb003ee5c9bfb396dd22f3 \
+    --hash=sha256:e920276dd6813095e9377c0bc5566d94c932c33b27a3e3945d8389c374dd4746
+
+packaging==26.2 \
+    --hash=sha256:ff452ff5a3e828ce110190feff1178bb1f2ea2281fa2075aadb987c2fb221661 \
+    --hash=sha256:5fc45236b9446107ff2415ce77c807cee2862cb6fac22b8a73826d0693b0980e

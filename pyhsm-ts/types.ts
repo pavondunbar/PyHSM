@@ -49,7 +49,8 @@ export interface KeyEntry {
 export interface KeystoreData {
   version: 3;
   keys: Record<string, KeyEntry>;
-  kekSalt?: string; // hex-encoded 16-byte salt for KEK derivation (PBKDF2→HKDF)
+  kekSalt?: string;   // hex-encoded 16-byte salt for KEK derivation (PBKDF2→HKDF)
+  auditSalt?: string; // hex-encoded 16-byte salt for audit HMAC key derivation (Argon2id→HKDF)
 }
 
 // --- Audit ---

@@ -30,7 +30,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.keywrap import aes_key_wrap_with_padding, aes_key_unwrap_with_padding
 from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
 
-from .storage import KeyStore, TamperError
+from .storage import KeyStore, TamperError, _derive_audit_hmac_key
 from .audit import AuditLog
 from .rate_limiter import RateLimiter
 from .metrics import MetricsCollector
@@ -167,16 +167,31 @@ class PyHSM:
         storage_path: str = "keystore.enc",
         master_password: Optional[str] = None,
         *,
+        password_file: Optional[str] = None,
         audit_log_path: Optional[str] = None,
         session_timeout_s: float = 300.0,
         rate_limit_max_ops: int = 100,
         rate_limit_window_s: float = 60.0,
         _unsafe_skip_password_validation: bool = False,
     ) -> None:
-        if not master_password:
+        # --- Resolve master password from one of three sources (priority order):
+        #   1. password_file  — safest: enforces file ownership + 0o600 perms
+        #   2. master_password — direct string (acceptable for programmatic use
+        #      where the caller controls the lifetime of the string in memory)
+        #   3. Neither provided — hard error
+        #
+        # Environment variable injection (PYHSM_MASTER_PASSWORD) is handled
+        # exclusively by the CLI layer (cli.py) and requires the operator to
+        # explicitly set PYHSM_ALLOW_ENV_PASSWORD=1. It is NOT checked here
+        # so that library users cannot accidentally pick it up.
+        if password_file is not None:
+            from .password_file import load_password_from_file
+            master_password = load_password_from_file(password_file)
+        elif not master_password:
             raise ValueError(
-                "PyHSM: master_password is required. "
-                "There is no insecure default — supply an explicit password."
+                "PyHSM: master_password or password_file is required. "
+                "There is no insecure default — supply an explicit password "
+                "or a path to a 0o600-permission password file via password_file=."
             )
 
         if not _unsafe_skip_password_validation:
@@ -187,15 +202,20 @@ class PyHSM:
 
         audit_path = audit_log_path or (storage_path + ".audit.jsonl")
 
-        # Derive the audit HMAC key from the master password via HKDF.
-        # This eliminates the plaintext .hmackey file on disk — the audit
-        # chain integrity is now tied to the master password.
-        audit_hmac_key = HKDFExpand(
-            algorithm=hashes.SHA256(),
-            length=32,
-            info=b"pyhsm-audit-hmac-v1",
-        ).derive(master_password.encode("utf-8"))
+        # Build the KeyStore FIRST so we have the per-instance audit salt
+        # before constructing AuditLog. This eliminates the two-phase bootstrap
+        # and ensures every log entry — including selfTestPass and sessionOpen —
+        # is written under the correct Argon2id-derived HMAC key.
+        self._store = KeyStore(storage_path, master_password)
 
+        # Derive the audit HMAC key from the master password via Argon2id →
+        # HKDF-Expand using the per-instance salt from the keystore.
+        # The salt is unique per keystore instance and stored inside the
+        # encrypted keystore JSON, so it is protected at rest.
+        audit_hmac_key = _derive_audit_hmac_key(
+            master_password,
+            audit_salt=self._store.get_audit_salt(),
+        )
         self._audit = AuditLog(audit_path, hmac_key=audit_hmac_key)
         self._rate_limiter = RateLimiter(rate_limit_max_ops, rate_limit_window_s)
         self._metrics = MetricsCollector()
@@ -210,7 +230,6 @@ class PyHSM:
             _logger.critical("self-tests FAILED", extra={"event": "self_test_fail", "error": str(exc)})
             raise
 
-        self._store = KeyStore(storage_path, master_password)
         self._session_active = True
         self._last_activity = _now()
         # Sharded locks: per-key operations use striped locks for concurrency,
@@ -963,26 +982,36 @@ class PyHSM:
             if not current:
                 raise ValueError(f"PyHSM: no current version for key '{key_id}'")
 
-            private_key = serialization.load_pem_private_key(
-                self._unwrap_key_data(current["key_data"]), password=None
-            )
-
-            if entry["key_type"].startswith("rsa"):
-                sig = private_key.sign(
-                    data,
-                    padding.PSS(
-                        mgf=padding.MGF1(hashes.SHA256()),
-                        salt_length=padding.PSS.MAX_LENGTH,
-                    ),
-                    hashes.SHA256(),
+            # Unwrap the private key PEM bytes into a mutable SecureBytes so
+            # we can deterministically zeroize them after the signing operation.
+            # Previously the raw bytes object was passed directly — bytes is
+            # immutable in Python and cannot be zeroed, leaving the PEM on the
+            # heap until GC. SecureBytes wraps a bytearray and calls
+            # zeroize_bytearray() in its zeroize() method.
+            raw_pem = self._unwrap_key_data(current["key_data"])
+            pem_sec = SecureBytes(raw_pem)
+            try:
+                private_key = serialization.load_pem_private_key(
+                    bytes(pem_sec.buf), password=None
                 )
-            elif entry["key_type"] == "ed25519":
-                sig = private_key.sign(data)
-            elif entry["key_type"].startswith("ec"):
-                hash_alg = _ec_hash_for_key_type(entry["key_type"])
-                sig = private_key.sign(data, ec.ECDSA(hash_alg))
-            else:
-                raise ValueError("Signing requires an RSA, EC, or Ed25519 key")
+                if entry["key_type"].startswith("rsa"):
+                    sig = private_key.sign(
+                        data,
+                        padding.PSS(
+                            mgf=padding.MGF1(hashes.SHA256()),
+                            salt_length=padding.PSS.MAX_LENGTH,
+                        ),
+                        hashes.SHA256(),
+                    )
+                elif entry["key_type"] == "ed25519":
+                    sig = private_key.sign(data)
+                elif entry["key_type"].startswith("ec"):
+                    hash_alg = _ec_hash_for_key_type(entry["key_type"])
+                    sig = private_key.sign(data, ec.ECDSA(hash_alg))
+                else:
+                    raise ValueError("Signing requires an RSA, EC, or Ed25519 key")
+            finally:
+                pem_sec.zeroize()
 
             # Atomically increment operation_count under _save_lock.
             self._store.increment_operation_count(key_id)

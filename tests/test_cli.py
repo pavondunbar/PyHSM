@@ -39,6 +39,9 @@ def run_cli(args: list[str], store: str, env_extra: dict | None = None,
     """Run the CLI with the given arguments and return the result."""
     env = os.environ.copy()
     env["PYHSM_MASTER_PASSWORD"] = PASSWORD
+    # Tests use the env-var password path — explicitly opt in to the security
+    # gate so the CLI doesn't reject the env var injection.
+    env["PYHSM_ALLOW_ENV_PASSWORD"] = "1"
     if env_extra:
         env.update(env_extra)
 

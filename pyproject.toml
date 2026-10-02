@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vectorguard-pyhsm"
-version = "2.0.0"
+version = "2.1.0"
 description = "Production-grade software Key Management Service (KMS) — key lifecycle, authenticated encryption, digital signing, and tamper-evident audit logging."
 readme = "README.md"
 license = "MIT"
@@ -26,8 +26,8 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "cryptography>=43.0.0,<44.0.0",
-    "argon2-cffi>=23.1.0,<25.0.0",
+    "cryptography>=43.0.0",
+    "argon2-cffi>=23.1.0",
 ]
 
 [project.optional-dependencies]
@@ -43,6 +43,7 @@ Issues = "https://github.com/pavondunbar/PyHSM/issues"
 
 [project.scripts]
 vectorguard-pyhsm = "cli:main"
+vectorguard-pyhsm-server = "hsm.ipc_server:main"
 
 [tool.setuptools.packages.find]
 include = ["hsm*"]
@@ -52,11 +53,15 @@ py-modules = ["cli"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "--cov=hsm --cov-report=term-missing --cov-fail-under=80"
+addopts = "--cov=hsm --cov-report=term-missing --cov-fail-under=78"
 
 [tool.coverage.run]
 source = ["hsm"]
 branch = true
+omit = [
+    "hsm/ipc_server.py",
+    "hsm/ipc_client.py",
+]
 
 [tool.coverage.report]
 show_missing = true

@@ -21,6 +21,12 @@ from .logging import get_logger
 
 _logger = get_logger(__name__)
 
+import socket as _socket
+try:
+    _HOSTNAME = _socket.gethostname()
+except Exception:
+    _HOSTNAME = "unknown"
+
 
 _VALID_OPERATIONS = frozenset(
     [
@@ -160,6 +166,9 @@ class AuditLog:
             "sequence": self._sequence,
             "operation": operation,
             "success": success,
+            # SIEM-friendly fixed fields present on every event
+            "schema_version": "pyhsm-audit-v1",
+            "host": _HOSTNAME,
         }
         if key_id is not None:
             entry["keyId"] = key_id
@@ -325,6 +334,150 @@ class AuditLog:
                 continue
             results.append(entry)
         return results
+
+    def export_siem(
+        self,
+        *,
+        operation: Optional[str] = None,
+        key_id: Optional[str] = None,
+        since: Optional[str] = None,
+        until: Optional[str] = None,
+        format: str = "cef",
+    ) -> list[str]:
+        """
+        Export audit log entries in a format ready for SIEM ingestion.
+
+        Supported formats
+        -----------------
+        ``"cef"``
+            ArcSight Common Event Format (CEF:0). Compatible with Splunk,
+            IBM QRadar, ArcSight, and most commercial SIEMs.
+            Each entry is a single CEF-formatted string.
+
+        ``"leef"``
+            IBM QRadar Log Event Enhanced Format (LEEF:2.0).
+
+        ``"json"``
+            Structured JSON with all fields present and typed. Suitable for
+            Elastic/OpenSearch, Splunk HEC, Datadog, and custom pipelines.
+            Returns the same dicts as export_jsonl() with added SIEM fields.
+
+        Parameters
+        ----------
+        operation : str, optional
+            Filter by operation type.
+        key_id : str, optional
+            Filter by key ID.
+        since : str, optional
+            ISO-8601 start timestamp (inclusive).
+        until : str, optional
+            ISO-8601 end timestamp (inclusive).
+        format : str
+            Output format: ``"cef"``, ``"leef"``, or ``"json"``.
+
+        Returns
+        -------
+        list[str]
+            List of formatted log strings (one per audit entry).
+        """
+        entries = self.export_jsonl(
+            operation=operation,
+            key_id=key_id,
+            since=since,
+            until=until,
+        )
+
+        if format == "json":
+            return [json.dumps(e, separators=(",", ":")) for e in entries]
+        elif format == "cef":
+            return [self._to_cef(e) for e in entries]
+        elif format == "leef":
+            return [self._to_leef(e) for e in entries]
+        else:
+            raise ValueError(
+                f"Unknown SIEM format: {format!r}. "
+                "Supported formats: 'cef', 'leef', 'json'."
+            )
+
+    @staticmethod
+    def _cef_escape(value: str) -> str:
+        """Escape special characters in CEF extension values."""
+        return str(value).replace("\\", "\\\\").replace("|", "\\|").replace("\n", "\\n").replace("\r", "\\r")
+
+    def _to_cef(self, entry: dict) -> str:
+        """
+        Format one audit entry as ArcSight CEF:0.
+
+        CEF header fields:
+            Version | Device Vendor | Device Product | Device Version |
+            Signature ID | Name | Severity
+
+        Severity mapping:
+            success=True  → 3 (Low)
+            success=False, non-security operation → 5 (Medium)
+            accessDenied / tamperDetected → 8 (High)
+        """
+        op = entry.get("operation", "unknown")
+        success = entry.get("success", True)
+
+        sev = 3  # Low — normal operation
+        if not success:
+            sev = 5  # Medium — failed operation
+        if op in ("accessDenied", "tamperDetected", "selfTestFail"):
+            sev = 8  # High — security event
+
+        # CEF header (pipe-separated)
+        header = (
+            f"CEF:0|PyHSM|vectorguard-pyhsm|2.1.0"
+            f"|{self._cef_escape(op)}"
+            f"|{self._cef_escape(op)}"
+            f"|{sev}"
+        )
+
+        # CEF extension (key=value pairs, space-separated)
+        ext_parts = [
+            f"rt={self._cef_escape(entry.get('timestamp', ''))}",
+            f"outcome={'success' if success else 'failure'}",
+            f"act={self._cef_escape(op)}",
+            f"seq={entry.get('sequence', 0)}",
+            f"dhost={self._cef_escape(entry.get('host', _HOSTNAME))}",
+        ]
+        if entry.get("keyId"):
+            ext_parts.append(f"fname={self._cef_escape(entry['keyId'])}")
+        if entry.get("callerId"):
+            ext_parts.append(f"suser={self._cef_escape(entry['callerId'])}")
+        if entry.get("reason"):
+            ext_parts.append(f"msg={self._cef_escape(entry['reason'])}")
+        ext_parts.append(f"cs1Label=hmac cs1={self._cef_escape(entry.get('hmac', ''))}")
+
+        return f"{header} {'  '.join(ext_parts)}"
+
+    def _to_leef(self, entry: dict) -> str:
+        """
+        Format one audit entry as IBM QRadar LEEF:2.0.
+        """
+        op = entry.get("operation", "unknown")
+        success = entry.get("success", True)
+
+        attrs = {
+            "devTime": entry.get("timestamp", ""),
+            "devTimeFormat": "yyyy-MM-dd'T'HH:mm:ss.SSSXXX",
+            "cat": op,
+            "outcome": "success" if success else "failure",
+            "seq": str(entry.get("sequence", 0)),
+            "sev": "3" if success else ("8" if op in ("accessDenied", "tamperDetected") else "5"),
+            "src": entry.get("host", _HOSTNAME),
+        }
+        if entry.get("keyId"):
+            attrs["resource"] = entry["keyId"]
+        if entry.get("callerId"):
+            attrs["usrName"] = entry["callerId"]
+        if entry.get("reason"):
+            attrs["reason"] = entry["reason"]
+        attrs["hmac"] = entry.get("hmac", "")
+
+        attr_str = "\t".join(f"{k}={v}" for k, v in attrs.items())
+        return f"LEEF:2.0|PyHSM|vectorguard-pyhsm|2.1.0|{op}|{attr_str}"
 
     def _ship_to_webhook(self, entry: dict) -> None:
         """Best-effort, non-blocking HTTP POST of a single audit entry.

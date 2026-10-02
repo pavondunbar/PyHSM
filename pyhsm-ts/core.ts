@@ -152,6 +152,12 @@ export class PyHSM {
 
     // Open session (will use Argon2id-derived key for load)
     instance.load();
+
+    // Phase 2: replace bootstrap audit HMAC key with Argon2id-derived key.
+    // This is the preferred path — Argon2id is memory-hard and resists
+    // offline dictionary attacks against the audit log.
+    await instance.refreshAuditHmacKeyAsync();
+
     instance.sessionActive = true;
     instance.lastActivity = Date.now();
     instance.scheduleTimeout();
@@ -203,27 +209,25 @@ export class PyHSM {
 
     // Initialize sub-modules
     const auditPath = config.auditLogPath || config.storePath + ".audit.jsonl";
-    // Derive audit HMAC key from master password via HKDF-Expand only.
+    // Derive audit HMAC key via Argon2id → HKDF-Expand.
     //
-    // IMPORTANT: This must match the Python layer exactly.
-    // Python uses HKDFExpand(algorithm=SHA256, length=32, info=b"pyhsm-audit-hmac-v1").derive(password)
-    // which runs the EXPAND step only — treating the raw password as the PRK,
-    // with NO extract step.
+    // Phase 1 (bootstrap): derive with an all-zeros placeholder salt so
+    // AuditLog can be constructed before the keystore is loaded. The real
+    // salt (_auditSalt stored inside the encrypted keystore JSON) is not
+    // available yet. The bootstrap key is replaced in Phase 2.
     //
-    // Node's crypto.hkdfSync() runs full HKDF (extract THEN expand). Even with
-    // an empty salt it computes PRK = HMAC-SHA256(key=zeros_32, data=password)
-    // before expanding — producing a DIFFERENT key than Python for the same
-    // password. That silently breaks cross-layer audit chain verification.
+    // Phase 2: after load() the keystore JSON contains `auditSalt`. Call
+    // refreshAuditHmacKey() to re-derive with the real salt and replace
+    // this.audit._hmacKey.
     //
-    // We replicate HKDFExpand manually:
-    //   T(1) = HMAC-SHA256(key=PRK, data=info || 0x01)   where PRK = raw password
-    // This is the single-block expand (length=32 <= SHA256 output size).
-    const info = Buffer.from("pyhsm-audit-hmac-v1", "utf8");
-    const expandInput = Buffer.concat([info, Buffer.from([0x01])]);
-    const auditHmacKey = crypto.createHmac("sha256", this.masterPasswordBuf)
-      .update(expandInput)
-      .digest();
-    this.audit = new AuditLog(auditPath, undefined, auditHmacKey);
+    // Using Argon2id here ensures the audit HMAC key has the same
+    // offline-brute-force resistance as the keystore encryption key. The
+    // previous implementation used a single HMAC-SHA256 expand over the raw
+    // password (no salt, no stretching), which allowed an attacker who stole
+    // only the audit log to crack the master password at millions of
+    // attempts per second.
+    const bootstrapAuditKey = this.deriveAuditHmacKey(Buffer.alloc(SALT_LEN, 0));
+    this.audit = new AuditLog(auditPath, undefined, bootstrapAuditKey);
     this.rateLimiter = new RateLimiter(
       parseInt(process.env.PYHSM_RATE_LIMIT || "100", 10),
       parseInt(process.env.PYHSM_RATE_WINDOW_MS || "60000", 10),
@@ -235,6 +239,8 @@ export class PyHSM {
 
   private openSession(): void {
     this.load();
+    // Phase 2: replace bootstrap audit HMAC key with the real salt-derived key.
+    this.refreshAuditHmacKey();
     this.sessionActive = true;
     this.lastActivity = Date.now();
     this.scheduleTimeout();
@@ -328,6 +334,89 @@ export class PyHSM {
   }
 
   // --- Persistence with Tamper Detection ---
+
+  /**
+   * Derive the audit HMAC key using Argon2id → HKDF-Expand.
+   *
+   * Uses the same Argon2id parameters as the keystore KDF so that an
+   * attacker who steals only the audit log faces the same brute-force cost
+   * as one who steals the keystore. A dedicated auditSalt (16 bytes stored
+   * inside the encrypted keystore JSON) makes the key unique per-instance.
+   *
+   * Sync path: uses PBKDF2 (async Argon2id not available here). Call
+   * refreshAuditHmacKeyAsync() after PyHSM.create() to upgrade to Argon2id.
+   */
+  private deriveAuditHmacKey(auditSalt: Buffer): Buffer {
+    // Use PBKDF2 synchronously (Argon2id is async-only in Node.js).
+    // PyHSM.create() will call refreshAuditHmacKeyAsync() to upgrade.
+    const master = crypto.pbkdf2Sync(
+      this.masterPasswordBuf,
+      auditSalt,
+      480_000,
+      32,
+      "sha256",
+    );
+    const auditKey = Buffer.from(
+      crypto.hkdfSync("sha256", master, Buffer.alloc(0), "pyhsm-audit-hmac-v1", 32)
+    );
+    zeroBuffer(master);
+    return auditKey;
+  }
+
+  /**
+   * Derive the audit HMAC key using Argon2id → HKDF-Expand (async).
+   * Called by PyHSM.create() after the keystore is loaded so the auditSalt
+   * is available. Replaces the bootstrap PBKDF2-derived key.
+   */
+  private async deriveAuditHmacKeyAsync(auditSalt: Buffer): Promise<Buffer> {
+    const raw = await argon2.hash(this.masterPasswordBuf, {
+      type: argon2.argon2id,
+      salt: auditSalt,
+      memoryCost: ARGON2_MEM_COST,
+      timeCost: ARGON2_TIME_COST,
+      parallelism: ARGON2_PARALLELISM,
+      hashLength: 32,
+      raw: true,
+    });
+    const master = Buffer.from(raw);
+    const auditKey = Buffer.from(
+      crypto.hkdfSync("sha256", master, Buffer.alloc(0), "pyhsm-audit-hmac-v1", 32)
+    );
+    zeroBuffer(master);
+    return auditKey;
+  }
+
+  /**
+   * Replace the bootstrap audit HMAC key with one derived from the real
+   * auditSalt stored in the (now-loaded) keystore JSON.
+   * Called synchronously after load() for the constructor path (PBKDF2),
+   * and asynchronously by PyHSM.create() (Argon2id).
+   */
+  private refreshAuditHmacKey(): void {
+    const auditSalt = this.getOrCreateAuditSalt();
+    const realKey = this.deriveAuditHmacKey(auditSalt);
+    // Replace the bootstrap key on the AuditLog instance
+    (this.audit as unknown as { _hmacKey: Buffer })._hmacKey = realKey;
+  }
+
+  private async refreshAuditHmacKeyAsync(): Promise<void> {
+    const auditSalt = this.getOrCreateAuditSalt();
+    const realKey = await this.deriveAuditHmacKeyAsync(auditSalt);
+    (this.audit as unknown as { _hmacKey: Buffer })._hmacKey = realKey;
+  }
+
+  /**
+   * Retrieve the auditSalt from the keystore, generating one if absent
+   * (migration path for keystores created before this feature).
+   */
+  private getOrCreateAuditSalt(): Buffer {
+    if (!this.store.auditSalt) {
+      this.store.auditSalt = crypto.randomBytes(SALT_LEN).toString("hex");
+      // Persist immediately so the salt survives restarts.
+      this.save();
+    }
+    return Buffer.from(this.store.auditSalt, "hex");
+  }
 
   private deriveKey(salt: Buffer): Buffer {
     // Use cached Argon2id key if salt matches (set by PyHSM.create() factory)
@@ -428,8 +517,10 @@ export class PyHSM {
 
   private load(): void {
     if (!this.backend.exists()) {
-      // New keystore — initialize kekSalt so all key wrapping uses PBKDF2→HKDF from the start
+      // New keystore — initialize kekSalt and auditSalt so all key wrapping
+      // and audit HMAC derivation uses proper salted paths from the start.
       this.store.kekSalt = crypto.randomBytes(SALT_LEN).toString("hex");
+      this.store.auditSalt = crypto.randomBytes(SALT_LEN).toString("hex");
       return;
     }
     const raw = this.backend.read();
@@ -495,6 +586,20 @@ export class PyHSM {
     // and re-wrap all key material from legacy HMAC KEK to PBKDF2→HKDF KEK
     if (!this.store.kekSalt) {
       this.migrateKek();
+    }
+
+    // Migrate audit salt: inject if absent (pre-existing keystore).
+    // The old HKDFExpand-only audit HMAC key is no longer used after this;
+    // existing log entries remain valid under the old key, new entries
+    // will use the Argon2id-derived key (after refreshAuditHmacKey()).
+    if (!this.store.auditSalt) {
+      this.store.auditSalt = crypto.randomBytes(SALT_LEN).toString("hex");
+      // save() will be triggered by migrateKek() or the next mutation;
+      // if neither fires we save explicitly to persist the new salt.
+      if (this.store.kekSalt) {
+        // kekSalt already existed, no migrateKek() will fire — save now.
+        this.save();
+      }
     }
 
     // Internalize all keyData hex strings into the in-memory Buffer map so

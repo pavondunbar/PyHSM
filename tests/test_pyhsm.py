@@ -124,7 +124,7 @@ class TestKeyStore:
 
 class TestConstruction:
     def test_no_password_raises(self, store_path):
-        with pytest.raises(ValueError, match="master_password is required"):
+        with pytest.raises(ValueError, match="master_password or password_file is required"):
             PyHSM(store_path)
 
     def test_empty_password_raises(self, store_path):

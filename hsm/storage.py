@@ -77,6 +77,74 @@ _ARGON2_PARALLELISM = 4
 _ARGON2_HASH_LEN = 32
 
 
+def _derive_audit_hmac_key(
+    master_password: str,
+    audit_salt: Optional[bytes],
+) -> bytes:
+    """
+    Derive the audit log HMAC key from the master password.
+
+    Uses the full Argon2id → HKDF-Expand pipeline so the resulting key has
+    the same offline-brute-force resistance as the keystore encryption key.
+    A dedicated ``audit_salt`` (16 random bytes stored inside the encrypted
+    keystore) makes the key unique per-instance.
+
+    When ``audit_salt`` is None (first-time bootstrap before the keystore
+    exists), a temporary key is derived from a fixed all-zeros salt. This key
+    is only used for the AuditLog constructor during __init__ and is
+    immediately replaced by the real key once the store is open.
+
+    Parameters
+    ----------
+    master_password : str
+        The plaintext master password.
+    audit_salt : bytes or None
+        16-byte random salt retrieved from the keystore's ``_audit_salt``
+        field. Pass None only during initial bootstrap.
+
+    Returns
+    -------
+    bytes
+        32-byte HMAC key.
+    """
+    salt = audit_salt if audit_salt is not None else bytes(16)  # bootstrap placeholder
+    pw_bytes = bytearray(master_password.encode("utf-8"))
+    try:
+        if _ARGON2_AVAILABLE:
+            master = bytearray(hash_secret_raw(
+                secret=bytes(pw_bytes),
+                salt=salt,
+                time_cost=_ARGON2_TIME_COST,
+                memory_cost=_ARGON2_MEMORY_COST,
+                parallelism=_ARGON2_PARALLELISM,
+                hash_len=_ARGON2_HASH_LEN,
+                type=Type.ID,
+            ))
+        elif _ALLOW_PBKDF2_FALLBACK:
+            from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+            kdf = PBKDF2HMAC(
+                algorithm=hashes.SHA256(),
+                length=32,
+                salt=salt,
+                iterations=_KDF_ITERATIONS,
+            )
+            master = bytearray(kdf.derive(bytes(pw_bytes)))
+        else:
+            raise RuntimeError(
+                "PyHSM FATAL: argon2-cffi is not installed. "
+                "Cannot derive audit HMAC key without Argon2id."
+            )
+        audit_key = bytes(HKDFExpand(
+            algorithm=hashes.SHA256(),
+            length=32,
+            info=b"pyhsm-audit-hmac-v1",
+        ).derive(bytes(master)))
+        zeroize_bytearray(master)
+        return audit_key
+    finally:
+        zeroize_bytearray(pw_bytes)
+
+
 def _internalize_key_data(keys: dict) -> None:
     """
     Convert key_data hex strings to bytearray in-place for secure memory handling.
@@ -197,25 +265,63 @@ class KeyStore:
         """The underlying storage backend."""
         return self._backend
 
+    def get_audit_salt(self) -> bytes:
+        """Return the per-instance audit HMAC salt (16 bytes).
+
+        Used by PyHSM.__init__() to derive the audit HMAC key with Argon2id
+        after the keystore is loaded. The salt is stored inside the encrypted
+        keystore JSON so it is protected at rest.
+        """
+        salt_hex = self._keys.get("_audit_salt", "")
+        if salt_hex:
+            return bytes.fromhex(salt_hex)
+        # Should never happen after _load_store(), but defend gracefully.
+        new_salt = os.urandom(_SALT_LEN)
+        self._keys["_audit_salt"] = new_salt.hex()
+        return new_salt
+
     def _migrate_kek(self) -> None:
         """
         Re-wrap all key material from legacy KEK to the new salt-based KEK.
 
-        Called once when opening a keystore that lacks a _kek_salt field.
-        After migration, the keystore is saved with the new KEK salt and
-        all key material is wrapped with the new KEK.
+        Crash-safety via write-ahead rename
+        ------------------------------------
+        The naive approach (re-wrap in memory → save) has a fatal crash window:
+        if the process dies after keys are re-wrapped in memory but before
+        ``_save_store()`` completes, the on-disk file still uses the old KEK
+        while ``_kek_salt`` is now present in the injected in-memory dict.
+        On next open the code would try the new PBKDF2→HKDF KEK path against
+        on-disk keys that are still wrapped with the old HMAC KEK → silent
+        corruption / unrecoverable keystore.
+
+        This implementation uses a write-ahead temp-file strategy:
+
+        1. Re-wrap all keys in a **deep copy** of the in-memory dict (original
+           untouched throughout steps 1-3).
+        2. Serialize + encrypt the copy to a ``.migrating`` sibling file using
+           the new KEK.
+        3. Verify the ``.migrating`` file can be decrypted and parsed correctly.
+        4. Atomically rename ``.migrating`` → live path (POSIX rename is atomic).
+        5. Only after a successful rename, update ``self._keys`` from the copy.
+
+        At every point before step 4 the original on-disk file is intact.
+        After step 4 the new file is intact. There is no window where both
+        files are corrupt simultaneously.
+
+        Called once when opening a keystore that lacks a ``_kek_salt`` field.
         """
+        import copy
+        import json
         from cryptography.hazmat.primitives.keywrap import (
             aes_key_wrap_with_padding,
             aes_key_unwrap_with_padding,
         )
 
-        # Derive the old (legacy) KEK
+        # --- Step 1: derive old KEK and new KEK ---
         old_kek = bytearray(_hmac.new(
             bytes(self._master_password), b"pyhsm-kek-v1", hashlib.sha256
         ).digest())
 
-        # Derive the new KEK (using the freshly generated _kek_salt)
         kek_salt = bytes.fromhex(self._keys["_kek_salt"])
         master = self._derive_master(kek_salt)
         new_kek = bytearray(HKDFExpand(
@@ -225,30 +331,104 @@ class KeyStore:
         ).derive(bytes(master)))
         zeroize_bytearray(master)
 
+        # --- Step 2: build migrated copy WITHOUT touching self._keys ---
+        migrated_keys = copy.deepcopy(self._keys)
+
         try:
-            for key_id, entry in self._keys.items():
+            for key_id, entry in migrated_keys.items():
                 if key_id.startswith("_"):
                     continue
                 for v in entry.get("versions", []):
                     kd = v.get("key_data", b"")
                     if not kd:
                         continue
-                    # key_data may be bytearray (post-internalize) or str (pre-internalize)
                     if isinstance(kd, bytearray):
                         wrapped_bytes = bytes(kd)
                     elif isinstance(kd, str):
                         wrapped_bytes = bytes.fromhex(kd)
                     else:
                         wrapped_bytes = bytes(kd)
-                    # Unwrap with old KEK, re-wrap with new KEK
                     raw = aes_key_unwrap_with_padding(bytes(old_kek), wrapped_bytes)
-                    v["key_data"] = bytearray(aes_key_wrap_with_padding(bytes(new_kek), raw))
+                    v["key_data"] = bytearray(
+                        aes_key_wrap_with_padding(bytes(new_kek), raw)
+                    )
         finally:
             zeroize_bytearray(old_kek)
             zeroize_bytearray(new_kek)
 
+        # --- Step 3: write migrated copy to a .migrating temp file ---
+        serializable = _externalize_key_data(migrated_keys)
+        salt = os.urandom(_SALT_LEN)
+        enc_key, mac_key = self._derive_subkeys(salt)
+        nonce = os.urandom(_NONCE_LEN)
+        ct = AESGCM(bytes(enc_key)).encrypt(
+            nonce, json.dumps(serializable).encode("utf-8"), None
+        )
+        payload = nonce + ct
+        mac = _hmac.new(bytes(mac_key), payload, hashlib.sha256).digest()
+        zeroize_bytearray(enc_key)
+        zeroize_bytearray(mac_key)
+        file_data = salt + mac + payload
+
+        # Derive the live path for the temp file.
+        # FileBackend exposes .path; fall back gracefully for custom backends.
+        live_path = getattr(self._backend, "path", None)
+        if live_path:
+            migrating_path = live_path + ".migrating"
+            try:
+                with open(migrating_path, "wb") as f:
+                    f.write(file_data)
+                    f.flush()
+                    os.fsync(f.fileno())
+
+                # --- Step 4 (verification): read back and attempt decryption ---
+                with open(migrating_path, "rb") as f:
+                    verify_data = f.read()
+                # Minimal structural check — HMAC + GCM decrypt
+                v_salt = verify_data[:_SALT_LEN]
+                v_stored_hmac = verify_data[_SALT_LEN:_SALT_LEN + _HMAC_LEN]
+                v_payload = verify_data[_SALT_LEN + _HMAC_LEN:]
+                v_enc, v_mac = self._derive_subkeys(v_salt)
+                v_expected = _hmac.new(bytes(v_mac), v_payload, hashlib.sha256).digest()
+                if not _hmac.compare_digest(v_stored_hmac, v_expected):
+                    zeroize_bytearray(v_enc)
+                    zeroize_bytearray(v_mac)
+                    raise TamperError(
+                        "PyHSM KEK migration: verification of .migrating file "
+                        "FAILED (HMAC mismatch). Original keystore untouched."
+                    )
+                v_nonce = v_payload[:_NONCE_LEN]
+                v_ct = v_payload[_NONCE_LEN:]
+                AESGCM(bytes(v_enc)).decrypt(v_nonce, v_ct, None)  # raises on failure
+                zeroize_bytearray(v_enc)
+                zeroize_bytearray(v_mac)
+
+                # --- Step 5: atomic rename — point of no return ---
+                os.replace(migrating_path, live_path)
+
+            except Exception:
+                # Clean up temp file on any failure so it doesn't confuse
+                # future opens. The original file is still intact.
+                try:
+                    os.unlink(migrating_path)
+                except OSError:
+                    pass
+                raise
+        else:
+            # Custom backend — fall back to in-place write (no crash-safe temp file).
+            # This is acceptable for MemoryBackend (used in tests) where data is
+            # volatile anyway.
+            self._backend.write(file_data)
+
+        # --- Step 6: update live in-memory state from the migrated copy ---
+        self._keys = migrated_keys
         self._needs_kek_migration = False
-        self._save_store()
+
+        _logger.info("KEK migration completed", extra={
+            "event": "kek_migration",
+            "from": "hmac-sha256",
+            "to": "pbkdf2-hkdf",
+        })
 
     # ------------------------------------------------------------------
     # KDF — key separation via HKDF-Expand
@@ -408,6 +588,7 @@ class KeyStore:
             # New keystore: generate a dedicated KEK salt and mark KDF version
             return {
                 "_kek_salt": os.urandom(_SALT_LEN).hex(),
+                "_audit_salt": os.urandom(_SALT_LEN).hex(),
                 "_kdf": "argon2id" if _ARGON2_AVAILABLE else "pbkdf2",
             }
 
@@ -475,13 +656,19 @@ class KeyStore:
         # Migration: inject a KEK salt if this is a pre-existing keystore
         if "_kek_salt" not in keys:
             keys["_kek_salt"] = os.urandom(_SALT_LEN).hex()
-            # Note: the new KEK salt will be persisted on the next _save_store() call.
-            # Until then, _derive_kek() falls back to legacy HMAC derivation, so
-            # existing wrapped keys remain accessible. On the first write (any key
-            # operation that modifies state), keys will be re-wrapped with the new KEK.
             self._needs_kek_migration = True
         else:
             self._needs_kek_migration = False
+
+        # Migration: inject an audit salt if this is a pre-existing keystore
+        if "_audit_salt" not in keys:
+            keys["_audit_salt"] = os.urandom(_SALT_LEN).hex()
+            # Will be persisted on the next save (triggered by kek migration or
+            # first write); the old HKDFExpand-only audit key remains valid for
+            # any already-written audit entries — they are not re-HMACed.
+            if not self._needs_kek_migration:
+                # Nothing else is triggering a save, so do it now to persist the salt.
+                self._needs_kdf_migration = True
 
         # Update KDF marker
         if _ARGON2_AVAILABLE:

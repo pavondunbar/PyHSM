@@ -155,7 +155,7 @@ class MetricsCollector:
         def _counter(name: str, description: str, value: int, attributes: Optional[list] = None) -> dict:
             data_point: dict = {
                 "asInt": str(value),
-                "startTimeUnixNano": str(int((self._start + _time.time() - _time.monotonic()) * 1_000_000_000)),
+                "startTimeUnixNano": str(int((_time.time() - _time.monotonic() + self._start) * 1_000_000_000)),
                 "timeUnixNano": str(now_ns),
             }
             if attributes:
@@ -206,7 +206,7 @@ class MetricsCollector:
                 "resource": {
                     "attributes": [
                         {"key": "service.name", "value": {"stringValue": "pyhsm"}},
-                        {"key": "service.version", "value": {"stringValue": "1.8.0"}},
+                        {"key": "service.version", "value": {"stringValue": "2.1.0"}},
                     ]
                 },
                 "scopeMetrics": [{

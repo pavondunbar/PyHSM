@@ -9,6 +9,7 @@ import glob
 import json
 import os
 import sys
+from typing import Optional
 
 from hsm import PyHSM
 from hsm.shamir import split_secret, reconstruct_secret, zeroize
@@ -25,18 +26,64 @@ _MAX_STDIN_BYTES = 64 * 1024 * 1024 + 1
 # ---------------------------------------------------------------------------
 
 def get_hsm(args) -> PyHSM:
-    """Obtain a PyHSM instance. Password is always entered interactively via getpass."""
+    """Obtain a PyHSM instance using the safest available password source.
+
+    Password source priority (highest to lowest security):
+      1. --password-file  <path>   File with 0o600 permissions owned by this user.
+                                   Recommended for production and automated deployments.
+      2. Interactive getpass()     Prompts on the terminal. Safe for human operators.
+      3. PYHSM_MASTER_PASSWORD     Environment variable. Requires PYHSM_ALLOW_ENV_PASSWORD=1
+                                   to acknowledge the security risk. Prints a loud warning.
+                                   Do NOT use in production — env vars are visible in
+                                   /proc/<pid>/environ and process listings.
+    """
+    password_file: Optional[str] = getattr(args, "password_file", None)
+
+    if password_file:
+        # Safest path — permission-enforced file read.
+        # PyHSM.__init__ handles the load_password_from_file() call.
+        is_new = not os.path.exists(args.store)
+        hsm = PyHSM(
+            storage_path=args.store,
+            password_file=password_file,
+            session_timeout_s=0,
+        )
+        if is_new:
+            print(f"Created new keystore: {args.store}", file=sys.stderr)
+        return hsm
+
     env_password = os.environ.get("PYHSM_MASTER_PASSWORD")
     if env_password:
-        # Clear the variable from the process environment immediately so it
-        # cannot be read from /proc/<pid>/environ or inspected by other
-        # processes running as the same user.
+        # Clear from environment immediately so child processes and
+        # /proc/<pid>/environ inspection cannot read it.
         os.environ.pop("PYHSM_MASTER_PASSWORD", None)
+
+        allow_env = os.environ.get("PYHSM_ALLOW_ENV_PASSWORD", "0") == "1"
+        if not allow_env:
+            print(
+                "ERROR: PYHSM_MASTER_PASSWORD is set but PYHSM_ALLOW_ENV_PASSWORD=1 "
+                "is not set.\n"
+                "\n"
+                "Using an environment variable for the master password is a security risk:\n"
+                "  - It is visible in /proc/<pid>/environ to other processes on the host.\n"
+                "  - It appears in shell history when set inline (e.g. PASS=x cmd).\n"
+                "  - It may be captured in CI/CD logs.\n"
+                "\n"
+                "Recommended alternatives (in order of preference):\n"
+                "  1. --password-file /path/to/file   (chmod 600, owned by this user)\n"
+                "  2. Interactive password prompt      (default when no source given)\n"
+                "\n"
+                "To acknowledge this risk and proceed anyway (e.g. in automated tests):\n"
+                "  export PYHSM_ALLOW_ENV_PASSWORD=1",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
         print(
-            "WARNING: PYHSM_MASTER_PASSWORD is set in the environment. "
-            "The variable has been cleared from the process environment, but it "
-            "may still be visible in shell history or parent process environments. "
-            "Use interactive password entry for production deployments.",
+            "WARNING: PYHSM_MASTER_PASSWORD is set. PYHSM_ALLOW_ENV_PASSWORD=1 "
+            "acknowledged.\n"
+            "The variable has been cleared from the process environment.\n"
+            "Do NOT use this method in production — use --password-file instead.",
             file=sys.stderr,
         )
         password = env_password
@@ -47,7 +94,7 @@ def get_hsm(args) -> PyHSM:
     hsm = PyHSM(
         storage_path=args.store,
         master_password=password,
-        session_timeout_s=0,  # CLI is short-lived; disable background timeout thread
+        session_timeout_s=0,
     )
     if is_new:
         print(f"Created new keystore: {args.store}", file=sys.stderr)
@@ -240,12 +287,24 @@ def cmd_audit(args) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(prog="vectorguard-pyhsm", description="PyHSM CLI")
     parser.add_argument("--store", default="keystore.enc", help="Keystore file path")
+    parser.add_argument(
+        "--password-file",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Path to a file containing the master password (recommended for "
+            "production). The file must be owned by the current user and have "
+            "permissions 0o600 (no group or world read). "
+            "Safer than PYHSM_MASTER_PASSWORD env var."
+        ),
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    # Shared parent parser for global options — allows --store
+    # Shared parent parser for global options — allows --store and --password-file
     # to appear before OR after the subcommand.
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--store", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    common.add_argument("--password-file", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
 
     # generate
     gen = sub.add_parser("generate", parents=[common], help="Generate a new key")

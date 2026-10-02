@@ -1,0 +1,168 @@
+# PyHSM Reference Docker Compose Deployment
+#
+# This file demonstrates a hardened production configuration.
+# Copy and adapt to your environment.
+#
+# Prerequisites:
+#   1. Create the password file:
+#        install -d -m 700 /run/secrets
+#        printf '%s' 'YourStr0ng!Passphrase' > /run/secrets/pyhsm-password
+#        chmod 600 /run/secrets/pyhsm-password
+#
+#   2. Create data and log directories:
+#        install -d -m 750 /var/lib/pyhsm
+#        install -d -m 750 /var/log/pyhsm
+#
+#   3. Build the image:
+#        docker compose build
+#
+#   4. Start:
+#        docker compose up -d
+#
+# Usage from another container (IPC client mode):
+#   - Mount the socket volume: volumes: [pyhsm-socket:/run/pyhsm:ro]
+#   - Connect: IPCClient("/run/pyhsm/pyhsm.sock")
+#
+# Usage standalone (CLI mode):
+#   docker compose run --rm pyhsm-cli list
+
+services:
+
+  # ---- PyHSM IPC Server ---------------------------------------------------
+  pyhsm:
+    build: .
+    image: pyhsm:2.1.0
+    container_name: pyhsm
+    restart: unless-stopped
+    user: "1000:1000"           # pyhsm:pyhsm — never root
+
+    # Read-only root filesystem; only named volumes are writable
+    read_only: true
+
+    # tmpfs mounts for ephemeral runtime data (never touches disk)
+    tmpfs:
+      - /tmp:noexec,nosuid,nodev,size=64m
+      - /run/pyhsm:noexec,nosuid,nodev,size=1m
+
+    volumes:
+      # Keystore and backup storage — persistent, writable by pyhsm only
+      - type: bind
+        source: /var/lib/pyhsm
+        target: /data
+        read_only: false
+
+      # Password file — read-only, never writable by the container
+      - type: bind
+        source: /run/secrets/pyhsm-password
+        target: /run/secrets/pyhsm-password
+        read_only: true
+
+      # Audit logs — persistent, writable
+      - type: bind
+        source: /var/log/pyhsm
+        target: /var/log/pyhsm
+        read_only: false
+
+      # Unix socket — shared with application containers
+      - type: volume
+        source: pyhsm-socket
+        target: /run/pyhsm
+
+    # No network access needed when using Unix socket IPC.
+    # Enable if you use the audit webhook feature.
+    network_mode: none
+
+    security_opt:
+      - no-new-privileges:true
+      - seccomp:unconfined     # Replace with seccomp-pyhsm.json in production
+
+    cap_drop:
+      - ALL                    # PyHSM requires no Linux capabilities
+
+    # Resource limits — tune for your key volume
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.0"
+        reservations:
+          memory: 128M
+
+    environment:
+      # Optional: set to enable IPC authentication
+      # PYHSM_IPC_SECRET: "${PYHSM_IPC_SECRET}"
+
+      # Optional: configure rate limiting
+      PYHSM_RATE_LIMIT: "100"
+      PYHSM_RATE_WINDOW_MS: "60000"
+
+    healthcheck:
+      test: ["CMD", "python3", "-c", "
+from hsm.ipc_client import IPCClient
+try:
+    with IPCClient('/run/pyhsm/pyhsm.sock') as c:
+        r = c.health()
+        assert r.get('status') == 'ok'
+except Exception as e:
+    raise SystemExit(1)
+"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+        labels: "service=pyhsm"
+
+  # ---- One-shot CLI container (optional) ----------------------------------
+  # Use for manual key management operations:
+  #   docker compose run --rm pyhsm-cli list
+  #   docker compose run --rm pyhsm-cli generate my-key --type aes-256
+  pyhsm-cli:
+    build: .
+    image: pyhsm:2.1.0
+    profiles: ["cli"]           # only started when explicitly requested
+    user: "1000:1000"
+    read_only: true
+    tmpfs:
+      - /tmp:noexec,nosuid,size=16m
+
+    volumes:
+      - type: bind
+        source: /var/lib/pyhsm
+        target: /data
+      - type: bind
+        source: /run/secrets/pyhsm-password
+        target: /run/secrets/pyhsm-password
+        read_only: true
+      - type: bind
+        source: /var/log/pyhsm
+        target: /var/log/pyhsm
+
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    network_mode: none
+
+    # Override the default IPC server CMD to run the CLI
+    entrypoint: ["vectorguard-pyhsm"]
+    command:
+      - "--store"
+      - "/data/keystore.enc"
+      - "--password-file"
+      - "/run/secrets/pyhsm-password"
+      - "list"
+
+volumes:
+  # Named volume for the Unix socket — shared between pyhsm and app containers
+  pyhsm-socket:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=1m,mode=700"
