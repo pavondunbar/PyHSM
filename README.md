@@ -2,6 +2,43 @@
 
 ## Changelog
 
+### v2.1.0 (2026-10-01)
+
+A security-hardening and operational maturity release. No breaking changes from v2.0.0.
+
+**New Modules**
+
+- `hsm/ipc_server.py` — Python-native Unix domain socket IPC server. Runs PyHSM core in a dedicated subprocess for process isolation; registered as the `vectorguard-pyhsm-server` CLI entry point.
+- `hsm/ipc_client.py` — Companion IPC client. Drop-in replacement for direct `PyHSM` usage when running in process-isolation mode.
+- `hsm/password_file.py` — Safe password-file loader for institutional deployments. Reads the master password from a filesystem path with strict permission checks (must be owned by the running user and mode `0600`), as a secure alternative to environment-variable injection.
+
+**Audit Log Improvements**
+
+- Every audit entry now includes `schema_version: "pyhsm-audit-v1"` and `host` (hostname) fields, making events directly consumable by SIEM platforms without pre-processing.
+- New `export_siem()` method on `AuditLog` for structured SIEM-ready export.
+
+**New Documentation**
+
+- `HARDENING.md` — Step-by-step deployment hardening guide covering OS requirements, service account isolation, file permissions, swap/memory protection, systemd unit hardening, Docker hardening, keystore backup, audit log protection, network isolation, IPC process isolation mode, and dependency verification.
+- `COMPLIANCE.md` — Per-framework compliance coverage matrix (SOC 2, ISO 27001, PCI-DSS, HIPAA, FedRAMP). States which requirements PyHSM satisfies, partially satisfies, and which are out of scope.
+- `SECURITY_POLICY.md` — Formal security policy document: security objectives, cryptographic standards, operational requirements, and incident response commitments. Suitable for inclusion in organizational security documentation packages.
+- `Dockerfile` and `docker-compose.yml` — Reference hardened container deployment with least-privilege runtime configuration.
+
+**Dependency Changes**
+
+- Unpinned upper bounds on `cryptography` and `argon2-cffi` (now `>=43.0.0` and `>=23.1.0` respectively) to allow users to receive upstream security patches without waiting for a PyHSM release.
+- Coverage threshold adjusted to 78% to account for the new IPC modules (excluded from coverage measurement as they require a live subprocess environment).
+
+**Migration from v2.0.0**
+
+No breaking changes. Update with:
+
+```bash
+pip install --upgrade vectorguard-pyhsm
+```
+
+---
+
 ### v2.0.0 (2026-10-01)
 
 This is a major release. The version bump reflects breaking changes to the public API, cryptographic storage format improvements, and the promotion of several previously-experimental features to stable.
