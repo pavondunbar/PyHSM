@@ -50,6 +50,8 @@ _VALID_OPERATIONS = frozenset(
         "accessDenied",
         "backup",
         "verifyBackup",
+        "rotationSeal",
+        "rotationOpen",
     ]
 )
 
@@ -96,6 +98,9 @@ class AuditLog:
         self._max_entries = max_entries
         self._max_rotated_files = max_rotated_files
         self._entries_since_load = 0
+        # Guard flag: prevents _maybe_rotate() from triggering a recursive
+        # rotation while _rotate() is already in progress writing seal entries.
+        self._rotating = False
 
         # Validate and store webhook URL — only https:// is permitted.
         # http://, file://, ftp://, and internal-network addresses are all
@@ -228,6 +233,12 @@ class AuditLog:
 
     def _maybe_rotate(self) -> None:
         """Rotate the log file if it exceeds configured size or entry limits."""
+        # Do not trigger a rotation while one is already in progress (the seal
+        # and open entries written during rotation must not themselves cause
+        # another rotation attempt).
+        if self._rotating:
+            return
+
         needs_rotation = False
 
         if self._max_bytes > 0:
@@ -251,6 +262,29 @@ class AuditLog:
 
         The current log becomes .1, previous .1 becomes .2, etc.
         Files beyond max_rotated_files are deleted.
+
+        Rotation-seal entries
+        ---------------------
+        Before rotating, a ``rotationSeal`` entry is appended to the current
+        log file.  It carries:
+
+          - ``rotation_hmac``: the final HMAC of the current chain, so that
+            ``verify_across_rotations()`` can confirm the seal was written by
+            a process that held the HMAC key.
+          - ``rotated_to``: the numbered filename the current file is about
+            to be renamed to (e.g. ``audit.jsonl.1``).
+
+        After the rename, a ``rotationOpen`` entry is written to the new
+        (empty) active log.  It records the previous file's seal HMAC so
+        that an auditor can cryptographically stitch the chain back together:
+
+          - ``prev_file``: the rotated-away filename.
+          - ``prev_seal_hmac``: the ``rotation_hmac`` from the seal entry.
+
+        An attacker who deletes a rotated file cannot forge a valid seal HMAC
+        (that requires the key), so the gap is detectable by comparing the
+        ``prev_seal_hmac`` in the open entry against the last HMAC in the
+        deleted file.
         """
         # Delete the oldest file if it would exceed max_rotated_files
         oldest = f"{self.log_path}.{self._max_rotated_files}"
@@ -264,13 +298,48 @@ class AuditLog:
             if os.path.exists(src):
                 os.rename(src, dst)
 
+        # --- Write rotation-seal entry to the current file before renaming ---
+        next_rotated_name = f"{self.log_path}.1"
+        # Record the seal HMAC *before* appending (the append will update
+        # self._last_hmac, but we want to capture the chain up to this point).
+        seal_hmac_before = self._last_hmac
+        self._rotating = True
+        try:
+            self.record(
+                "rotationSeal",
+                success=True,
+                extra={
+                    "rotation_hmac": seal_hmac_before,
+                    "rotated_to": next_rotated_name,
+                },
+            )
+        finally:
+            self._rotating = False
+        # After record(), self._last_hmac is now the seal entry's own HMAC.
+        seal_entry_hmac = self._last_hmac
+
         # Rotate current file to .1
         if os.path.exists(self.log_path):
-            os.rename(self.log_path, f"{self.log_path}.1")
+            os.rename(self.log_path, next_rotated_name)
 
-        # Reset state for the new file — HMAC chain continues from where it left off
-        # (this is intentional: the chain spans rotations for tamper evidence)
+        # Reset entry counter for the new file.
+        # The HMAC chain continues from where it left off (self._last_hmac is
+        # already set to seal_entry_hmac) — do NOT reset self._last_hmac here.
         self._entries_since_load = 0
+
+        # --- Write rotation-open entry to the new (empty) active log ---
+        self._rotating = True
+        try:
+            self.record(
+                "rotationOpen",
+                success=True,
+                extra={
+                    "prev_file": next_rotated_name,
+                    "prev_seal_hmac": seal_entry_hmac,
+                },
+            )
+        finally:
+            self._rotating = False
 
     def verify(self) -> int:
         """
@@ -298,6 +367,146 @@ class AuditLog:
                 return entry.get("sequence", -2)
             prev_hmac = stored_hmac
         return -1
+
+    def verify_across_rotations(self) -> dict:
+        """
+        Verify the HMAC chain across the active log file and all rotated files.
+
+        How it works
+        ------------
+        ``_rotate()`` writes a ``rotationSeal`` entry as the last entry in
+        a file before renaming it, and a ``rotationOpen`` entry as the first
+        entry in the new file.  ``rotationOpen`` records the seal entry's
+        HMAC (``prev_seal_hmac``) so this method can stitch the files
+        together:
+
+          1. Load all rotated files in order (oldest first): ``.N``, …, ``.1``
+          2. Load the active file.
+          3. Verify the HMAC chain within each file independently.
+          4. At each file boundary, check that the ``rotationOpen`` entry's
+             ``prev_seal_hmac`` matches the ``rotation_hmac`` in the
+             preceding file's ``rotationSeal`` entry.
+
+        Returns
+        -------
+        dict with keys:
+          ``ok``           — True if the entire chain is intact.
+          ``files_checked``— list of filenames verified (oldest → newest).
+          ``first_error``  — description of the first integrity failure,
+                             or None if ok is True.
+        """
+        # Collect all log files, oldest first
+        files: list[str] = []
+        for i in range(self._max_rotated_files, 0, -1):
+            path = f"{self.log_path}.{i}"
+            if os.path.exists(path):
+                files.append(path)
+        files.append(self.log_path)  # active file is always last
+
+        files_checked: list[str] = []
+        prev_seal_hmac: str | None = None  # expected from prior file's rotationSeal
+
+        for filepath in files:
+            if not os.path.exists(filepath):
+                continue
+            files_checked.append(filepath)
+
+            try:
+                with open(filepath, "r") as f:
+                    lines = [l for l in f.read().strip().split("\n") if l.strip()]
+            except OSError as exc:
+                return {
+                    "ok": False,
+                    "files_checked": files_checked,
+                    "first_error": f"Cannot read {filepath}: {exc}",
+                }
+
+            if not lines:
+                continue
+
+            # Determine the starting prev_hmac for this file.
+            # For the first file the chain starts at "0"*64.
+            # For subsequent files the chain continues from the last HMAC of
+            # the rotationSeal entry in the previous file.
+            if prev_seal_hmac is not None:
+                # The rotationOpen entry in this file should confirm the seal.
+                try:
+                    open_entry = json.loads(lines[0])
+                except json.JSONDecodeError as exc:
+                    return {
+                        "ok": False,
+                        "files_checked": files_checked,
+                        "first_error": f"{filepath} line 1 is not valid JSON: {exc}",
+                    }
+                if open_entry.get("operation") == "rotationOpen":
+                    recorded = open_entry.get("prev_seal_hmac", "")
+                    if recorded != prev_seal_hmac:
+                        return {
+                            "ok": False,
+                            "files_checked": files_checked,
+                            "first_error": (
+                                f"{filepath}: rotationOpen prev_seal_hmac mismatch — "
+                                f"got '{recorded}', expected '{prev_seal_hmac}'. "
+                                "A rotated file may have been deleted or tampered with."
+                            ),
+                        }
+
+            # Verify the HMAC chain within this file.
+            # The chain anchor is "0"*64 for the first file ever written,
+            # or the HMAC of the rotationOpen entry for subsequent files
+            # (which we reconstruct below by walking the chain from "0"*64
+            # reset — each file's internal chain is self-contained; only
+            # cross-file stitching uses prev_seal_hmac).
+            current_prev = "0" * 64
+            last_hmac_in_file = "0" * 64
+            seal_hmac_in_file: str | None = None
+
+            for lineno, line in enumerate(lines, 1):
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    return {
+                        "ok": False,
+                        "files_checked": files_checked,
+                        "first_error": f"{filepath} line {lineno}: JSON error: {exc}",
+                    }
+
+                stored_hmac = entry.pop("hmac", None)
+                expected = _hmac.new(
+                    self._hmac_key,
+                    (
+                        json.dumps(entry, separators=(",", ":"), sort_keys=True)
+                        + current_prev
+                    ).encode(),
+                    hashlib.sha256,
+                ).hexdigest()
+
+                if stored_hmac != expected:
+                    return {
+                        "ok": False,
+                        "files_checked": files_checked,
+                        "first_error": (
+                            f"{filepath} line {lineno} (seq {entry.get('sequence', '?')}): "
+                            f"HMAC mismatch — file has been tampered with or truncated."
+                        ),
+                    }
+
+                current_prev = stored_hmac
+                last_hmac_in_file = stored_hmac
+
+                # Track the rotationSeal entry so we can hand its HMAC to
+                # the next file's stitching check.
+                if entry.get("operation") == "rotationSeal":
+                    seal_hmac_in_file = stored_hmac
+
+            # The cross-file stitch uses the rotationSeal entry's HMAC.
+            prev_seal_hmac = seal_hmac_in_file  # None if no seal in this file
+
+        return {
+            "ok": True,
+            "files_checked": files_checked,
+            "first_error": None,
+        }
 
     def export_jsonl(
         self,

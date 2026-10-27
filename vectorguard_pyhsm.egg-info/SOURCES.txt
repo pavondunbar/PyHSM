@@ -6,9 +6,12 @@ hsm/__init__.py
 hsm/audit.py
 hsm/backends.py
 hsm/core.py
+hsm/ipc_client.py
+hsm/ipc_server.py
 hsm/jwk.py
 hsm/logging.py
 hsm/metrics.py
+hsm/password_file.py
 hsm/py.typed
 hsm/rate_limiter.py
 hsm/secure_memory.py

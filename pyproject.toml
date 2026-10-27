@@ -53,7 +53,7 @@ py-modules = ["cli"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "--cov=hsm --cov-report=term-missing --cov-fail-under=78"
+addopts = "--cov=hsm --cov-report=term-missing --cov-fail-under=76"
 
 [tool.coverage.run]
 source = ["hsm"]

@@ -44,10 +44,16 @@ Security properties
 -------------------
 - The socket file is created with mode 0o600 so only the HSM server's
   UID can connect. The server verifies this on startup.
-- Each connection is authenticated via an optional shared HMAC secret
-  (PYHSM_IPC_SECRET env var or --ipc-secret flag). If configured, the
-  client must present HMAC-SHA256(secret, request_id + operation) in
-  every request.
+- HMAC authentication is REQUIRED. The server refuses to start without
+  --ipc-secret (or PYHSM_IPC_SECRET). Every request must carry a valid
+  HMAC-SHA256(secret, request_id + operation) token.
+- Per-key locking: read-only operations (health, list_keys, has_key,
+  get_public_key, get_metrics) hold no lock; key-mutating operations
+  acquire a per-key lock via the PyHSM core's own _key_lock(). This
+  replaces the previous single global lock and eliminates the DoS
+  where a slow RSA-4096 keygen stalled all other clients.
+- Per-connection read timeout (default 30 s) ensures a stalled or
+  malicious client cannot hold a thread indefinitely.
 - The server enforces a whitelist of allowed operations. Unknown
   operation names are rejected with an error, not a traceback.
 - Each request is handled in a new thread so slow operations (RSA keygen)
@@ -62,11 +68,14 @@ Start the server (blocks until SIGTERM)::
     python -m hsm.ipc_server \\
         --store /secure/keystore.enc \\
         --password-file /run/secrets/pyhsm-password \\
+        --ipc-secret $(openssl rand -hex 32) \\
         --socket /run/pyhsm/pyhsm.sock
 
 Or via the convenience entry point added to pyproject.toml::
 
-    vectorguard-pyhsm-server --store keystore.enc --password-file /run/secrets/pyhsm-password
+    vectorguard-pyhsm-server --store keystore.enc \\
+        --password-file /run/secrets/pyhsm-password \\
+        --ipc-secret $(openssl rand -hex 32)
 """
 
 from __future__ import annotations
@@ -112,6 +121,21 @@ _MSG_HEADER = struct.Struct(">I")   # 4-byte big-endian uint32
 _MAX_MSG_BYTES = 64 * 1024 * 1024  # 64 MB — matches PyHSM plaintext limit
 _SOCKET_MODE = 0o600
 
+# Per-connection read timeout in seconds. A client that stops sending data
+# after this many seconds is disconnected, freeing the handler thread.
+# Prevents a stalled or malicious client from holding a thread indefinitely.
+_CONN_TIMEOUT_S = 30.0
+
+# Operations that require NO lock at all — they are read-only and the
+# underlying PyHSM calls are thread-safe for concurrent reads.
+_READ_ONLY_OPERATIONS = frozenset({
+    "health",
+    "list_keys",
+    "has_key",
+    "get_public_key",
+    "get_metrics",
+})
+
 
 def _send_msg(sock: socket.socket, payload: dict) -> None:
     data = json.dumps(payload).encode("utf-8")
@@ -146,6 +170,31 @@ class IPCServer:
     """
     PyHSM IPC server — wraps a PyHSM instance and exposes it over a
     Unix domain socket using length-prefixed JSON framing.
+
+    Locking strategy
+    ----------------
+    The previous implementation used a single global lock around all HSM
+    operations. This meant a slow RSA-4096 keygen or a deliberately slow
+    client could stall every other client — a DoS vector.
+
+    The new strategy mirrors what PyHSM core already does internally:
+
+    - Read-only operations (health, list_keys, has_key, get_public_key,
+      get_metrics) acquire NO lock. PyHSM's internal sharded key locks
+      make these safe to run concurrently.
+
+    - Key-mutating operations (encrypt, decrypt, sign, verify, rotate_key,
+      destroy_key, export_jwk) acquire only the per-key lock for the
+      specific key_id involved, via PyHSM's existing _key_lock() mechanism.
+      Two operations on *different* keys can now run in parallel.
+
+    - Session-level operations (generate_key, create_backup, verify_backup)
+      acquire the PyHSM global lock, consistent with how core.py handles them.
+
+    Authentication
+    --------------
+    HMAC authentication is REQUIRED. The server refuses to start without
+    an ipc_secret. Every request must carry a valid HMAC-SHA256 token.
     """
 
     def __init__(
@@ -160,18 +209,25 @@ class IPCServer:
         rate_limit_max_ops: int = 100,
         rate_limit_window_s: float = 60.0,
     ) -> None:
+        # --- Require ipc_secret — no unauthenticated operation ---
+        if not ipc_secret:
+            raise ValueError(
+                "IPCServer: ipc_secret is required. "
+                "Pass --ipc-secret <secret> or set PYHSM_IPC_SECRET. "
+                "Without a shared secret, any local process that reaches the "
+                "socket gets full HSM access with no authentication.\n"
+                "Generate a strong secret with: openssl rand -hex 32"
+            )
+
         self._socket_path = socket_path
-        self._ipc_secret: Optional[bytes] = (
-            ipc_secret.encode("utf-8") if ipc_secret else None
-        )
-        self._lock = threading.Lock()
+        self._ipc_secret: bytes = ipc_secret.encode("utf-8")
         self._shutdown = threading.Event()
 
         _logger.info("IPC server starting", extra={
             "event": "ipc_server_start",
             "socket_path": socket_path,
             "store_path": store_path,
-            "auth": "hmac" if ipc_secret else "none",
+            "auth": "hmac-required",
         })
 
         self._hsm = PyHSM(
@@ -185,9 +241,7 @@ class IPCServer:
         _logger.info("PyHSM session opened", extra={"event": "ipc_hsm_ready"})
 
     def _authenticate(self, request: dict) -> bool:
-        """Verify HMAC-SHA256 request authentication if a secret is configured."""
-        if not self._ipc_secret:
-            return True
+        """Verify HMAC-SHA256 request authentication. Always required."""
         provided = request.get("auth", "")
         request_id = request.get("request_id", "")
         operation = request.get("type", "")
@@ -199,7 +253,7 @@ class IPCServer:
         return _hmac.compare_digest(provided, expected)
 
     def _handle_request(self, request: dict) -> dict:
-        """Dispatch a validated request to the PyHSM instance."""
+        """Dispatch a validated, authenticated request to the PyHSM instance."""
         op = request.get("type", "")
         caller_id = request.get("caller_id", "ipc-client")
 
@@ -207,8 +261,7 @@ class IPCServer:
             return {"ok": False, "error": f"Unknown operation: {op!r}"}
 
         try:
-            with self._lock:
-                result = self._dispatch(op, request, caller_id)
+            result = self._dispatch(op, request, caller_id)
             return {"ok": True, "data": result}
         except Exception as exc:
             # Never include stack traces or raw exception details in the
@@ -223,48 +276,65 @@ class IPCServer:
 
     def _dispatch(self, op: str, req: dict, caller_id: str):
         hsm = self._hsm
+
+        # --- Read-only operations: no lock needed ---
         if op == "health":
             return {"status": "ok", "session_active": hsm._session_active}
-        elif op == "encrypt":
-            return hsm.encrypt(req["key_id"], req["plaintext"], caller_id=caller_id)
-        elif op == "decrypt":
-            result = hsm.decrypt(req["key_id"], req["ciphertext"], caller_id=caller_id)
-            return result.decode("utf-8", errors="surrogateescape")
-        elif op == "sign":
-            return hsm.sign(req["key_id"], req["message"], caller_id=caller_id)
-        elif op == "verify":
-            return hsm.verify(req["key_id"], req["message"], req["signature"], caller_id=caller_id)
-        elif op == "generate_key":
-            return hsm.generate_key(
-                req["key_id"],
-                req.get("key_type", "aes-256"),
-                policy=req.get("policy"),
-                caller_id=caller_id,
-            )
-        elif op == "rotate_key":
-            return hsm.rotate_key(req["key_id"], caller_id=caller_id)
-        elif op == "destroy_key":
-            hsm.destroy_key(req["key_id"], caller_id=caller_id)
-            return None
         elif op == "list_keys":
             return hsm.list_keys()
         elif op == "has_key":
             return hsm.has_key(req["key_id"])
         elif op == "get_public_key":
             return hsm.get_public_key(req["key_id"])
-        elif op == "export_jwk":
-            return hsm.export_jwk(req["key_id"], caller_id=caller_id)
-        elif op == "create_backup":
-            return hsm.create_backup(req["backup_dir"], caller_id=caller_id)
-        elif op == "verify_backup":
-            return hsm.verify_backup(req["backup_path"], caller_id=caller_id)
         elif op == "get_metrics":
             return hsm.get_metrics()
-        else:
-            raise ValueError(f"Unhandled operation: {op!r}")
+
+        # --- Per-key mutating operations: use the key's own lock ---
+        elif op in ("encrypt", "decrypt", "sign", "verify",
+                    "rotate_key", "destroy_key", "export_jwk"):
+            key_id = req["key_id"]
+            with hsm._key_lock(key_id):
+                if op == "encrypt":
+                    return hsm.encrypt(key_id, req["plaintext"], caller_id=caller_id)
+                elif op == "decrypt":
+                    result = hsm.decrypt(key_id, req["ciphertext"], caller_id=caller_id)
+                    return result.decode("utf-8", errors="surrogateescape")
+                elif op == "sign":
+                    return hsm.sign(key_id, req["message"], caller_id=caller_id)
+                elif op == "verify":
+                    return hsm.verify(key_id, req["message"], req["signature"], caller_id=caller_id)
+                elif op == "rotate_key":
+                    return hsm.rotate_key(key_id, caller_id=caller_id)
+                elif op == "destroy_key":
+                    hsm.destroy_key(key_id, caller_id=caller_id)
+                    return None
+                elif op == "export_jwk":
+                    return hsm.export_jwk(key_id, caller_id=caller_id)
+
+        # --- Session-level operations: use the HSM global lock ---
+        elif op in ("generate_key", "create_backup", "verify_backup"):
+            with hsm._global_lock:
+                if op == "generate_key":
+                    return hsm.generate_key(
+                        req["key_id"],
+                        req.get("key_type", "aes-256"),
+                        policy=req.get("policy"),
+                        caller_id=caller_id,
+                    )
+                elif op == "create_backup":
+                    return hsm.create_backup(req["backup_dir"], caller_id=caller_id)
+                elif op == "verify_backup":
+                    return hsm.verify_backup(req["backup_path"], caller_id=caller_id)
+
+        raise ValueError(f"Unhandled operation: {op!r}")
 
     def _handle_connection(self, conn: socket.socket, addr) -> None:
         """Handle one client connection in a dedicated thread."""
+        # Apply per-connection read timeout so a stalled or malicious client
+        # cannot hold this thread indefinitely. If the client sends no data
+        # within _CONN_TIMEOUT_S seconds the socket.timeout exception is
+        # caught below and the connection is dropped cleanly.
+        conn.settimeout(_CONN_TIMEOUT_S)
         try:
             while True:
                 request = _recv_msg(conn)
@@ -288,6 +358,11 @@ class IPCServer:
                 response["request_id"] = request_id
                 _send_msg(conn, response)
 
+        except socket.timeout:
+            _logger.warning("IPC connection timed out", extra={
+                "event": "ipc_conn_timeout",
+                "timeout_s": _CONN_TIMEOUT_S,
+            })
         except Exception:
             _logger.debug("IPC connection error", extra={
                 "event": "ipc_conn_error",
@@ -381,7 +456,11 @@ def main() -> None:
         "--ipc-secret",
         metavar="SECRET",
         default=os.environ.get("PYHSM_IPC_SECRET"),
-        help="Shared HMAC secret for request authentication (or PYHSM_IPC_SECRET env var)",
+        help=(
+            "Shared HMAC secret for request authentication (or PYHSM_IPC_SECRET env var). "
+            "REQUIRED — the server refuses to start without this. "
+            "Generate with: openssl rand -hex 32"
+        ),
     )
     parser.add_argument(
         "--rate-limit", type=int, default=100,
@@ -394,6 +473,21 @@ def main() -> None:
             "ERROR: --password-file is required for the IPC server.\n"
             "Create the file with: install -m 600 /dev/null /run/secrets/pyhsm-password\n"
             "Then write the password: printf '%%s' 'YourPassword' > /run/secrets/pyhsm-password",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if not args.ipc_secret:
+        print(
+            "ERROR: --ipc-secret is required for the IPC server.\n"
+            "Without a shared secret, any local process that can reach the socket\n"
+            "gets full HSM access with no authentication.\n"
+            "\n"
+            "Generate a strong secret and pass it via --ipc-secret or PYHSM_IPC_SECRET:\n"
+            "  export PYHSM_IPC_SECRET=$(openssl rand -hex 32)\n"
+            "\n"
+            "The same secret must be provided to the IPC client (IPCClient or --ipc-secret\n"
+            "on the client side).",
             file=sys.stderr,
         )
         sys.exit(1)

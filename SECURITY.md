@@ -4,9 +4,11 @@
 
 | Version | Supported          |
 |---------|--------------------|
-| 1.x     | :white_check_mark: |
+| 2.x     | :white_check_mark: |
+| 1.x     | :x:                |
 
 Only the latest release on the `main` branch receives security patches.
+v1.x is no longer supported. Upgrade to v2.1.0 or later.
 
 ---
 
