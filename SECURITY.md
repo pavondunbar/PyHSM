@@ -8,7 +8,22 @@
 | 1.x     | :x:                |
 
 Only the latest release on the `main` branch receives security patches.
-v1.x is no longer supported. Upgrade to v2.1.0 or later.
+v1.x is no longer supported. Upgrade to v2.2.0 or later.
+
+---
+
+## Recent Security Fixes (v2.2.0)
+
+The following vulnerabilities were identified in an internal security audit and fixed in v2.2.0:
+
+| Issue | Severity | Fix |
+|---|---|---|
+| IPC server unauthenticated by default | High | `--ipc-secret` now mandatory; server refuses to start without it |
+| IPC server global lock DoS | Medium | Replaced with per-key locking; read-only ops hold no lock; 30 s connection timeout |
+| Shamir shares use 4-byte truncated checksum | Medium | Replaced with per-share HMAC-SHA256 (256-bit, index-bound) + reconstruction HMAC |
+| KAT coverage missing 6 primitives | Medium | Added KATs for Argon2id, HKDF, AES-KWP, ECDSA P-256, RSA-PSS, Ed25519 |
+| Audit log chain did not span rotation boundaries | Low | `rotationSeal`/`rotationOpen` entries + `verify_across_rotations()` |
+| Supported versions table incorrect in SECURITY.md | Informational | Updated (v1.x EOL, v2.x supported) |
 
 ---
 

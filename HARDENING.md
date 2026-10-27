@@ -130,9 +130,9 @@ At runtime, collect threshold shares and reconstruct:
 
 ```bash
 vectorguard-pyhsm reconstruct \
-    --share '{"index":1,"data":"...","checksum":"..."}' \
-    --share '{"index":3,"data":"...","checksum":"..."}' \
-    --share '{"index":5,"data":"...","checksum":"..."}' \
+    --share '{"index":1,"data":"...","share_hmac":"...","hmac_salt":"...","reconstruction_hmac":"..."}' \
+    --share '{"index":3,"data":"...","share_hmac":"...","hmac_salt":"...","reconstruction_hmac":"..."}' \
+    --share '{"index":5,"data":"...","share_hmac":"...","hmac_salt":"...","reconstruction_hmac":"..."}' \
     > /run/secrets/pyhsm-password
 chmod 600 /run/secrets/pyhsm-password
 ```
@@ -210,7 +210,8 @@ Group=pyhsm
 ExecStart=/usr/local/bin/vectorguard-pyhsm-server \
     --store /var/lib/pyhsm/keystore.enc \
     --password-file /run/secrets/pyhsm-password \
-    --socket /run/pyhsm/pyhsm.sock
+    --socket /run/pyhsm/pyhsm.sock \
+    --ipc-secret ${PYHSM_IPC_SECRET}
 ExecStop=/bin/kill -TERM $MAINPID
 Restart=on-failure
 RestartSec=5s
@@ -336,10 +337,26 @@ The HMAC-chained audit log is a security control. Protect it accordingly.
 chmod 640 /var/log/pyhsm/*.audit.jsonl
 chown pyhsm:security /var/log/pyhsm/*.audit.jsonl
 
-# Verify chain integrity
+# Verify chain integrity (active log file only)
 vectorguard-pyhsm --store /var/lib/pyhsm/keystore.enc \
     --password-file /run/secrets/pyhsm-password \
     audit --verify
+
+# Verify chain integrity across ALL rotated files (v2.2.0+)
+# Returns ok=true if every file and every rotation boundary is intact.
+# A deleted rotated file or a forged seal produces a precise error.
+python3 -c "
+from hsm.audit import AuditLog
+import os, sys
+key = open('/run/secrets/pyhsm-audit-key', 'rb').read()
+log = AuditLog('/var/log/pyhsm/keystore.enc.audit.jsonl', hmac_key=key)
+result = log.verify_across_rotations()
+if result['ok']:
+    print('Audit chain OK — files checked:', result['files_checked'])
+else:
+    print('TAMPER DETECTED:', result['first_error'], file=sys.stderr)
+    sys.exit(1)
+"
 
 # Ship to SIEM (CEF format for Splunk/QRadar/ArcSight)
 vectorguard-pyhsm --store /var/lib/pyhsm/keystore.enc \
@@ -360,6 +377,14 @@ Use Linux audit framework (`auditd`) to detect tampering with the log file:
 ```bash
 auditctl -w /var/log/pyhsm -p wxa -k pyhsm_audit
 ```
+
+**Rotation seal entries (v2.2.0+):** When the audit log rotates, a
+`rotationSeal` entry is appended to the closing file containing a
+cryptographic HMAC of the chain up to that point, and a `rotationOpen`
+entry is written to the new file confirming the seal. This makes deletion
+of any rotated file detectable — an attacker cannot erase evidence without
+breaking the provable chain that the next file's open entry was created by
+a holder of the HMAC key.
 
 ---
 
@@ -387,27 +412,47 @@ application user only.
 ## 11. Process Isolation Mode (IPC) (Recommended)
 
 Run PyHSM in a separate process to harden the trust boundary between
-the HSM and your application code:
+the HSM and your application code. As of v2.2.0, `--ipc-secret` is
+**required** — the server refuses to start without it.
+
+### Generating the IPC secret
 
 ```bash
-# Start the HSM server process
+# Generate a strong shared secret (32 bytes = 256 bits)
+openssl rand -hex 32 > /run/secrets/pyhsm-ipc-secret
+chmod 600 /run/secrets/pyhsm-ipc-secret
+chown pyhsm:pyhsm /run/secrets/pyhsm-ipc-secret
+```
+
+### Starting the server
+
+```bash
 vectorguard-pyhsm-server \
     --store /var/lib/pyhsm/keystore.enc \
     --password-file /run/secrets/pyhsm-password \
     --socket /run/pyhsm/pyhsm.sock \
-    --ipc-secret "$(cat /run/secrets/pyhsm-ipc-secret)" &
+    --ipc-secret "$(cat /run/secrets/pyhsm-ipc-secret)"
+```
 
-# In your application
+### Connecting from your application
+
+```python
 from hsm.ipc_client import IPCClient
 
-with IPCClient("/run/pyhsm/pyhsm.sock",
-               ipc_secret=open("/run/secrets/pyhsm-ipc-secret").read().strip()) as hsm:
+ipc_secret = open("/run/secrets/pyhsm-ipc-secret").read().strip()
+with IPCClient("/run/pyhsm/pyhsm.sock", ipc_secret=ipc_secret) as hsm:
     ct = hsm.encrypt("my-key", "sensitive data")
 ```
 
 With IPC mode, a compromised dependency in your application cannot
 directly call `hsm.export_jwk()` or read `_master_password` — the HSM
 lives in a different OS process with a different UID.
+
+**Security properties of v2.2.0 IPC server:**
+- Authentication is mandatory — no unauthenticated requests processed
+- Per-key locking — operations on different keys run in parallel (eliminates global lock DoS where a slow RSA-4096 keygen stalled all clients)
+- 30-second per-connection read timeout — malicious or stalled clients dropped cleanly
+- Read-only operations (`health`, `list_keys`, `has_key`, `get_public_key`, `get_metrics`) hold no lock at all
 
 ---
 
@@ -435,12 +480,14 @@ Before going live, verify each item:
 [ ] PyHSM runs as a dedicated unprivileged user (not root)
 [ ] Keystore file: chmod 600, owned by pyhsm user
 [ ] Password file: chmod 600, owned by pyhsm user, on tmpfs
+[ ] IPC secret file: chmod 600, owned by pyhsm user, on tmpfs (generated with openssl rand -hex 32)
+[ ] IPC server started with --ipc-secret (mandatory as of v2.2.0)
 [ ] Audit log: chmod 640, shipped to SIEM or centralized log store
+[ ] Audit chain verified across rotated files: verify_across_rotations() returns ok=true
 [ ] Swap encrypted or disabled
 [ ] pip install uses --require-hashes -r requirements.lock
 [ ] systemd unit has NoNewPrivileges=true, MemoryDenyWriteExecute=true
 [ ] Backup exists and has been tested with verify-backup
-[ ] Audit chain verified: vectorguard-pyhsm audit --verify returns OK
 [ ] IPC mode enabled if application code is not fully trusted
 [ ] NTP synchronized (clock skew can bypass key expiry)
 [ ] SELinux or AppArmor policy applied (if available)

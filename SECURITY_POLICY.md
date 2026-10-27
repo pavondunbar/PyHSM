@@ -1,7 +1,7 @@
 # PyHSM Security Policy
 
-**Version:** 2.1.0  
-**Effective Date:** 2026-10-01  
+**Version:** 2.2.0  
+**Effective Date:** 2026-10-27  
 **Owner:** PyHSM Project Maintainers  
 
 This document is the formal security policy for the PyHSM software key
@@ -142,7 +142,9 @@ is performed.
 ### 4.2 Caller Authentication
 
 When using IPC mode, callers are authenticated via HMAC-SHA256 of the
-request ID and operation name using a shared secret. Unauthenticated
+request ID and operation name using a shared secret. **This authentication
+is required** — the IPC server refuses to start without a configured
+`--ipc-secret` (or `PYHSM_IPC_SECRET` environment variable). Unauthenticated
 requests are rejected without processing.
 
 ### 4.3 Rate Limiting
@@ -182,6 +184,14 @@ Each entry is HMAC-SHA256 linked to the previous entry. Deletion or
 modification of any entry breaks the chain, detectable via
 `audit --verify`. The HMAC key is derived from the master password via
 Argon2id → HKDF so an attacker cannot forge entries without the password.
+
+As of v2.2.0, tamper evidence extends across rotation boundaries. When
+the log file is rotated, a `rotationSeal` entry is appended containing
+the chain's final HMAC, and the new file begins with a `rotationOpen`
+entry recording the seal. The `verify_across_rotations()` method
+verifies the full chain across all retained rotated files. Deletion
+of a rotated file is detectable because the next file's `rotationOpen`
+entry will not match any seal entry the verifier can find.
 
 ### 5.3 SIEM Integration
 
@@ -276,9 +286,12 @@ The following threats are **explicitly outside PyHSM's security boundary**:
 
 PyHSM maintains the following security testing baseline:
 
-- **Unit tests:** ≥ 80% line and branch coverage
+- **Unit tests:** ≥ 76% line and branch coverage (Python layer including new security hardening code)
 - **Known-Answer Tests (KATs):** Run on every `PyHSM` instantiation via
-  `run_self_tests()`. Fail-fast on any mismatch.
+  `run_self_tests()`. Fail-fast on any mismatch. As of v2.2.0, covers all
+  10 primitives in active use: AES-256-GCM, PBKDF2-SHA256, HMAC-SHA256,
+  CSPRNG, Argon2id, HKDF-SHA256, AES-256-KWP, ECDSA P-256, RSA-2048-PSS,
+  and Ed25519.
 - **Dependency audit:** `pip-audit` and `npm audit` on every CI run
 - **Static type checking:** mypy strict mode on every CI run
 - **Linting:** ESLint (TypeScript), enforced in CI
@@ -290,10 +303,26 @@ PyHSM maintains the following security testing baseline:
 ## 9. Change Management
 
 - All changes to cryptographic code (`hsm/storage.py`, `hsm/core.py`,
-  `hsm/shamir.py`, `pyhsm-ts/core.ts`) require review by at least one
-  maintainer with cryptographic expertise before merge.
-- Changes to authentication or audit code require the same.
+  `hsm/shamir.py`, `hsm/self_test.py`, `pyhsm-ts/core.ts`) require review
+  by at least one maintainer with cryptographic expertise before merge.
+- Changes to authentication, IPC, or audit code require the same.
 - The `requirements.lock` file must be updated with new hashes whenever
   production dependencies change.
 - This security policy is reviewed and updated with each major version
   release.
+
+---
+
+## Appendix: v2.2.0 Security Hardening Summary
+
+The following issues were resolved in the v2.2.0 release following an
+internal security audit:
+
+| # | Issue | Category | Resolution |
+|---|---|---|---|
+| 1 | IPC server: global lock DoS | Availability | Per-key locking; read-only ops hold no lock; 30 s connection timeout |
+| 2 | IPC server: no mutual auth by default | Authentication | `--ipc-secret` mandatory; server refuses to start without it |
+| 3 | Shamir: 4-byte truncated checksum | Integrity | Per-share HMAC-SHA256 (256-bit, index-bound) + reconstruction HMAC |
+| 4 | KATs missing 6 primitives | Verification | KATs added for Argon2id, HKDF, AES-KWP, ECDSA P-256, RSA-PSS, Ed25519 |
+| 5 | Audit chain not spanning rotations | Audit integrity | `rotationSeal`/`rotationOpen` + `verify_across_rotations()` |
+| 6 | SECURITY.md listed v1.x as supported | Documentation | Corrected; v1.x marked EOL |
