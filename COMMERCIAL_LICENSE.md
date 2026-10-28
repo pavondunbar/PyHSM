@@ -30,20 +30,30 @@ You need a commercial license if any of the following apply:
 
 ## Pricing
 
-Commercial licenses are available on an **annual per-deployment** basis.
-Contact us with your use case and we will provide a quote.
+Commercial licenses are available on a **per-deployment** basis, billed
+monthly or annually. Annual billing saves the equivalent of two months
+(~17% discount).
 
-## What a Commercial License Provides
+| Tier | Deployments | Keys | Monthly | Annual |
+|---|---|---|---|---|
+| **Startup** | 1 production deployment | Up to 5 keys | $149/mo | $1,490/yr |
+| **Growth** | Up to 5 deployments | Unlimited keys | $349/mo | $3,490/yr |
+| **Scale** | Unlimited deployments | Unlimited keys | $749/mo | $7,490/yr |
 
+All tiers include:
 - Right to use PyHSM in proprietary products and services without AGPL
   obligations (no requirement to disclose your application source code)
 - Written license agreement suitable for legal, procurement, and compliance
   review
-- License coverage for the duration of the annual term
+- License coverage for the duration of the billing term (monthly or annual)
+
+**Scale** additionally includes priority technical support with direct
+access to the PyHSM engineering team.
 
 ## Contact
 
 **pavon@vectorguardlabs.com**
 
 Please include a brief description of your use case (product type, industry,
-and how you intend to deploy PyHSM) so we can provide an accurate quote.
+how you intend to deploy PyHSM, and your preferred billing term) so we can
+get you set up quickly.
