@@ -2,6 +2,28 @@
 
 ## Changelog
 
+### v2.3.0 (2026-10-28)
+
+**License change: MIT → GNU Affero General Public License v3.0 (AGPL-3.0)**
+
+All versions up to and including v2.2.5 remain under the MIT license and are
+unaffected by this change. Starting with v2.3.0, PyHSM is licensed under the
+AGPL-3.0.
+
+**What this means:**
+
+- **Open source projects** and **personal use** — no change. Use PyHSM freely.
+- **Proprietary products or network services** — if you embed PyHSM in a
+  product you distribute, or use it to provide a network service without
+  releasing your application source under AGPL, you need a commercial license.
+- See [COMMERCIAL_LICENSE.md](COMMERCIAL_LICENSE.md) for details or contact
+  **pavon@vectorguardlabs.com**.
+
+No code changes in this release. The version bump exists solely to mark the
+license transition clearly in the package history.
+
+---
+
 ### v2.2.0 (2026-10-27)
 
 A targeted security-hardening release addressing six vulnerabilities identified in a full security audit. No breaking changes from v2.1.0 except that `--ipc-secret` is now **required** for the IPC server.
@@ -1144,4 +1166,10 @@ See [`pyhsm-ts/OPERATIONS.md`](pyhsm-ts/OPERATIONS.md) for the full operator gui
 
 ## License
 
-MIT
+PyHSM is open source under the [GNU Affero General Public License v3.0](LICENSE).
+
+**Commercial use:** If you are embedding PyHSM in a proprietary product or
+running it as part of a network service without releasing your application
+source under AGPL, you need a commercial license. See
+[COMMERCIAL_LICENSE.md](COMMERCIAL_LICENSE.md) or contact
+**pavon@vectorguardlabs.com**.

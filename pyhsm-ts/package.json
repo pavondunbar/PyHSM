@@ -1,6 +1,6 @@
 {
   "name": "pyhsm-ts",
-  "version": "1.0.0",
+  "version": "2.3.0",
   "description": "Production-grade software HSM (Key Management Service) for Node.js — key lifecycle, authenticated encryption, digital signing, and tamper-evident audit logging.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -52,7 +52,7 @@
     "signing"
   ],
   "author": "Pavon Dunbar",
-  "license": "MIT",
+  "license": "AGPL-3.0-or-later",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/pavondunbar/PyHSM.git",

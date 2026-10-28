@@ -1,3 +1,9 @@
+# Copyright (c) 2026 VectorGuard Labs (Pavon Dunbar)
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# This file is part of PyHSM. For commercial licensing (use in proprietary
+# products or services without AGPL obligations), contact:
+# pavon@vectorguardlabs.com
 """
 PyHSM Python Layer — pytest test suite.
 

@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 VectorGuard Labs (Pavon Dunbar)
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# This file is part of PyHSM. For commercial licensing (use in proprietary
+# products or services without AGPL obligations), contact:
+# pavon@vectorguardlabs.com
 """CLI interface for the PyHSM."""
 
 from __future__ import annotations
