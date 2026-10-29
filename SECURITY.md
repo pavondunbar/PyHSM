@@ -8,7 +8,22 @@
 | 1.x     | :x:                |
 
 Only the latest release on the `main` branch receives security patches.
-v1.x is no longer supported. Upgrade to v2.2.0 or later.
+v1.x is no longer supported. Upgrade to v2.3.0 or later.
+
+---
+
+## Changes in v2.3.0
+
+| Change | Category | Details |
+|---|---|---|
+| Runtime license notice at every `PyHSM()` instantiation | Notice | Logged at INFO with `event: license_notice`; establishes constructive notice of AGPL-3.0 obligations |
+| CLI license banner on every subcommand | Notice | Printed to stderr before each subcommand dispatch |
+| Offline JWT license token verification (`hsm/license.py`) | Access control | RS256-signed tokens verified locally; no network call; `LicenseError` on invalid/expired token |
+| `license_verified` / `agpl_mode` audit events | Audit | License state recorded in the HMAC-chained audit log at session open |
+| Per-tier key limit enforced in `generate_key()` | Policy | Startup tier capped at 5 keys; Growth/Scale unlimited |
+| `--license-file` / `PYHSM_LICENSE_TOKEN` | Interface | CLI flag and env var for supplying commercial tokens |
+| `get_license_info()` method | API | Returns `LicenseInfo` dataclass with tier, licensee, expiry, and limits |
+| `license` CLI subcommand | CLI | Displays active license status in human-readable format |
 
 ---
 
@@ -100,6 +115,7 @@ The following are **in scope** for security reports:
 - Keystore tamper detection bypass
 - Audit log integrity bypass
 - Denial of service via crafted input
+- License token forgery or bypass (signature verification, claim tampering)
 
 The following are **out of scope**:
 
@@ -142,3 +158,5 @@ Key design principles:
 - Constant-time comparisons for all secret-dependent operations
 - Input size validation to prevent memory exhaustion
 - Atomic file writes to prevent corruption
+- Offline RS256 JWT license verification — no network call, no server dependency, air-gap safe
+- License state recorded in the tamper-evident audit log at every session open

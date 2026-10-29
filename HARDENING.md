@@ -14,15 +14,16 @@ considered production-ready.
 2. [Dedicated Service Account](#2-dedicated-service-account-required)
 3. [File and Directory Permissions](#3-file-and-directory-permissions-required)
 4. [Password Injection](#4-password-injection-required)
-5. [Swap and Memory Protection](#5-swap-and-memory-protection-required)
-6. [systemd Unit Hardening](#6-systemd-unit-hardening-recommended)
-7. [Docker Hardening](#7-docker-hardening)
-8. [Keystore Backup](#8-keystore-backup-required)
-9. [Audit Log Protection](#9-audit-log-protection-required)
-10. [Network Isolation](#10-network-isolation-recommended)
-11. [Process Isolation Mode (IPC)](#11-process-isolation-mode-ipc-recommended)
-12. [Dependency Verification](#12-dependency-verification-required)
-13. [Operating System Hardening Checklist](#13-operating-system-hardening-checklist)
+5. [License Token Injection](#5-license-token-injection-commercial-deployments)
+6. [Swap and Memory Protection](#6-swap-and-memory-protection-required)
+7. [systemd Unit Hardening](#7-systemd-unit-hardening-recommended)
+8. [Docker Hardening](#8-docker-hardening)
+9. [Keystore Backup](#9-keystore-backup-required)
+10. [Audit Log Protection](#10-audit-log-protection-required)
+11. [Network Isolation](#11-network-isolation-recommended)
+12. [Process Isolation Mode (IPC)](#12-process-isolation-mode-ipc-recommended)
+13. [Dependency Verification](#13-dependency-verification-required)
+14. [Operating System Hardening Checklist](#14-operating-system-hardening-checklist)
 
 ---
 
@@ -150,7 +151,76 @@ vectorguard-pyhsm ...
 
 ---
 
-## 5. Swap and Memory Protection (REQUIRED)
+## 5. License Token Injection (Commercial Deployments)
+
+If you hold a commercial PyHSM license, inject your license token at
+startup. Without a token, PyHSM runs under AGPL-3.0 open source terms
+and logs a notice at every session open.
+
+**Do not** embed the token in source code or commit it to version control.
+
+### Method 1 — License file (recommended)
+
+```bash
+# Create the secrets directory if it doesn't exist
+install -d -m 700 -o pyhsm -g pyhsm /run/secrets
+
+# Write your token (received from VectorGuard Labs after purchase)
+printf '%s' 'YOUR_JWT_TOKEN_HERE' > /run/secrets/pyhsm-license.jwt
+chmod 600 /run/secrets/pyhsm-license.jwt
+chown pyhsm:pyhsm /run/secrets/pyhsm-license.jwt
+
+# Use with CLI
+vectorguard-pyhsm --license-file /run/secrets/pyhsm-license.jwt license
+
+# Use with Python API
+from hsm import PyHSM
+hsm = PyHSM(
+    storage_path="/var/lib/pyhsm/keystore.enc",
+    password_file="/run/secrets/pyhsm-password",
+    license_file="/run/secrets/pyhsm-license.jwt",
+)
+```
+
+### Method 2 — Environment variable (automated/CI deployments)
+
+```bash
+export PYHSM_LICENSE_TOKEN="YOUR_JWT_TOKEN_HERE"
+vectorguard-pyhsm generate my-key
+```
+
+The token is cleared from the process environment immediately after it
+is read. This method is acceptable for automated deployments where the
+environment is managed by a secrets manager (Vault, AWS Secrets Manager).
+
+### Verify your license is active
+
+```bash
+vectorguard-pyhsm --license-file /run/secrets/pyhsm-license.jwt license
+```
+
+Expected output for a valid commercial token:
+
+```
+License type : Commercial
+Tier         : Growth
+Licensee     : you@example.com
+Expires      : 2027-10-29T17:55:43+00:00  (364 days remaining)
+Max keys     : unlimited
+Max seats    : 5
+Token ID     : 7bb6351d-afe2-4c7d-bd7f-1565165aca79
+```
+
+### Token renewal
+
+License tokens have a configurable expiry (default: 90 days). PyHSM
+raises a `LicenseError` at startup when the token is expired. Renew
+by contacting **pavon@vectorguardlabs.com** before expiry to receive
+a replacement token.
+
+---
+
+## 6. Swap and Memory Protection (REQUIRED)
 
 PyHSM zeroizes key material immediately after use, but the operating
 system may page memory contents to swap before zeroization. Mitigate this:
@@ -480,6 +550,8 @@ Before going live, verify each item:
 [ ] PyHSM runs as a dedicated unprivileged user (not root)
 [ ] Keystore file: chmod 600, owned by pyhsm user
 [ ] Password file: chmod 600, owned by pyhsm user, on tmpfs
+[ ] License token file: chmod 600, owned by pyhsm user (commercial deployments)
+[ ] License verified at startup: vectorguard-pyhsm --license-file ... license
 [ ] IPC secret file: chmod 600, owned by pyhsm user, on tmpfs (generated with openssl rand -hex 32)
 [ ] IPC server started with --ipc-secret (mandatory as of v2.2.0)
 [ ] Audit log: chmod 640, shipped to SIEM or centralized log store
@@ -489,7 +561,7 @@ Before going live, verify each item:
 [ ] systemd unit has NoNewPrivileges=true, MemoryDenyWriteExecute=true
 [ ] Backup exists and has been tested with verify-backup
 [ ] IPC mode enabled if application code is not fully trusted
-[ ] NTP synchronized (clock skew can bypass key expiry)
+[ ] NTP synchronized (clock skew can bypass key expiry and license expiry)
 [ ] SELinux or AppArmor policy applied (if available)
 [ ] auditd rule watching keystore and audit log files for modification
 ```

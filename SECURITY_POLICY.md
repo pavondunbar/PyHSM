@@ -1,7 +1,7 @@
 # PyHSM Security Policy
 
-**Version:** 2.2.0  
-**Effective Date:** 2026-10-27  
+**Version:** 2.3.0  
+**Effective Date:** 2026-10-29  
 **Owner:** PyHSM Project Maintainers  
 
 This document is the formal security policy for the PyHSM software key
@@ -128,6 +128,27 @@ timeframes in Section 6.
   unsuitable for production.
 - The master password is stored in a mutable `bytearray` and zeroized
   when the session closes.
+
+### 3.7 Commercial License Token
+
+- Commercial license tokens are RS256-signed JWTs issued by VectorGuard Labs.
+- Tokens are verified locally against an embedded RSA-2048 public key.
+  No network call is made. Tokens are safe to use in air-gapped environments.
+- A `LicenseError` is raised immediately at `PyHSM()` construction if the
+  token is malformed, has an invalid signature, uses a non-RS256 algorithm,
+  has an unexpected issuer, is expired, or is missing required claims.
+- The license state (`license_verified` for commercial, `agpl_mode` for
+  open source) is recorded in the HMAC-chained audit log at every
+  session open.
+- Tokens should be stored in a `0o600`-permission file and injected via
+  `--license-file` or the `license_file=` constructor parameter.
+  Injection via `PYHSM_LICENSE_TOKEN` environment variable is acceptable
+  in automated deployments managed by a secrets manager.
+- Per-tier key limits are enforced at `generate_key()` time. A `LicenseError`
+  is raised if the limit would be exceeded; the operation is not performed
+  and no rate-limit token is consumed.
+- Token renewal is the commercial licensee's responsibility. Renew before
+  the token's `exp` claim by contacting pavon@vectorguardlabs.com.
 
 ---
 
@@ -310,6 +331,23 @@ PyHSM maintains the following security testing baseline:
   production dependencies change.
 - This security policy is reviewed and updated with each major version
   release.
+
+---
+
+## Appendix: v2.3.0 Licensing and Notice Changes
+
+The following additions were made in v2.3.0:
+
+| # | Addition | Category | Details |
+|---|---|---|---|
+| 1 | Runtime AGPL license notice at `PyHSM()` instantiation | Notice | `INFO`-level log entry, `event: license_notice`, on every session open |
+| 2 | CLI banner to stderr on every subcommand | Notice | Printed before subcommand dispatch; appears in terminal and CI logs |
+| 3 | `hsm/license.py` — offline JWT verification | Access control | RS256 / RSA-2048; no network dependency; `LicenseError` on any invalid token attribute |
+| 4 | `license_verified` and `agpl_mode` audit events | Audit | License state is part of the tamper-evident audit record |
+| 5 | Per-tier key limit enforcement in `generate_key()` | Policy | Startup tier: 5 keys; Growth/Scale: unlimited; enforced before key material generation |
+| 6 | `--license-file` CLI flag and `PYHSM_LICENSE_TOKEN` env var | Interface | Consistent with password injection patterns already in the CLI |
+| 7 | `get_license_info()` method | API | Returns `LicenseInfo` dataclass; exposes tier, licensee, expiry, limits to operators |
+| 8 | `license` CLI subcommand | CLI | Human-readable license status; useful for health checks and deployment verification |
 
 ---
 

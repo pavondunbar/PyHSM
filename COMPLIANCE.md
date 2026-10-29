@@ -5,8 +5,8 @@ satisfies, which it partially satisfies, and which are out of scope. It is
 intended for security auditors, compliance officers, and institutional
 procurement teams evaluating PyHSM for regulated deployments.
 
-**Last reviewed:** 2026-10-27  
-**PyHSM version:** 2.2.5
+**Last reviewed:** 2026-10-29  
+**PyHSM version:** 2.3.0
 
 ---
 
@@ -18,6 +18,22 @@ environments where certification of the specific binary is mandatory
 (PCI-DSS Level 1 SAQ D, U.S. Federal FedRAMP High, DoD IL4+), a
 validated hardware HSM is required. PyHSM is appropriate as a software
 KMS for all other environments where software key protection is acceptable.
+
+---
+
+## v2.3.0 Licensing and Notice Changes
+
+The following changes were made in v2.3.0. Auditors reviewing evidence of
+license compliance controls should note these additions.
+
+| Change | Compliance Impact |
+|---|---|
+| Runtime license notice emitted at every `PyHSM()` instantiation | Establishes constructive notice of AGPL-3.0 obligations; supports CC6.1 (access controls communicated), A.8.9 (configuration management), legal defensibility |
+| CLI banner printed to stderr on every subcommand invocation | Same as above; applies to CLI-based deployments |
+| Offline JWT license token verification (`hsm/license.py`) | Enables contractual tier-limit enforcement (max keys per instance); `license_verified` event audited; supports SOC 2 CC6.2 (authentication of commercial licensees) |
+| `LicenseError` raised at startup on invalid/expired tokens | Prevents inadvertent operation under a lapsed commercial license; supports CC6.3 (timely access revocation) |
+| `license_verified` and `agpl_mode` events added to audit log | Extends audit trail to include license state at session open; supports CC7.2, Req 10.2, §164.312(b) |
+| Per-tier key limit enforced in `generate_key()` | Startup tier (max 5 keys) enforced at runtime; supports CC6.1 resource-level access control |
 
 ---
 
@@ -344,11 +360,13 @@ must be implemented by the data controller.
 When an auditor requests evidence of PyHSM's security controls, provide:
 
 1. **`THREAT_MODEL.md`** — security boundary documentation
-2. **`SECURITY_POLICY.md`** — formal security policy (v2.2.5)
+2. **`SECURITY_POLICY.md`** — formal security policy (v2.3.0)
 3. **`COMPLIANCE.md`** — this document
-4. **Audit log export** — `vectorguard-pyhsm audit --verify && audit --raw`
-5. **Cross-rotation audit chain verification** — output of `verify_across_rotations()` showing `ok: true` across all retained log files
-6. **Dependency scan results** — `pip-audit` output from the latest CI run
-7. **Test coverage report** — from the latest CI run (76%+ line coverage)
-8. **`requirements.lock`** — hash-pinned dependency manifest
-9. **KAT results** — logged at startup as `selfTestPass` in the audit log; confirm all 10 primitives passed
+4. **`COMMERCIAL_LICENSE.md`** — license enforcement architecture and tier details
+5. **Audit log export** — `vectorguard-pyhsm audit --verify && audit --raw`
+6. **License audit events** — filter for `license_verified` and `agpl_mode` events: `vectorguard-pyhsm audit --operation license_verified`
+7. **Cross-rotation audit chain verification** — output of `verify_across_rotations()` showing `ok: true` across all retained log files
+8. **Dependency scan results** — `pip-audit` output from the latest CI run
+9. **Test coverage report** — from the latest CI run (76%+ line coverage)
+10. **`requirements.lock`** — hash-pinned dependency manifest
+11. **KAT results** — logged at startup as `selfTestPass` in the audit log; confirm all 10 primitives passed

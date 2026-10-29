@@ -2,6 +2,50 @@
 
 ## Changelog
 
+### v2.3.0 (2026-10-29)
+
+**Offline JWT license token verification and runtime license notices**
+
+- **Runtime license notice.** Every `PyHSM()` instantiation now emits an
+  `INFO`-level log entry (`event: license_notice`) stating the AGPL-3.0
+  terms and commercial licensing contact. The CLI additionally prints a
+  one-line banner to stderr on every subcommand invocation. Both establish
+  constructive notice for all users.
+
+- **Offline JWT license token verification** (`hsm/license.py`). Commercial
+  licensees receive a signed RS256 JWT from VectorGuard Labs. The token is
+  verified locally against an embedded RSA-2048 public key — no network call,
+  no server dependency, air-gap safe. Invalid, expired, or tampered tokens
+  raise `LicenseError` at `PyHSM()` construction time before any key
+  operation is permitted.
+
+- **Per-tier key limits enforced.** The Startup tier enforces a maximum of
+  5 keys per instance at `generate_key()` time. Growth and Scale tiers are
+  unlimited. AGPL (unlicensed) sessions are unrestricted.
+
+- **New `license` CLI subcommand.** Shows the active license tier,
+  licensee, expiry, remaining days, and tier limits.
+
+- **New `get_license_info()` API method.** Returns a `LicenseInfo` dataclass
+  with `tier`, `licensee`, `expires_at`, `max_keys`, `max_seats`, and
+  `token_id`.
+
+- **License state audited.** A `license_verified` (commercial) or
+  `agpl_mode` (open source) event is written to the HMAC-chained audit
+  log at every session open.
+
+- **New `--license-file` CLI flag** and `PYHSM_LICENSE_TOKEN` env var
+  for injecting commercial tokens.
+
+- **New `tools/` scripts** for VectorGuard Labs operators:
+  - `tools/generate_license_keypair.py` — one-time RSA-2048 keypair generation
+  - `tools/issue_license.py` — mint signed tokens for paying customers
+
+See [COMMERCIAL_LICENSE.md](COMMERCIAL_LICENSE.md) for full details on
+how enforcement works and how to use your license token.
+
+---
+
 ### v2.3.0 (2026-10-28)
 
 **License change: MIT → GNU Affero General Public License v3.0 (AGPL-3.0)**
@@ -380,6 +424,12 @@ No keys stored.
 vectorguard-pyhsm stores
 vectorguard-pyhsm stores /path/to/keystores
 
+# Check active license status (commercial token via file)
+vectorguard-pyhsm --license-file /etc/pyhsm/license.jwt license
+
+# Check active license status (AGPL mode — no token)
+vectorguard-pyhsm --store keystore.enc license
+
 # Generate keys (password prompted interactively)
 vectorguard-pyhsm --store keystore.enc generate my-aes-key --type aes-256
 vectorguard-pyhsm --store keystore.enc generate my-rsa-key --type rsa-2048
@@ -450,6 +500,9 @@ hsm = PyHSM(
     session_timeout_s=300,      # auto-lock after 5 min inactivity (0 = disabled)
     rate_limit_max_ops=100,     # max ops per key per window
     rate_limit_window_s=60,
+    # Commercial license token (omit to run under AGPL-3.0 terms):
+    license_file="/etc/pyhsm/license.jwt",   # recommended: file path
+    # license_token="<jwt string>",          # or: inline string
 )
 
 # Or use as a context manager for automatic cleanup
@@ -457,6 +510,12 @@ with PyHSM(storage_path="keystore.enc", master_password="your-master-password") 
     hsm.generate_key("my-key")
     ct = hsm.encrypt("my-key", "secret")
     # Key material is automatically zeroized on exit
+
+# Inspect the active license
+info = hsm.get_license_info()
+print(info.tier.value)      # "startup" | "growth" | "scale" | "agpl"
+print(info.licensee)        # "you@example.com" or "agpl-user"
+print(info.is_commercial)   # True for paid tiers
 
 # Generate keys
 hsm.generate_key("aes-key")                          # AES-256 by default
@@ -605,6 +664,7 @@ The `StorageBackend` interface deals only with raw encrypted bytes — all encry
 | Variable | Default | Description |
 |---|---|---|
 | `PYHSM_MASTER_PASSWORD` | *(none)* | Master password for the CLI. When set, the CLI uses this instead of prompting interactively. Useful for scripting and CI. |
+| `PYHSM_LICENSE_TOKEN` | *(none)* | Commercial license JWT token. Cleared from the process environment immediately after it is read. Use `--license-file` in production. |
 | `PYHSM_LOG_LEVEL` | `WARNING` | Structured log verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. Set to `INFO` in production for operational visibility. |
 | `PYHSM_ALLOW_PBKDF2_FALLBACK` | `0` (disabled) | Set to `1` to permit degraded PBKDF2 key derivation when `argon2-cffi` is unavailable. **Testing/migration only — never set in production.** |
 | `PYHSM_AUDIT_HMAC_KEY` | *(derived from master password)* | Hex-encoded 32-byte key for audit HMAC chain. When not set, derived automatically from the master password via HKDF. |
@@ -640,7 +700,11 @@ hsm/
                       per-key AES-KWP wrapping, AAD binding, hybrid nonce,
                       per-key sharded locks, caller_id ACL enforcement,
                       automatic key rotation (rotate_every_days policy),
-                      key metadata search, backup/restore, OTLP metrics export
+                      key metadata search, backup/restore, OTLP metrics export,
+                      license token resolution and tier-limit enforcement
+  license.py        — Offline JWT license verification: RS256 / RSA-2048,
+                      LicenseInfo dataclass, LicenseTier enum, LicenseError,
+                      AGPL_LICENSE sentinel; no network dependency
   storage.py        — KeyStore: Argon2id (required) key derivation,
                       HKDF key separation (enc/mac/kek subkeys),
                       AES-256-GCM + HMAC-SHA256, cached KEK, pluggable StorageBackend,
@@ -658,6 +722,9 @@ hsm/
   __init__.py       — Public API exports
   py.typed          — PEP 561 marker for type checker support
 cli.py              — Full-featured command-line interface
+tools/
+  generate_license_keypair.py — One-time RSA-2048 keypair generation (VectorGuard Labs use)
+  issue_license.py            — Mint RS256 JWT tokens for paying customers (VectorGuard Labs use)
 tests/
   test_pyhsm.py     — 140 pytest tests (unit + integration + auto-rotation + search + OTLP)
   test_concurrency.py — 8 concurrency stress tests (16 threads, data integrity proofs)

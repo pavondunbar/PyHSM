@@ -1,6 +1,6 @@
 # PyHSM Threat Model
 
-**Last updated:** v2.2.0 (2026-10-27)
+**Last updated:** v2.3.0 (2026-10-29)
 
 This document defines the security boundaries, assumptions, and threat actors
 that PyHSM is designed to defend against — and explicitly states what is out of scope.
@@ -17,6 +17,7 @@ that PyHSM is designed to defend against — and explicitly states what is out o
 | Keystore integrity | The encrypted keystore file must not be silently modified |
 | Audit log integrity | The HMAC-chained log must be tamper-evident |
 | Operational metadata | Key policies, operation counts, caller ACLs |
+| License token | RS256-signed JWT granting commercial use rights; must not be forged, replayed, or tampered with |
 
 ---
 
@@ -190,6 +191,7 @@ PyHSM acknowledges this limitation in its scope statement.
 | IPC per-key locking (v2.2.0) | The previous global lock was a DoS vector: one slow RSA-4096 keygen blocked every other client. Per-key locks allow parallel operations on different keys. Read-only ops hold no lock at all. |
 | Audit rotation seals (v2.2.0) | `rotationSeal` and `rotationOpen` entries cryptographically stitch the HMAC chain across file boundaries. An attacker who deletes a rotated log file cannot prevent detection because the next file's `rotationOpen.prev_seal_hmac` will not match any seal the verifier can find. |
 | Startup KATs for all primitives (v2.2.0) | Extended from 4 to 10 KATs: Argon2id, HKDF-SHA256, AES-256-KWP, ECDSA P-256, RSA-2048-PSS, and Ed25519 added. Ensures the installed library versions produce correct output before any keys are used. |
+| Offline RS256 JWT license verification (v2.3.0) | License tokens are RS256-signed by VectorGuard Labs' private key and verified locally against an embedded RSA-2048 public key. No network call is made — tokens are safe to use in air-gapped environments. The embedded public key cannot be replaced without recompiling; signature verification uses PKCS#1 v1.5 / SHA-256 via the `cryptography` library with no custom crypto. An attacker who cannot forge an RSA-2048 signature cannot produce a valid token. Expired, wrong-issuer, or algorithm-confused tokens are rejected before any claim is trusted. |
 
 ---
 
@@ -228,6 +230,7 @@ PyHSM acknowledges this limitation in its scope statement.
 | Forged Shamir shares | N/A (hardware ceremony) | Protected (per-share HMAC-SHA256, 256-bit, index-bound, v2.2.0) |
 | Deleted audit log files | Protected (hardware audit journal) | Protected (rotation seals detect file deletion, v2.2.0) |
 | KAT regression in crypto library | Protected (certified module) | Protected (10 primitive KATs at startup, v2.2.0) |
+| License token forgery | N/A (not applicable) | Protected (RS256 / RSA-2048 signature verification, embedded public key, v2.3.0) |
 
 PyHSM is appropriate for environments where software key management is acceptable.
 For environments mandating certified hardware, use a FIPS 140-2/3 Level 3+ device.
