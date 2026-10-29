@@ -42,26 +42,38 @@ def get_hsm(args) -> PyHSM:
                                    to acknowledge the security risk. Prints a loud warning.
                                    Do NOT use in production — env vars are visible in
                                    /proc/<pid>/environ and process listings.
+
+    License token source priority:
+      1. --license-file  <path>    File containing the JWT token string.
+      2. PYHSM_LICENSE_TOKEN       Environment variable (cleared immediately after read).
+      3. Neither                   AGPL mode — open source terms apply.
     """
     password_file: Optional[str] = getattr(args, "password_file", None)
+    license_file: Optional[str] = getattr(args, "license_file", None)
+
+    # --- Resolve license token ---
+    license_token: Optional[str] = None
+    if not license_file:
+        env_token = os.environ.pop("PYHSM_LICENSE_TOKEN", None)
+        if env_token:
+            license_token = env_token.strip()
+
+    # --- Shared kwargs for PyHSM construction ---
+    hsm_kwargs: dict = {
+        "session_timeout_s": 0,
+        "license_file": license_file,
+        "license_token": license_token,
+    }
 
     if password_file:
-        # Safest path — permission-enforced file read.
-        # PyHSM.__init__ handles the load_password_from_file() call.
         is_new = not os.path.exists(args.store)
-        hsm = PyHSM(
-            storage_path=args.store,
-            password_file=password_file,
-            session_timeout_s=0,
-        )
+        hsm = PyHSM(storage_path=args.store, password_file=password_file, **hsm_kwargs)
         if is_new:
             print(f"Created new keystore: {args.store}", file=sys.stderr)
         return hsm
 
     env_password = os.environ.get("PYHSM_MASTER_PASSWORD")
     if env_password:
-        # Clear from environment immediately so child processes and
-        # /proc/<pid>/environ inspection cannot read it.
         os.environ.pop("PYHSM_MASTER_PASSWORD", None)
 
         allow_env = os.environ.get("PYHSM_ALLOW_ENV_PASSWORD", "0") == "1"
@@ -97,11 +109,7 @@ def get_hsm(args) -> PyHSM:
         password = getpass.getpass("Master password: ")
 
     is_new = not os.path.exists(args.store)
-    hsm = PyHSM(
-        storage_path=args.store,
-        master_password=password,
-        session_timeout_s=0,
-    )
+    hsm = PyHSM(storage_path=args.store, master_password=password, **hsm_kwargs)
     if is_new:
         print(f"Created new keystore: {args.store}", file=sys.stderr)
     return hsm
@@ -259,6 +267,33 @@ def cmd_metrics(args) -> None:
     hsm.close_session()
 
 
+def cmd_license(args) -> None:
+    """Display the active license status for this PyHSM instance."""
+    hsm = get_hsm(args)
+    info = hsm.get_license_info()
+    import datetime
+    if info.tier.value == "agpl":
+        print("License type : AGPL-3.0 (open source)")
+        print("Commercial   : No")
+        print("Note         : A commercial license is required for proprietary")
+        print("               products or SaaS deployments without AGPL obligations.")
+        print("Contact      : pavon@vectorguardlabs.com")
+    else:
+        exp = datetime.datetime.fromtimestamp(
+            info.expires_at, tz=datetime.timezone.utc
+        ).isoformat()
+        now = datetime.datetime.now(tz=datetime.timezone.utc).timestamp()
+        days_left = max(0, int((info.expires_at - now) / 86400))
+        print(f"License type : Commercial")
+        print(f"Tier         : {info.tier.value.capitalize()}")
+        print(f"Licensee     : {info.licensee}")
+        print(f"Expires      : {exp}  ({days_left} days remaining)")
+        print(f"Max keys     : {info.max_keys if info.max_keys > 0 else 'unlimited'}")
+        print(f"Max seats    : {info.max_seats if info.max_seats > 0 else 'unlimited'}")
+        print(f"Token ID     : {info.token_id}")
+    hsm.close_session()
+
+
 def cmd_audit(args) -> None:
     hsm = get_hsm(args)
     audit = hsm.get_audit_log()
@@ -304,6 +339,16 @@ def main() -> None:
             "Safer than PYHSM_MASTER_PASSWORD env var."
         ),
     )
+    parser.add_argument(
+        "--license-file",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Path to a file containing your PyHSM commercial license token (JWT). "
+            "If omitted, PYHSM_LICENSE_TOKEN env var is checked. "
+            "If neither is provided, the instance runs under AGPL-3.0 terms."
+        ),
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     # Shared parent parser for global options — allows --store and --password-file
@@ -311,6 +356,7 @@ def main() -> None:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--store", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     common.add_argument("--password-file", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    common.add_argument("--license-file", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
 
     # generate
     gen = sub.add_parser("generate", parents=[common], help="Generate a new key")
@@ -392,6 +438,9 @@ def main() -> None:
     met.add_argument("--prometheus", action="store_true", help="Output in Prometheus format")
     met.set_defaults(func=cmd_metrics)
 
+    # license
+    lic = sub.add_parser("license", parents=[common], help="Show active license status")
+    lic.set_defaults(func=cmd_license)
     # audit
     aud = sub.add_parser("audit", parents=[common], help="Inspect or verify the audit log")
     aud.add_argument("--verify", action="store_true", help="Verify HMAC chain integrity")
@@ -403,6 +452,12 @@ def main() -> None:
     aud.set_defaults(func=cmd_audit)
 
     args = parser.parse_args()
+    print(
+        "PyHSM \u00a9 2026 VectorGuard Labs \u2014 AGPL-3.0 open source. "
+        "Commercial license required for proprietary products/SaaS. "
+        "Contact: pavon@vectorguardlabs.com",
+        file=sys.stderr,
+    )
     try:
         args.func(args)
     except KeyboardInterrupt:

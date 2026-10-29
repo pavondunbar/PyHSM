@@ -10,3 +10,8 @@ FETCH_HEAD
 # real key material or sensitive audit entries.
 pyhsm-keystore.enc
 pyhsm-keystore.enc.audit.jsonl
+
+# License signing key — NEVER commit the private key
+tools/license_private.pem
+license_private.pem
+*.jwt

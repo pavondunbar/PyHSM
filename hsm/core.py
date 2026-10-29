@@ -51,6 +51,14 @@ from .jwk import (
     export_ed25519_jwk,
     import_jwk as _import_jwk,
 )
+from .license import (
+    LicenseInfo,
+    LicenseTier,
+    LicenseError,
+    AGPL_LICENSE,
+    verify_license_token,
+    load_token_from_file,
+)
 
 # Key ID validation: 1-128 chars, start alphanumeric, body [a-zA-Z0-9._-]
 _KEY_ID_RE = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9._\-]{0,127}$')
@@ -156,6 +164,14 @@ class PyHSM:
         Maximum operations per key per rate window. Default 100.
     rate_limit_window_s : float, optional
         Rate-limit window in seconds. Default 60.
+    license_token : str, optional
+        RS256-signed JWT commercial license token issued by VectorGuard Labs.
+        If omitted and ``license_file`` is also omitted, the instance runs
+        under AGPL-3.0 open source terms with a notice logged.
+    license_file : str, optional
+        Path to a file containing the license token JWT string.
+        Takes precedence over ``license_token`` if both are supplied.
+        Recommended over ``license_token`` for production deployments.
     _unsafe_skip_password_validation : bool, optional
         If True, skip password strength checks. The leading underscore
         signals this is not a stable public API. Only use this for
@@ -179,6 +195,8 @@ class PyHSM:
         session_timeout_s: float = 300.0,
         rate_limit_max_ops: int = 100,
         rate_limit_window_s: float = 60.0,
+        license_token: Optional[str] = None,
+        license_file: Optional[str] = None,
         _unsafe_skip_password_validation: bool = False,
     ) -> None:
         # --- Resolve master password from one of three sources (priority order):
@@ -203,6 +221,29 @@ class PyHSM:
 
         if not _unsafe_skip_password_validation:
             _validate_master_password(master_password)
+
+        # --- Resolve license token (priority order):
+        #   1. license_file  — path to a file containing the JWT (recommended)
+        #   2. license_token — direct string
+        #   3. Neither       — AGPL mode (open source terms apply, notice printed)
+        _raw_token: Optional[str] = None
+        if license_file is not None:
+            _raw_token = load_token_from_file(license_file)
+        elif license_token is not None:
+            _raw_token = license_token
+
+        if _raw_token is not None:
+            # Raises LicenseError (a subclass of Exception) if invalid —
+            # let it propagate so the caller knows immediately.
+            self._license: LicenseInfo = verify_license_token(_raw_token)
+        else:
+            self._license = AGPL_LICENSE
+            _logger.info(
+                "No commercial license token provided — running under AGPL-3.0 terms. "
+                "Commercial use in proprietary products or SaaS requires a license: "
+                "pavon@vectorguardlabs.com",
+                extra={"event": "agpl_mode"},
+            )
 
         self._storage_path = storage_path
         self._session_timeout_s = session_timeout_s
@@ -261,6 +302,14 @@ class PyHSM:
         import atexit
         self._atexit_registered = True
         atexit.register(self._atexit_cleanup)
+
+        _logger.info(
+            "PyHSM — AGPL-3.0 open source. "
+            "A commercial license is required for use in proprietary products or SaaS deployments "
+            "without AGPL source-disclosure obligations. "
+            "See COMMERCIAL_LICENSE.md or contact pavon@vectorguardlabs.com",
+            extra={"event": "license_notice"},
+        )
 
     # ------------------------------------------------------------------
     # Context manager support
@@ -456,6 +505,11 @@ class PyHSM:
         """
         self._assert_session()
         _validate_key_id(key_id)
+
+        # Enforce per-tier key limit for commercial licenses (e.g. Startup: 5 keys)
+        if self._license.max_keys > 0:
+            current_count = len(self._store.load_all())
+            self._license.check_key_limit(current_count)
 
         # Generate key material outside the global lock (expensive for RSA)
         if key_type == "aes-256":
@@ -1418,6 +1472,17 @@ class PyHSM:
     def get_metrics(self) -> dict:
         """Return current operational metrics as a dict."""
         return self._metrics.get_metrics()
+
+    def get_license_info(self) -> LicenseInfo:
+        """
+        Return the ``LicenseInfo`` for this session.
+
+        For AGPL (unlicensed) sessions, returns ``AGPL_LICENSE`` with
+        ``tier=LicenseTier.AGPL``.  For commercial sessions, returns
+        the decoded token payload including tier, licensee, expiry, and limits.
+        """
+        self._assert_session()
+        return self._license
 
     def get_prometheus_metrics(self) -> str:
         """Return metrics in Prometheus text exposition format."""

@@ -21,6 +21,7 @@ from .logging import get_logger
 from .password_file import load_password_from_file, check_password_file_permissions
 from .ipc_client import IPCClient
 from .ipc_server import IPCServer
+from .license import LicenseInfo, LicenseTier, LicenseError, AGPL_LICENSE, verify_license_token
 
 __all__ = [
     # Core HSM
@@ -60,4 +61,10 @@ __all__ = [
     # Process isolation IPC
     "IPCClient",
     "IPCServer",
+    # License
+    "LicenseInfo",
+    "LicenseTier",
+    "LicenseError",
+    "AGPL_LICENSE",
+    "verify_license_token",
 ]
