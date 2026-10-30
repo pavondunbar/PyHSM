@@ -62,9 +62,12 @@ No custom or novel cryptographic primitives are used.
 | Key Type | Minimum Size | Recommended |
 |---|---|---|
 | AES | 128 bits | 256 bits |
-| RSA | 2048 bits | 4096 bits |
+| RSA | 2048 bits (enforced at import) | 4096 bits |
 | EC | P-256 | P-384 or P-521 |
 | Master password | 12 characters | 20+ characters, passphrase |
+
+RSA keys below 2048 bits are rejected at import (`import_key_jwk`) with a clear
+error citing NIST SP 800-131A Rev. 2. Only 2048 and 4096 bits are accepted.
 
 ### 2.3 Algorithm Deprecation
 
@@ -173,7 +176,10 @@ requests are rejected without processing.
 Rate limiting is enforced per-key with a configurable sliding window.
 The rate limiter runs **after** ACL and policy checks to prevent
 unauthorized callers from exhausting rate-limit budget for legitimate
-callers.
+callers. As of v2.3.1, the rate limiter is **thread-safe**: `allow()`,
+`usage()`, and `reset()` are all protected by a `threading.Lock` to
+prevent the check-then-act race that could previously allow up to
+2× `max_ops` through under concurrent load.
 
 ### 4.4 Operation Policies
 
@@ -205,6 +211,9 @@ Each entry is HMAC-SHA256 linked to the previous entry. Deletion or
 modification of any entry breaks the chain, detectable via
 `audit --verify`. The HMAC key is derived from the master password via
 Argon2id → HKDF so an attacker cannot forge entries without the password.
+All HMAC comparisons in `verify()` and `verify_across_rotations()` use
+`hmac.compare_digest()` to prevent timing-oracle attacks (enforced since
+v2.3.1).
 
 As of v2.2.0, tamper evidence extends across rotation boundaries. When
 the log file is rotated, a `rotationSeal` entry is appended containing
@@ -307,12 +316,14 @@ The following threats are **explicitly outside PyHSM's security boundary**:
 
 PyHSM maintains the following security testing baseline:
 
-- **Unit tests:** ≥ 76% line and branch coverage (Python layer including new security hardening code)
+- **Unit tests:** ≥ 73% line and branch coverage (Python layer; 142 tests as of v2.3.1)
 - **Known-Answer Tests (KATs):** Run on every `PyHSM` instantiation via
   `run_self_tests()`. Fail-fast on any mismatch. As of v2.2.0, covers all
   10 primitives in active use: AES-256-GCM, PBKDF2-SHA256, HMAC-SHA256,
   CSPRNG, Argon2id, HKDF-SHA256, AES-256-KWP, ECDSA P-256, RSA-2048-PSS,
-  and Ed25519.
+  and Ed25519. As of v2.3.1, the RSA-PSS KAT uses a fixed embedded private
+  key with a pinned public-key fingerprint, and adds wrong-key and
+  tamper-detection checks. The Ed25519 KAT adds a wrong-key rejection check.
 - **Dependency audit:** `pip-audit` and `npm audit` on every CI run
 - **Static type checking:** mypy strict mode on every CI run
 - **Linting:** ESLint (TypeScript), enforced in CI
@@ -331,6 +342,22 @@ PyHSM maintains the following security testing baseline:
   production dependencies change.
 - This security policy is reviewed and updated with each major version
   release.
+
+---
+
+## Appendix: v2.3.1 Security Hardening
+
+The following issues were identified in a security audit of v2.3.0 and resolved in v2.3.1:
+
+| # | Issue | Category | Resolution |
+|---|---|---|---|
+| 1 | `RateLimiter.allow()` check-then-act race under concurrent access | Availability / DoS | `threading.Lock` added; all three public methods (`allow`, `usage`, `reset`) are now atomic read-modify-write |
+| 2 | Audit `verify()` used plain `!=` for HMAC string comparison | Timing oracle | Replaced with `hmac.compare_digest()` |
+| 3 | `verify_across_rotations()` cross-file stitch used plain `!=` for HMAC | Timing oracle | Replaced with `hmac.compare_digest()` |
+| 4 | Legacy Shamir 4-byte checksum path used plain `!=` | Timing oracle | Replaced with `hmac.compare_digest()` |
+| 5 | JWK RSA import accepted keys below 2048 bits | Weak key injection | Allowlist `{2048, 4096}` enforced; sub-2048 raises `ValueError` citing NIST SP 800-131A Rev. 2 |
+| 6 | Ed25519 KAT docstring cited wrong source | Accuracy | Docstring corrected; wrong-key rejection check added to the test |
+| 7 | RSA-PSS KAT was round-trip only (no cross-key confusion test) | KAT quality | Fixed embedded private key (SHA-256 fingerprint pinned); wrong-key and tamper-detection negative checks added |
 
 ---
 

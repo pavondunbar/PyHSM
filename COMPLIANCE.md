@@ -21,6 +21,23 @@ KMS for all other environments where software key protection is acceptable.
 
 ---
 
+## v2.3.1 Security Hardening Summary
+
+The following security improvements were made in v2.3.1 following an
+internal audit of v2.3.0. Auditors reviewing prior versions should note
+these changes when comparing coverage assessments.
+
+| Change | Compliance Impact |
+|---|---|
+| `RateLimiter` made thread-safe (`threading.Lock` on all methods) | Closes a race where 2× max_ops could be admitted under concurrent load; strengthens CC6.1 (rate-based access control), A1.1 (availability), §164.308(a)(7) |
+| `hmac.compare_digest()` enforced throughout audit log verification (`verify()`, `verify_across_rotations()`) | Eliminates timing-oracle path on HMAC; strengthens CC7.2, Req 10.3, §164.312(b) |
+| `hmac.compare_digest()` enforced in legacy Shamir checksum path | Eliminates timing-oracle on share reconstruction; strengthens CC6.2, Req 3.6, A.8.24 |
+| JWK RSA import restricted to 2048/4096 bits (NIST SP 800-131A Rev. 2) | Prevents import of cryptographically weak RSA keys; strengthens Req 3.6, A.8.24, NIST SP 800-57 |
+| RSA-PSS KAT uses fixed embedded key with pinned fingerprint; adds cross-key and tamper-detection checks | Stronger startup self-test evidence; strengthens FIPS 140-2 Level 1 KAT coverage, NIST SP 800-57 §8.1 |
+| Ed25519 KAT adds wrong-key rejection check | Same as above |
+
+---
+
 ## v2.3.0 Licensing and Notice Changes
 
 The following changes were made in v2.3.0. Auditors reviewing evidence of
@@ -78,7 +95,9 @@ these changes when comparing coverage assessments.
   `allow_sign`). IPC mutual authentication is now mandatory — any client
   connecting to the HSM process must present a valid HMAC-SHA256 token on
   every request; unauthenticated connections are rejected before any
-  operation is processed.
+  operation is processed. As of v2.3.1, the rate limiter is thread-safe
+  (`threading.Lock` protecting all operations), ensuring the per-key
+  operation cap cannot be exceeded by concurrent callers.
 - **CC6.2 — Authentication:** Master password with Argon2id KDF (64 MB
   memory-hard), minimum 12-character enforcement, weak-password blocklist.
   Shamir M-of-N for multi-custodian access control, now with per-share
@@ -90,8 +109,10 @@ these changes when comparing coverage assessments.
   detection now spanning rotation boundaries (`rotationSeal`/`rotationOpen`
   entries). `verify_across_rotations()` allows auditors to cryptographically
   verify the complete chain across all retained log files, detecting
-  deletion of any rotated file. CEF/LEEF/JSON SIEM export. Prometheus and
-  OTLP metrics.
+  deletion of any rotated file. All HMAC comparisons in `verify()` and
+  `verify_across_rotations()` use `hmac.compare_digest()` (v2.3.1) —
+  eliminating any timing-oracle path on the verification routines.
+  CEF/LEEF/JSON SIEM export. Prometheus and OTLP metrics.
 - **CC9.1 — Change management (dependencies):** Hash-pinned `requirements.lock`
   with SHA-256 verification prevents supply-chain modifications.
 
@@ -127,7 +148,10 @@ these changes when comparing coverage assessments.
   Keys never stored in plaintext. Double-wrapped with AES-KWP. Shamir
   share integrity now enforced with HMAC-SHA256 (per-share, index-bound),
   providing cryptographic assurance that reconstructed master passwords
-  have not been tampered with.
+  have not been tampered with. The legacy Shamir checksum comparison now
+  uses `hmac.compare_digest()` (v2.3.1). RSA key import is restricted to
+  2048 and 4096 bits (NIST SP 800-131A Rev. 2); weaker RSA keys are
+  rejected at the import boundary (v2.3.1).
 - **Req 3.7 — Key lifecycle:** Key expiry (`expires_at`), archival,
   rotation (`rotate_key`), and operation count limits (`max_operations`).
 - **Req 10.2 — Audit log:** Append-only HMAC-chained log covering all
@@ -235,11 +259,14 @@ PyHSM **fully implements** the NIST SP 800-57 key lifecycle model:
 | HKDF-SHA256 | Key derivation | Approved |
 | AES-KWP (RFC 5649) | Key wrapping | Approved |
 
-**Known-Answer Test (KAT) coverage (v2.2.5):**
+**Known-Answer Test (KAT) coverage (v2.3.1):**
 
-As of v2.2.5, startup KATs cover all 10 cryptographic primitives in
+As of v2.3.1, startup KATs cover all 10 cryptographic primitives in
 active use, verified against published NIST and RFC test vectors before
-any key operation is accepted:
+any key operation is accepted. The RSA-PSS KAT now uses a fixed embedded
+private key with a pinned SHA-256 public-key fingerprint, and includes
+cross-key confusion and tamper-detection negative checks. The Ed25519
+KAT includes a wrong-key rejection check.
 
 | Primitive | Test Vector Source |
 |---|---|
@@ -251,8 +278,8 @@ any key operation is accepted:
 | HKDF-SHA256 | RFC 5869 Appendix A, Test Case 1 |
 | AES-256-KWP | NIST SP 800-38F / RFC 5649 |
 | ECDSA P-256 | Sign + verify + tamper-detection round-trip |
-| RSA-2048-PSS | Sign + verify + tamper-detection round-trip |
-| Ed25519 | Pinned seed → public key + signature vectors |
+| RSA-2048-PSS | Fixed embedded key (SHA-256 fingerprint pinned) + wrong-key rejection + tamper-detection (v2.3.1) |
+| Ed25519 | Pinned seed → public key + signature vectors + wrong-key rejection (v2.3.1) |
 
 This KAT coverage strengthens NIST SP 800-57 Part 1 Rev. 5 §8.1
 (cryptographic algorithm validation) and provides evidence for FIPS
@@ -342,7 +369,9 @@ personal data. PyHSM satisfies the **technical** requirements:
   in `HARDENING.md`. IPC per-key locking (v2.2.5) eliminates the
   availability risk of a single slow operation blocking all clients.
 - **Regular testing:** `run_self_tests()` on every startup now covers
-  all 10 active primitives. CI/CD automated test suite with 76%+ coverage.
+  all 10 active primitives; RSA-PSS and Ed25519 KATs include cross-key
+  and tamper-detection negative checks (v2.3.1). CI/CD automated test
+  suite with 73%+ coverage (142 tests as of v2.3.1).
 - **Ongoing confidentiality assurance:** The audit log's cross-rotation
   chain verification (`verify_across_rotations()`) provides evidence that
   the complete record of personal data access operations has not been
@@ -367,6 +396,6 @@ When an auditor requests evidence of PyHSM's security controls, provide:
 6. **License audit events** — filter for `license_verified` and `agpl_mode` events: `vectorguard-pyhsm audit --operation license_verified`
 7. **Cross-rotation audit chain verification** — output of `verify_across_rotations()` showing `ok: true` across all retained log files
 8. **Dependency scan results** — `pip-audit` output from the latest CI run
-9. **Test coverage report** — from the latest CI run (76%+ line coverage)
+9. **Test coverage report** — from the latest CI run (73%+ line coverage, 142 tests as of v2.3.1)
 10. **`requirements.lock`** — hash-pinned dependency manifest
 11. **KAT results** — logged at startup as `selfTestPass` in the audit log; confirm all 10 primitives passed

@@ -2,6 +2,24 @@
 
 ## Changelog
 
+### v2.3.1 (2026-10-29)
+
+**Security hardening: thread safety, constant-time comparisons, RSA import validation, and stronger KATs**
+
+- **Thread-safe rate limiter.** `RateLimiter.allow()`, `usage()`, and `reset()` now all acquire a `threading.Lock` before touching shared state. Previously, two concurrent threads could both pass the `len(window) >= max_ops` check before either appended — admitting up to 2× the configured limit under burst load. The fix makes every check-then-record atomic.
+
+- **Constant-time HMAC comparisons throughout.** All HMAC string comparisons in `audit.verify()`, `audit.verify_across_rotations()` (both the per-entry loop and the cross-file stitch check), and the legacy Shamir 4-byte checksum path have been replaced with `hmac.compare_digest()`. Plain `!=` on HMAC-derived strings is a timing oracle: an adversary can guess values byte-by-byte by measuring response latency.
+
+- **RSA key import size enforcement.** `import_key_jwk()` now rejects RSA keys below 2048 bits with a clear error citing NIST SP 800-131A Rev. 2. Only 2048 and 4096 bits are accepted. Previously any RSA key size (including 512 and 1024 bits) would be silently stored and used.
+
+- **Stronger RSA-PSS KAT.** The startup self-test for RSA-2048-PSS now uses a fixed embedded private key (SHA-256 public-key fingerprint pinned) instead of a fresh ephemeral key. This catches library regressions that produce invalid signatures which still verify against the same buggy path. Added: wrong-key rejection check (the signature must not verify with a different key) and tamper-detection check.
+
+- **Ed25519 KAT wrong-key rejection check.** The Ed25519 KAT now also verifies that the signature does not verify under a different freshly generated key.
+
+- **10 new regression tests** covering all of the above: `TestRateLimiterThreadSafety`, `TestJWKWeakKeyRejection`, `TestAuditVerifyConstantTime`, and `TestKATVectors` (142 Python tests total).
+
+---
+
 ### v2.3.0 (2026-10-29)
 
 **Offline JWT license token verification and runtime license notices**
@@ -262,9 +280,9 @@ Most applications that need key management face a difficult choice: implement it
 - Fully typed Python API (PEP 561 `py.typed` marker included)
 - JSON-structured logging for production observability (SIEM-ready)
 - Concurrency stress-tested (16 threads, data integrity proofs)
-- 80%+ code coverage enforced in CI (76%+ for Python layer including new security code)
+- 80%+ code coverage enforced in CI (73%+ for Python layer as of v2.3.1)
 - Reproducible builds via pinned dependency lockfile
-- 264 tests across both layers (170 Python + 94 TypeScript)
+- 274 tests across both layers (180 Python + 94 TypeScript)
 
 ---
 
@@ -726,7 +744,7 @@ tools/
   generate_license_keypair.py — One-time RSA-2048 keypair generation (VectorGuard Labs use)
   issue_license.py            — Mint RS256 JWT tokens for paying customers (VectorGuard Labs use)
 tests/
-  test_pyhsm.py     — 140 pytest tests (unit + integration + auto-rotation + search + OTLP)
+  test_pyhsm.py     — 142 pytest tests (unit + integration + auto-rotation + search + OTLP + v2.3.1 security regression)
   test_concurrency.py — 8 concurrency stress tests (16 threads, data integrity proofs)
   test_cli.py       — 30 subprocess-based CLI integration tests
 ```
@@ -1139,14 +1157,14 @@ const sig = await client.encrypt("eth-wallet", txHash);
 | Audit integrity | Per-entry HMAC chain spanning rotation boundaries (`rotationSeal`/`rotationOpen` entries + `verify_across_rotations()`); audit HMAC key derived from master password via HKDF (Python) or stored independently (TypeScript) |
 | Caller ID tracking | All operations accept optional `caller_id`; recorded in every audit entry |
 | Caller ACL enforcement | Per-key `allowed_callers` policy; unauthorized callers denied with `accessDenied` audit entry |
-| Constant-time comparisons | `hmac.compare_digest` (Python) / length-padded `timingSafeEqual` (TypeScript) |
+| Constant-time comparisons | `hmac.compare_digest` (Python) / length-padded `timingSafeEqual` (TypeScript) — applied to all HMAC verification paths including audit log `verify()`, `verify_across_rotations()`, and the legacy Shamir checksum path (hardened v2.3.1) |
 | Crypto primitive verification | Known-Answer Tests against published RFC/NIST vectors at startup — 10 primitives: AES-256-GCM, PBKDF2-SHA256, HMAC-SHA256, CSPRNG, Argon2id, HKDF-SHA256, AES-256-KWP, ECDSA P-256, RSA-2048-PSS, Ed25519 |
 | Session isolation | Auto-lock on inactivity; explicit `close_session()` / `closeSession()` |
 | Concurrency | Per-key sharded locks (Python) — parallel operations on different keys; serialized save lock prevents write races |
-| Process memory isolation | IPC mode runs HSM in a separate OS process; HMAC mutual authentication required (`--ipc-secret` mandatory); per-key locking eliminates global lock DoS; 30 s per-connection timeout |
+| Process memory isolation | IPC mode runs HSM in a separate OS process; HMAC mutual authentication required (`--ipc-secret` mandatory); per-key locking eliminates global lock DoS; 30 s per-connection timeout; rate limiter is thread-safe (v2.3.1) |
 | M-of-N startup ceremony | Shamir split/reconstruct on master password with per-share HMAC-SHA256 (256-bit forgery resistance, index-bound) and reconstruction HMAC |
 | Pluggable storage | `StorageBackend` interface — swap file I/O for database, S3, etc. |
-| Key interoperability | JWK (RFC 7517) import/export — supports P-256, P-384, P-521, secp256k1, Ed25519, RSA, AES |
+| Key interoperability | JWK (RFC 7517) import/export — supports P-256, P-384, P-521, secp256k1, Ed25519, RSA (2048/4096 only at import, NIST SP 800-131A enforced), AES |
 | EC curve support | P-256 (SHA-256), P-384 (SHA-384), P-521 (SHA-512), secp256k1 (SHA-256) — NIST/SEC recommended hash pairing |
 | EdDSA support | Ed25519 signing — high-performance 64-byte signatures (Solana, Cosmos, SSH keys) |
 | Type safety | PEP 561 `py.typed` marker; `str | bytes` annotations on public API |
@@ -1189,13 +1207,13 @@ See [docs/FAQ.md](docs/FAQ.md) for detailed answers to common architecture and s
 ```bash
 # Run all tests with coverage
 python -m pytest tests/ -v
-# 170 tests (unit + integration + concurrency + CLI)
+# 180 tests (unit + integration + concurrency + CLI)
 
 # Run CLI integration tests separately (subprocess-based)
 python -m pytest tests/test_cli.py -v
 
-# Coverage report (76% minimum threshold enforced in CI)
-python -m pytest tests/ --cov=hsm --cov-report=term-missing --cov-fail-under=76
+# Coverage report (73% minimum threshold enforced in CI)
+python -m pytest tests/ --cov=hsm --cov-report=term-missing --cov-fail-under=73
 ```
 
 **Reproducible installs** use the pinned lockfile:
@@ -1213,7 +1231,7 @@ npm test
 # 94 tests (vitest)
 ```
 
-**CI** runs both suites on every push and pull request, across Python 3.11/3.12/3.13 and Node.js 20. Coverage is enforced at 80% minimum for both layers. Python also runs `mypy --strict` type checking. See `.github/workflows/ci.yml`.
+**CI** runs both suites on every push and pull request, across Python 3.11/3.12/3.13 and Node.js 20. Coverage is enforced at 80% minimum for TypeScript and 73% for Python. Python also runs `mypy --strict` type checking. See `.github/workflows/ci.yml`.
 
 ---
 

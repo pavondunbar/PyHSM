@@ -1,6 +1,6 @@
 # PyHSM Threat Model
 
-**Last updated:** v2.3.0 (2026-10-29)
+**Last updated:** v2.3.1 (2026-10-29)
 
 This document defines the security boundaries, assumptions, and threat actors
 that PyHSM is designed to defend against — and explicitly states what is out of scope.
@@ -93,6 +93,12 @@ Cannot directly access the PyHSM process memory (if isolation mode is used).
 **Residual risk:** If the master password or IPC secret is in the same process's
 environment variables, an attacker with code execution can read it. Mitigation:
 use Shamir shares, inject credentials at startup, and place secrets on tmpfs.
+
+Additionally, a T2 attacker who can make concurrent requests may attempt to
+exceed rate limits by issuing simultaneous calls and exploiting a race between
+the check and the counter update. This is closed by the thread-safe
+`RateLimiter` (v2.3.1), which uses `threading.Lock` to make
+`allow()` atomic.
 
 ### T3: Attacker with Filesystem Read Access
 
@@ -187,6 +193,9 @@ PyHSM acknowledges this limitation in its scope statement.
 | Deterministic zeroization | Mutable `bytearray` (Python) / `Buffer` (TypeScript) with explicit byte-by-byte overwrite. Avoids reliance on garbage collector timing. |
 | No custom crypto | All primitives are from `cryptography` (Python) / Node.js `crypto` / `@noble/ciphers`. No novel algorithms. |
 | Per-share HMAC-SHA256 (v2.2.0) | Shamir shares carry `HMAC-SHA256(salt, index_byte \|\| data)` rather than a 4-byte SHA-256 truncation. Provides 256-bit existential forgery resistance; index binding prevents tag transplantation between shares. A reconstruction HMAC covering the full secret catches insufficient-share reconstruction. |
+| Constant-time HMAC comparisons (v2.0.0 / hardened v2.3.1) | All HMAC verification in `verify()`, `verify_across_rotations()`, and the legacy Shamir checksum path use `hmac.compare_digest()`. A timing oracle on these paths would allow an adversary to guess HMAC values byte-by-byte by measuring response latency. |
+| Thread-safe rate limiter (v2.3.1) | `RateLimiter.allow()`, `usage()`, and `reset()` all acquire `threading.Lock` before touching shared state, closing a check-then-act race that could allow up to 2× `max_ops` through under concurrent load. |
+| RSA import size enforcement (v2.3.1) | `import_key_jwk()` rejects RSA keys below 2048 bits with a clear error citing NIST SP 800-131A Rev. 2. Only 2048 and 4096 bits are accepted, preventing silent injection of weak keys. |
 | IPC mandatory authentication (v2.2.0) | The IPC server requires `--ipc-secret` at startup. Unauthenticated socket access is rejected before any HSM operation is touched. Previous optional authentication meant an attacker reaching the socket (same UID, no secret) had full access. |
 | IPC per-key locking (v2.2.0) | The previous global lock was a DoS vector: one slow RSA-4096 keygen blocked every other client. Per-key locks allow parallel operations on different keys. Read-only ops hold no lock at all. |
 | Audit rotation seals (v2.2.0) | `rotationSeal` and `rotationOpen` entries cryptographically stitch the HMAC chain across file boundaries. An attacker who deletes a rotated log file cannot prevent detection because the next file's `rotationOpen.prev_seal_hmac` will not match any seal the verifier can find. |
@@ -209,9 +218,11 @@ PyHSM acknowledges this limitation in its scope statement.
 
 6. **No distributed consensus.** There is no multi-node replication or quorum-based access control. PyHSM is a single-instance system.
 
-7. **Rate limiter is in-process and non-persistent.** The per-key rate limiter does not survive process restarts and does not coordinate across multiple PyHSM instances. A restart resets all rate-limit windows. Mitigation: enforce rate limits at the infrastructure layer (API gateway, reverse proxy) in addition to PyHSM's internal limits.
+7. **Rate limiter is in-process and non-persistent.** The per-key rate limiter (v2.3.1: thread-safe) does not survive process restarts and does not coordinate across multiple PyHSM instances. A restart resets all rate-limit windows. Concurrent-access races within a single process are eliminated by `threading.Lock` (v2.3.1). Mitigation: enforce rate limits at the infrastructure layer (API gateway, reverse proxy) in addition to PyHSM's internal limits.
 
 8. **Audit log rotation seal does not protect against truncation of the active file.** The `rotationSeal`/`rotationOpen` mechanism detects deletion of entire rotated files. Truncation of the *active* (not yet rotated) log file is detectable only by the HMAC chain within that file — a truncation at a clean HMAC boundary could evade detection. Mitigation: use `auditd` or file-integrity monitoring to detect any write to audit log files from processes other than the PyHSM server.
+
+9. **Caller ID is supplied by the caller and is not cryptographically authenticated.** The `caller_id` field in every audit entry is taken from the caller's own request (or from the IPC JSON payload). While the IPC transport is HMAC-authenticated (ensuring only holders of the shared secret can call at all), the `caller_id` value within an authenticated request is not independently verified. A caller with a valid IPC secret can claim any `caller_id` string. The `allowed_callers` ACL therefore provides access segmentation between cooperating services, not enforcement against a malicious authorized caller. Mitigation: issue one IPC secret per service and document the mapping externally.
 
 ---
 
@@ -223,13 +234,16 @@ PyHSM acknowledges this limitation in its scope statement.
 | Application compromise | Protected (separate hardware) | Protected (process isolation mode) |
 | Unauthenticated IPC access | Protected (hardware bus, no socket) | Protected (HMAC mutual auth required, v2.2.0) |
 | IPC DoS via slow operation | Not applicable | Protected (per-key locking, connection timeout, v2.2.0) |
+| Rate limit bypass via concurrent calls | Not applicable | Protected (thread-safe `RateLimiter` with `threading.Lock`, v2.3.1) |
+| Weak RSA key injection via import | Not applicable | Protected (import restricted to 2048/4096 bits, NIST SP 800-131A, v2.3.1) |
+| Timing oracle on audit HMAC verification | Not applicable | Protected (`hmac.compare_digest()` throughout verify paths, v2.3.1) |
 | Root attacker with debugger | Protected (tamper-evident hardware boundary) | **NOT protected** (software boundary only) |
 | Physical theft of device | Protected (tamper-responsive, key destruction) | **NOT protected** (no hardware tamper response) |
 | Side-channel attacks | Protected (certified countermeasures) | **Partially** (constant-time HMAC + Shamir GF arithmetic, but depends on library for AES/EC) |
 | Supply chain (firmware) | Risk exists (vendor trust) | Risk exists (dependency trust, mitigated by pinning) |
 | Forged Shamir shares | N/A (hardware ceremony) | Protected (per-share HMAC-SHA256, 256-bit, index-bound, v2.2.0) |
 | Deleted audit log files | Protected (hardware audit journal) | Protected (rotation seals detect file deletion, v2.2.0) |
-| KAT regression in crypto library | Protected (certified module) | Protected (10 primitive KATs at startup, v2.2.0) |
+| KAT regression in crypto library | Protected (certified module) | Protected (10 primitive KATs at startup; RSA-PSS + Ed25519 with cross-key checks, v2.3.1) |
 | License token forgery | N/A (not applicable) | Protected (RS256 / RSA-2048 signature verification, embedded public key, v2.3.0) |
 
 PyHSM is appropriate for environments where software key management is acceptable.

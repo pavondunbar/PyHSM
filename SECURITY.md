@@ -27,6 +27,21 @@ v1.x is no longer supported. Upgrade to v2.3.0 or later.
 
 ---
 
+## Security Fixes (v2.3.1)
+
+The following vulnerabilities were identified in a security audit of v2.3.0 and fixed in v2.3.1:
+
+| Issue | Severity | Fix |
+|---|---|---|
+| `RateLimiter.allow()` had a check-then-act race under concurrent access | High | Added `threading.Lock` to `RateLimiter`; all three public methods (`allow`, `usage`, `reset`) are now atomic |
+| Audit log `verify()` and `verify_across_rotations()` used plain `!=` for HMAC comparison | Medium | Replaced all HMAC string comparisons with `hmac.compare_digest()` — prevents timing-oracle attacks |
+| Legacy Shamir checksum path used plain `!=` for hash comparison | Medium | Replaced with `hmac.compare_digest()` in the backward-compatible 4-byte checksum path |
+| JWK import accepted RSA keys below 2048 bits (e.g. RSA-1024) | Medium | Added allowlist `{2048, 4096}`; keys below 2048 bits raise `ValueError` citing NIST SP 800-131A Rev. 2 |
+| Ed25519 KAT used self-generated vectors, not independently published standard values | Low | KAT docstring corrected with accurate sourcing; wrong-key rejection check added |
+| RSA-PSS KAT was a round-trip only (no cross-key confusion or fixed-key test) | Low | Replaced with a fixed embedded private key (SHA-256 public key fingerprint pinned); added wrong-key rejection and tamper-detection checks |
+
+---
+
 ## Recent Security Fixes (v2.2.0)
 
 The following vulnerabilities were identified in an internal security audit and fixed in v2.2.0:
@@ -155,8 +170,10 @@ Key design principles:
 - Key separation via HKDF-Expand with distinct info strings
 - Encrypt-then-MAC with independent subkeys
 - Deterministic memory zeroization (mutable bytearray/Buffer, not immutable strings)
-- Constant-time comparisons for all secret-dependent operations
+- Constant-time comparisons for all secret-dependent operations (`hmac.compare_digest` throughout, including audit log verification and legacy Shamir checksum path — enforced in v2.3.1)
 - Input size validation to prevent memory exhaustion
 - Atomic file writes to prevent corruption
 - Offline RS256 JWT license verification — no network call, no server dependency, air-gap safe
 - License state recorded in the tamper-evident audit log at every session open
+- Thread-safe rate limiter — `allow()`, `usage()`, and `reset()` protected by `threading.Lock` (v2.3.1)
+- RSA key import restricted to NIST SP 800-131A approved sizes (2048 and 4096 bits) — weaker keys rejected at import (v2.3.1)

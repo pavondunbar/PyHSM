@@ -518,11 +518,12 @@ With IPC mode, a compromised dependency in your application cannot
 directly call `hsm.export_jwk()` or read `_master_password` — the HSM
 lives in a different OS process with a different UID.
 
-**Security properties of v2.2.0 IPC server:**
+**Security properties of v2.3.1 IPC server:**
 - Authentication is mandatory — no unauthenticated requests processed
 - Per-key locking — operations on different keys run in parallel (eliminates global lock DoS where a slow RSA-4096 keygen stalled all clients)
 - 30-second per-connection read timeout — malicious or stalled clients dropped cleanly
 - Read-only operations (`health`, `list_keys`, `has_key`, `get_public_key`, `get_metrics`) hold no lock at all
+- Rate limiter is thread-safe — concurrent callers cannot exceed `max_ops` via a check-then-act race (v2.3.1)
 
 ---
 
@@ -564,4 +565,6 @@ Before going live, verify each item:
 [ ] NTP synchronized (clock skew can bypass key expiry and license expiry)
 [ ] SELinux or AppArmor policy applied (if available)
 [ ] auditd rule watching keystore and audit log files for modification
+[ ] RSA keys imported via JWK are 2048 or 4096 bits only (enforced by PyHSM v2.3.1; verify no legacy 1024-bit keys exist in the keystore)
+[ ] Rate limiting configured to a value appropriate for your threat model (default: 100 ops/key/60 s); concurrent thread-safety enforced since v2.3.1
 ```
