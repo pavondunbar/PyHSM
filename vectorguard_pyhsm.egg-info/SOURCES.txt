@@ -9,6 +9,7 @@ hsm/core.py
 hsm/ipc_client.py
 hsm/ipc_server.py
 hsm/jwk.py
+hsm/license.py
 hsm/logging.py
 hsm/metrics.py
 hsm/password_file.py

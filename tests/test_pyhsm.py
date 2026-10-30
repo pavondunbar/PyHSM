@@ -1264,3 +1264,197 @@ class TestInputSizeLimit:
         oversized_hex = "00" * (64 * 1024 * 1024 + 1)
         with pytest.raises(ValueError, match="too large"):
             hsm.decrypt("size-key", oversized_hex)
+
+
+# ---------------------------------------------------------------------------
+# Security fixes — regression tests (v2.3.1)
+# ---------------------------------------------------------------------------
+
+class TestRateLimiterThreadSafety:
+    """Verify that RateLimiter is thread-safe under concurrent access.
+
+    Previously allow() had a check-then-act race: two threads could both pass
+    the len(window) >= max_ops gate before either appended, allowing up to
+    2×max_ops operations through. The fix adds a threading.Lock around the
+    entire read-modify-write sequence.
+    """
+
+    def test_concurrent_allow_respects_limit(self):
+        """Concurrent threads must never collectively exceed max_ops."""
+        import threading
+        from hsm.rate_limiter import RateLimiter
+
+        MAX_OPS = 10
+        NUM_THREADS = 50
+        limiter = RateLimiter(max_ops_per_window=MAX_OPS, window_seconds=60.0)
+        admitted = []
+        barrier = threading.Barrier(NUM_THREADS)
+
+        def worker():
+            barrier.wait()  # synchronize so all threads hit allow() simultaneously
+            if limiter.allow("shared-key"):
+                admitted.append(1)
+
+        threads = [threading.Thread(target=worker) for _ in range(NUM_THREADS)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert len(admitted) <= MAX_OPS, (
+            f"RateLimiter admitted {len(admitted)} ops but max is {MAX_OPS} — "
+            "thread-safety fix regressed"
+        )
+
+    def test_reset_is_thread_safe(self):
+        """reset() must not race with concurrent allow() calls."""
+        import threading
+        from hsm.rate_limiter import RateLimiter
+
+        limiter = RateLimiter(max_ops_per_window=100, window_seconds=60.0)
+        errors = []
+
+        def allow_worker():
+            try:
+                for _ in range(20):
+                    limiter.allow("key")
+            except Exception as exc:
+                errors.append(exc)
+
+        def reset_worker():
+            try:
+                for _ in range(20):
+                    limiter.reset("key")
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = (
+            [threading.Thread(target=allow_worker) for _ in range(5)]
+            + [threading.Thread(target=reset_worker) for _ in range(5)]
+        )
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert not errors, f"Thread safety errors: {errors}"
+
+
+class TestJWKWeakKeyRejection:
+    """Verify that importing weak RSA keys is rejected."""
+
+    def test_import_rsa_1024_rejected(self, hsm):
+        """Importing an RSA-1024 key must raise ValueError (below minimum 2048 bits)."""
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.hazmat.primitives import serialization
+        from hsm.jwk import export_rsa_jwk, import_jwk
+
+        # Generate a 1024-bit key (weak, test-only)
+        weak_key = rsa.generate_private_key(public_exponent=65537, key_size=1024)
+        weak_pem = weak_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+        jwk = export_rsa_jwk(weak_pem)
+
+        with pytest.raises(ValueError, match="not allowed"):
+            import_jwk(jwk)
+
+    def test_import_rsa_2048_accepted(self, hsm):
+        """Importing an RSA-2048 key must succeed."""
+        hsm.generate_key("rsa-source", "rsa-2048", policy={"allow_sign": True, "allow_export": True})
+        jwk = hsm.export_jwk("rsa-source")
+        # Re-importing should work cleanly
+        hsm.import_key_jwk("rsa-reimported", jwk)
+        assert hsm.has_key("rsa-reimported")
+
+    def test_import_rsa_4096_accepted(self, hsm):
+        """Importing an RSA-4096 key must succeed."""
+        hsm.generate_key(
+            "rsa4096-source", "rsa-4096",
+            policy={"allow_sign": True, "allow_export": True},
+        )
+        jwk = hsm.export_jwk("rsa4096-source")
+        hsm.import_key_jwk("rsa4096-reimported", jwk)
+        assert hsm.has_key("rsa4096-reimported")
+
+
+class TestAuditVerifyConstantTime:
+    """Verify that audit log verify() uses constant-time comparison."""
+
+    def test_verify_returns_minus_one_on_clean_log(self, hsm):
+        """A freshly written log with no tampering returns -1."""
+        audit = hsm.get_audit_log()
+        result = audit.verify()
+        assert result == -1, f"Expected -1 for clean log, got {result}"
+
+    def test_verify_detects_tampered_entry(self, hsm, store_path, tmp_path):
+        """Flipping a byte in an audit entry is detected by verify()."""
+        audit_path = store_path + ".audit.jsonl"
+        audit = hsm.get_audit_log()
+        # Write a few operations to build a chain
+        hsm.generate_key("tamper-key")
+        hsm.encrypt("tamper-key", "hello")
+
+        # Read the raw log and flip a byte in the first data line
+        with open(audit_path, "r") as f:
+            lines = f.readlines()
+
+        # Tamper the first non-empty line's 'success' field
+        tampered = lines[0].replace('"success":true', '"success":false', 1)
+        assert tampered != lines[0], "Tamper did not change the line"
+        lines[0] = tampered
+
+        with open(audit_path, "w") as f:
+            f.writelines(lines)
+
+        # verify() must detect the tampering
+        result = audit.verify()
+        assert result != -1, "Tampered audit log should not return -1"
+
+
+class TestKATVectors:
+    """Explicit regression tests for the updated KAT vectors."""
+
+    def test_ed25519_kat_pinned_values(self):
+        """Ed25519 KAT uses the correct pinned public key and signature."""
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+        from cryptography.hazmat.primitives import serialization
+
+        seed = bytes.fromhex(
+            "9d61b19deffd5a60ba844af492ec2cc4"
+            "4449c5697b326919703bac031cae3d55"
+        )
+        expected_pub = bytes.fromhex(
+            "700e2ce7c4b674427eab27ba820bcf6f"
+            "0faebe68e09fe8564292114e41dc6a41"
+        )
+        expected_sig = bytes.fromhex(
+            "37b4bd5f28b61f55dc9673ae2895bace"
+            "b863d9cf51780d040f98ad8cdc896cf5"
+            "be46be655a863525da0959f7f3736115"
+            "85e437e28ec971b7bd206ff9bd26e803"
+        )
+
+        priv = ed25519.Ed25519PrivateKey.from_private_bytes(seed)
+        pub_bytes = priv.public_key().public_bytes(
+            serialization.Encoding.Raw, serialization.PublicFormat.Raw
+        )
+        assert pub_bytes == expected_pub
+        sig = priv.sign(b"")
+        assert sig == expected_sig
+
+    def test_rsa_pss_kat_fingerprint(self):
+        """RSA-PSS KAT private key produces the expected public key fingerprint."""
+        import hashlib
+        from hsm.self_test import _test_rsa_pss
+        result = _test_rsa_pss()
+        assert result["passed"], f"RSA-PSS KAT failed: {result.get('error')}"
+
+    def test_all_kats_still_pass(self):
+        """Full KAT battery must still pass after the vector updates."""
+        from hsm.self_test import run_self_tests
+        results = run_self_tests()
+        failures = [r for r in results if not r["passed"]]
+        assert not failures, f"KAT failures: {failures}"

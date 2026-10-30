@@ -391,6 +391,20 @@ def import_jwk(jwk: dict) -> tuple[str, bytes, Optional[str]]:
         private_numbers = rsa.RSAPrivateNumbers(p, q, d, dp, dq, qi, public_numbers)
         private_key = private_numbers.private_key()
 
+        key_size = private_key.key_size
+
+        # Reject weak RSA keys.  The system only generates rsa-2048 and rsa-4096;
+        # importing anything smaller would silently create a key that passes the
+        # type check but provides far less security than expected.
+        # 2048 bits is the minimum recommended by NIST SP 800-131A Rev. 2.
+        _ALLOWED_RSA_SIZES = {2048, 4096}
+        if key_size not in _ALLOWED_RSA_SIZES:
+            raise ValueError(
+                f"PyHSM JWK import: RSA key size {key_size} bits is not allowed. "
+                f"Only {sorted(_ALLOWED_RSA_SIZES)} bits are accepted "
+                "(NIST SP 800-131A Rev. 2 minimum: 2048 bits)."
+            )
+
         priv_pem = private_key.private_bytes(
             serialization.Encoding.PEM,
             serialization.PrivateFormat.PKCS8,
@@ -401,7 +415,6 @@ def import_jwk(jwk: dict) -> tuple[str, bytes, Optional[str]]:
             serialization.PublicFormat.SubjectPublicKeyInfo,
         ).decode()
 
-        key_size = private_key.key_size
         key_type = f"rsa-{key_size}"
         return key_type, priv_pem, pub_pem
 

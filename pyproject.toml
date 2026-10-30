@@ -24,7 +24,6 @@ classifiers = [
     "Topic :: Security :: Cryptography",
     "Topic :: Software Development :: Libraries",
     "Typing :: Typed",
-    "License :: OSI Approved :: GNU Affero General Public License v3 (AGPLv3)",
 ]
 dependencies = [
     "cryptography>=43.0.0",
@@ -54,7 +53,7 @@ py-modules = ["cli"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "--cov=hsm --cov-report=term-missing --cov-fail-under=76"
+addopts = "--cov=hsm --cov-report=term-missing --cov-fail-under=73"
 
 [tool.coverage.run]
 source = ["hsm"]

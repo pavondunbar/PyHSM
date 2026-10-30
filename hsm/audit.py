@@ -352,6 +352,10 @@ class AuditLog:
         """
         Verify the HMAC chain of the entire log.
         Returns -1 if the log is clean, or the first corrupted sequence number.
+
+        Uses hmac.compare_digest() for all HMAC comparisons to prevent
+        timing-oracle attacks where an attacker submits crafted log entries
+        and measures response latency to recover the HMAC key byte-by-byte.
         """
         if not os.path.exists(self.log_path):
             return -1
@@ -362,6 +366,8 @@ class AuditLog:
         for line in lines:
             entry = json.loads(line)
             stored_hmac = entry.pop("hmac", None)
+            if stored_hmac is None:
+                return entry.get("sequence", -2)
             # Re-sort keys to match how we serialised
             expected = _hmac.new(
                 self._hmac_key,
@@ -370,7 +376,8 @@ class AuditLog:
                 ).encode(),
                 hashlib.sha256,
             ).hexdigest()
-            if stored_hmac != expected:
+            # Use compare_digest to prevent timing-oracle attacks.
+            if not _hmac.compare_digest(stored_hmac, expected):
                 return entry.get("sequence", -2)
             prev_hmac = stored_hmac
         return -1
@@ -447,7 +454,7 @@ class AuditLog:
                     }
                 if open_entry.get("operation") == "rotationOpen":
                     recorded = open_entry.get("prev_seal_hmac", "")
-                    if recorded != prev_seal_hmac:
+                    if not _hmac.compare_digest(recorded, prev_seal_hmac):
                         return {
                             "ok": False,
                             "files_checked": files_checked,
@@ -488,7 +495,7 @@ class AuditLog:
                     hashlib.sha256,
                 ).hexdigest()
 
-                if stored_hmac != expected:
+                if not _hmac.compare_digest(stored_hmac, expected):
                     return {
                         "ok": False,
                         "files_checked": files_checked,

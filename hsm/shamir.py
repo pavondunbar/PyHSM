@@ -375,7 +375,9 @@ def reconstruct_secret(shares: list[dict]) -> bytearray:
         stored_checksum = shares[0].get("checksum")
         if stored_checksum is not None:
             actual_checksum = hashlib.sha256(bytes(result)).digest()[:4].hex()
-            if actual_checksum != stored_checksum:
+            # Use compare_digest to prevent timing-oracle attacks even for the
+            # legacy 4-byte truncated checksum path.
+            if not _hmac.compare_digest(actual_checksum, stored_checksum):
                 zeroize(result)
                 raise ValueError(
                     "PyHSM Shamir: reconstructed secret failed checksum verification. "
